@@ -1,0 +1,27 @@
+# Compiled binaries / build output — never commit these.
+/bin/
+*.exe
+*.test
+/server
+/peer
+/conclave
+
+# Test & coverage artifacts
+coverage.out
+coverage.html
+*.prof
+
+# Go workspace files (machine-local)
+go.work
+go.work.sum
+
+# Media captured by later phases (save-to-disk, play-from-disk, etc.)
+*.ivf
+*.ogg
+*.h264
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+.idea/
+.vscode/
