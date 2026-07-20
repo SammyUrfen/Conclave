@@ -22,6 +22,7 @@ import (
 // communicating," not by wrapping every write in a lock.
 type member struct {
 	id   string
+	name string // peer-declared stable label (may be empty); echoed in rosters
 	conn *websocket.Conn
 	out  chan Message // buffered; filled by senders, drained by writePump
 

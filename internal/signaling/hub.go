@@ -97,6 +97,9 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 	if roomID == "" {
 		roomID = defaultRoom
 	}
+	// name is the peer's self-declared label (optional). It is authoritative only
+	// as "what this connection calls itself" — the id remains the routing address.
+	name := r.URL.Query().Get("name")
 
 	// One cancelable context per connection, derived from the request context so
 	// it also dies if the HTTP server shuts down. Cancelling it is the single
@@ -106,6 +109,7 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 
 	c := &member{
 		id:     h.nextID(),
+		name:   name,
 		conn:   conn,
 		out:    make(chan Message, outboundBuffer),
 		cancel: cancel,
@@ -126,19 +130,19 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 	h.unregister(roomID, c)
 }
 
-// register adds c to roomID and returns the ids already present, after telling
-// those incumbents that c arrived.
-func (h *Hub) register(roomID string, c *member) []string {
+// register adds c to roomID and returns the members already present (id + name),
+// after telling those incumbents that c arrived.
+func (h *Hub) register(roomID string, c *member) []Peer {
 	h.mu.Lock()
 	room := h.rooms[roomID]
 	if room == nil {
 		room = make(map[string]*member)
 		h.rooms[roomID] = room
 	}
-	existing := make([]string, 0, len(room))
+	existing := make([]Peer, 0, len(room))
 	incumbents := make([]*member, 0, len(room))
 	for id, other := range room {
-		existing = append(existing, id)
+		existing = append(existing, Peer{ID: id, Name: other.name})
 		incumbents = append(incumbents, other)
 	}
 	room[c.id] = c
@@ -147,7 +151,7 @@ func (h *Hub) register(roomID string, c *member) []string {
 	// Fan out AFTER unlocking: send() only touches the target's channel, never
 	// the Hub map, so holding mu across the loop would needlessly serialize every
 	// room's traffic behind one lock.
-	announce := Message{Type: TypePeerJoined, From: c.id}
+	announce := Message{Type: TypePeerJoined, From: c.id, Name: c.name}
 	for _, other := range incumbents {
 		other.send(announce)
 	}
@@ -179,7 +183,7 @@ func (h *Hub) unregister(roomID string, c *member) {
 	}
 	h.mu.Unlock()
 
-	announce := Message{Type: TypePeerLeft, From: c.id}
+	announce := Message{Type: TypePeerLeft, From: c.id, Name: c.name}
 	for _, other := range remaining {
 		other.send(announce)
 	}

@@ -49,7 +49,7 @@ func TestHubRelaysBetweenPeers(t *testing.T) {
 	defer connB.CloseNow()
 
 	joinedB := readMsg(ctx, t, connB)
-	if joinedB.Type != TypeJoined || len(joinedB.Peers) != 1 || joinedB.Peers[0] != idA {
+	if joinedB.Type != TypeJoined || len(joinedB.Peers) != 1 || joinedB.Peers[0].ID != idA {
 		t.Fatalf("B joined = %+v, want joined with peers=[%q]", joinedB, idA)
 	}
 	idB := joinedB.To

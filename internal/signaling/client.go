@@ -33,10 +33,11 @@ type Client struct {
 
 // Dial connects to the signaling server for the given room. serverURL may be an
 // http(s):// or ws(s):// base URL, or a bare host:port; the scheme is normalized
-// to ws/wss and /ws?room=<room> is appended. The passed ctx bounds only the
+// to ws/wss and /ws?room=<room> is appended. name is the peer's stable label for
+// topology resolution (may be empty in mesh mode). The passed ctx bounds only the
 // handshake — the connection's lifetime is controlled by Close.
-func Dial(ctx context.Context, log *slog.Logger, serverURL, room string) (*Client, error) {
-	wsURL, err := wsURLFor(serverURL, room)
+func Dial(ctx context.Context, log *slog.Logger, serverURL, room, name string) (*Client, error) {
+	wsURL, err := wsURLFor(serverURL, room, name)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +128,7 @@ func (c *Client) writePump(ctx context.Context) {
 // for the /ws endpoint. It accepts http(s), ws(s), or a bare host:port, and
 // rejects hostless or unknown-scheme values (the same fail-loud discipline as
 // the peer's healthURLFor).
-func wsURLFor(server, room string) (string, error) {
+func wsURLFor(server, room, name string) (string, error) {
 	s := strings.TrimSpace(server)
 	if s == "" {
 		return "", errors.New("empty signaling server URL")
@@ -154,6 +155,9 @@ func wsURLFor(server, room string) (string, error) {
 	q := u.Query()
 	if room != "" {
 		q.Set("room", room)
+	}
+	if name != "" {
+		q.Set("name", name)
 	}
 	u.RawQuery = q.Encode()
 	return u.String(), nil

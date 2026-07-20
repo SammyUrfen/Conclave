@@ -34,6 +34,18 @@ const (
 	TypeError Type = "error"
 )
 
+// Peer identifies one room member on the wire: the server-assigned id (the
+// authoritative address used for routing) plus the peer's self-declared name (a
+// stable label). The two are distinct on purpose — ids are unique and
+// server-controlled, names are peer-supplied and used only so a peer can locate
+// itself and its neighbours in a hardcoded topology authored ahead of time (the
+// server assigns p1, p2, … at connect time, but a tree is written in names like
+// "relay"/"leaf-b"). Name is empty when a peer joined without -name.
+type Peer struct {
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+}
+
 // Message is the single frame type on conclave's signaling WebSocket. Both the
 // server (this package) and every peer speak it.
 //
@@ -56,12 +68,18 @@ type Message struct {
 	// To is the intended recipient's id: the relay target, or the addressee of a
 	// control frame.
 	To string `json:"to,omitempty"`
+	// Name is the peer's stable label. It is set by the server on peer-joined /
+	// peer-left frames (naming the peer that From identifies) so that peers can
+	// resolve topology names to runtime ids. Like From, it is server-stamped from
+	// the connection's declared name, never trusted off the wire from a relay.
+	Name string `json:"name,omitempty"`
 	// SDP is an opaque webrtc.SessionDescription for offer/answer frames.
 	SDP json.RawMessage `json:"sdp,omitempty"`
 	// Candidate is an opaque webrtc.ICECandidateInit for candidate frames.
 	Candidate json.RawMessage `json:"candidate,omitempty"`
-	// Peers lists the ids already in the room; set only on a joined frame.
-	Peers []string `json:"peers,omitempty"`
+	// Peers lists the members already in the room (id + name); set only on a
+	// joined frame.
+	Peers []Peer `json:"peers,omitempty"`
 	// Error is a human-readable reason; set only on an error frame.
 	Error string `json:"error,omitempty"`
 }
