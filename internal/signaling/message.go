@@ -32,6 +32,17 @@ const (
 	// TypeError reports a rejected request back to its sender (e.g. a relay to an
 	// unknown peer). Message.Error holds a human-readable reason.
 	TypeError Type = "error"
+
+	// --- Phase 4 control plane: metrics in, computed topology out. ---
+
+	// TypeMetrics carries a peer's telemetry to the coordinator in Message.Payload
+	// (an opaque metrics.Report — the server decodes it rather than relaying it, the
+	// one frame the Hub consumes instead of forwarding). Peer → server.
+	TypeMetrics Type = "metrics"
+	// TypeTopology carries a coordinator-computed relay tree to a peer in
+	// Message.Payload (an opaque overlay.Topology the peer decodes and realises).
+	// Server → peer.
+	TypeTopology Type = "topology"
 )
 
 // Peer identifies one room member on the wire: the server-assigned id (the
@@ -82,4 +93,10 @@ type Message struct {
 	Peers []Peer `json:"peers,omitempty"`
 	// Error is a human-readable reason; set only on an error frame.
 	Error string `json:"error,omitempty"`
+	// Payload is an opaque control-plane body for metrics/topology frames — a
+	// json.RawMessage for the same reason SDP is: the wire layer stays ignorant of
+	// its shape (a metrics.Report going up, an overlay.Topology coming down), so
+	// signaling never imports the control-plane packages. The endpoints that own
+	// those types marshal into and out of it; the Type field says which is inside.
+	Payload json.RawMessage `json:"payload,omitempty"`
 }

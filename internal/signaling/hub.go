@@ -30,6 +30,21 @@ const (
 	readLimit = 1 << 20
 )
 
+// Observer is the control-plane's window into room membership and telemetry. A Hub
+// with an observer set (Phase 4's coordinator) calls it when a peer joins or
+// leaves and when a metrics frame arrives — the events that let the coordinator
+// track who is present and recompute the forwarding tree. It is deliberately
+// declared HERE, in the signaling layer, and takes only strings and raw bytes: the
+// Hub calls it but never imports the coordinator, so the wire layer stays free of
+// control-plane types. The methods are invoked from Hub goroutines and must be
+// safe to call concurrently and cheap (the coordinator's implementation just
+// enqueues an event and returns).
+type Observer interface {
+	PeerJoined(roomID, peerID, name string)
+	PeerLeft(roomID, peerID string)
+	Metrics(roomID, peerID string, payload []byte)
+}
+
 // Hub is the signaling rendezvous: it multiplexes connected peers into rooms and
 // relays frames between them. One Hub is constructed per server process and its
 // ServeWS method is mounted as an http.HandlerFunc.
@@ -47,6 +62,11 @@ type Hub struct {
 	mu    sync.Mutex
 	rooms map[string]map[string]*member // roomID → peerID → member
 	seq   uint64                        // monotonic id source; guarded by mu
+
+	// obs is the optional control-plane observer (Phase 4 coordinator). nil for a
+	// pure signaling relay (Phases 1–3), which keeps that behaviour untouched. It is
+	// set once at startup before any connection is served, so it needs no lock.
+	obs Observer
 }
 
 // NewHub returns a ready Hub that logs through the given logger.
@@ -56,6 +76,11 @@ func NewHub(log *slog.Logger) *Hub {
 		rooms: make(map[string]map[string]*member),
 	}
 }
+
+// SetObserver attaches a control-plane observer. Call it once, before serving any
+// connection (there is no lock guarding obs precisely because it is fixed at
+// startup). Passing nil leaves the Hub a plain relay.
+func (h *Hub) SetObserver(o Observer) { h.obs = o }
 
 // nextID hands out a fresh, process-unique peer id. A monotonic counter is
 // enough here: ids only need to be unique among live connections and are never
@@ -116,12 +141,32 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 		log:    h.log,
 	}
 
-	// Start the write side first so anything the join fans out is deliverable
-	// immediately, then register (which notifies incumbents), then greet the
-	// newcomer with its id and the current roster.
+	// Register first: it rejects a duplicate name and, on success, announces us to
+	// the incumbents. Registration writes only to OTHER members' channels, so it does
+	// not need our own writePump — which is why, on a rejection, we can report the
+	// error with a single direct write (no concurrent writer to race) and close.
+	peers, ok := h.register(roomID, c)
+	if !ok {
+		_ = wsjson.Write(ctx, conn, Message{Type: TypeError, To: c.id,
+			Error: fmt.Sprintf("name %q is already in use in room %q", name, roomID)})
+		h.log.Warn("rejected duplicate name",
+			slog.String("name", name), slog.String("room_id", roomID))
+		return // deferred conn.CloseNow closes the socket
+	}
+
+	// Now start our write side and greet ourselves with our id + the current roster.
 	go c.writePump(ctx)
-	peers := h.register(roomID, c)
 	c.send(Message{Type: TypeJoined, To: c.id, Peers: peers})
+
+	// Only NOW tell the control plane this peer joined — strictly after its joined
+	// frame is queued on its own outbound channel. The coordinator reacts by pushing
+	// a computed topology to this peer; queueing that push after the joined frame (on
+	// the same FIFO channel) guarantees the peer learns its id and roster before it
+	// is told a tree that references them. Firing this inside register would race the
+	// push ahead of the joined frame and the peer would resolve an empty roster.
+	if h.obs != nil {
+		h.obs.PeerJoined(roomID, c.id, c.name)
+	}
 
 	// readLoop blocks on this goroutine for the whole life of the connection,
 	// which is what keeps the handler (and so the accepted conn) alive. When it
@@ -131,13 +176,28 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 }
 
 // register adds c to roomID and returns the members already present (id + name),
-// after telling those incumbents that c arrived.
-func (h *Hub) register(roomID string, c *member) []Peer {
+// after telling those incumbents that c arrived. The bool is false — and nothing is
+// added or announced — when c's name collides with a live member (see below).
+func (h *Hub) register(roomID string, c *member) ([]Peer, bool) {
 	h.mu.Lock()
 	room := h.rooms[roomID]
 	if room == nil {
 		room = make(map[string]*member)
 		h.rooms[roomID] = room
+	}
+	// A non-empty name must be UNIQUE within a room. A tree/coordinator addresses
+	// peers by name, so two members sharing one would make name→id resolution
+	// ambiguous — a relay could resolve its child to the wrong peer and silently
+	// strand the intended one. Reject the newcomer (fail loud) rather than admit an
+	// ambiguous roster. Empty names are exempt: mesh peers don't use names, and many
+	// may share "".
+	if c.name != "" {
+		for _, other := range room {
+			if other.name == c.name {
+				h.mu.Unlock()
+				return nil, false
+			}
+		}
 	}
 	existing := make([]Peer, 0, len(room))
 	incumbents := make([]*member, 0, len(room))
@@ -158,7 +218,7 @@ func (h *Hub) register(roomID string, c *member) []Peer {
 	h.log.Info("peer joined",
 		slog.String("peer_id", c.id), slog.String("room_id", roomID),
 		slog.Int("room_size", len(existing)+1))
-	return existing
+	return existing, true
 }
 
 // unregister removes c from roomID and tells the remaining members it left. It
@@ -190,6 +250,10 @@ func (h *Hub) unregister(roomID string, c *member) {
 	h.log.Info("peer left",
 		slog.String("peer_id", c.id), slog.String("room_id", roomID),
 		slog.Int("room_size", len(remaining)))
+	// Tell the control plane a member left, so it can re-parent the survivors.
+	if h.obs != nil {
+		h.obs.PeerLeft(roomID, c.id)
+	}
 }
 
 // readLoop reads frames from c until the connection ends, routing each one. It
@@ -218,8 +282,9 @@ func (h *Hub) readLoop(ctx context.Context, roomID string, c *member) {
 	}
 }
 
-// route dispatches one inbound frame. Peers may only send media-signaling
-// frames; control types are server-originated and rejected if received.
+// route dispatches one inbound frame. Peers send media-signaling frames (relayed
+// to another peer) and metrics frames (consumed by the control plane, never
+// relayed); every other type is server-originated and rejected if received.
 func (h *Hub) route(roomID string, sender *member, msg Message) {
 	switch msg.Type {
 	case TypeOffer, TypeAnswer, TypeCandidate:
@@ -232,10 +297,32 @@ func (h *Hub) route(roomID string, sender *member, msg Message) {
 			sender.send(Message{Type: TypeError, To: sender.id,
 				Error: fmt.Sprintf("unknown peer %q in room", msg.To)})
 		}
+	case TypeMetrics:
+		// Telemetry is for the coordinator, not another peer: hand the raw payload
+		// to the observer and stop. Without a coordinator (Phases 1–3) it is simply
+		// dropped — a peer that reports into a relay-only server loses nothing.
+		if h.obs != nil {
+			h.obs.Metrics(roomID, sender.id, msg.Payload)
+		}
 	default:
 		sender.log.Warn("ignoring unexpected frame type from peer",
 			slog.String("peer_id", sender.id), slog.String("type", string(msg.Type)))
 	}
+}
+
+// SendTo delivers a server-originated frame to one peer by id within a room, the
+// path the coordinator uses to push a computed topology down. Like relay, the
+// lookup happens under the lock and the send after it is released; it returns false
+// if no such peer is present (e.g. it left between compute and push).
+func (h *Hub) SendTo(roomID, peerID string, msg Message) bool {
+	h.mu.Lock()
+	dst := h.rooms[roomID][peerID]
+	h.mu.Unlock()
+	if dst == nil {
+		return false
+	}
+	dst.send(msg)
+	return true
 }
 
 // relay forwards msg to the peer named by msg.To within roomID. It returns false

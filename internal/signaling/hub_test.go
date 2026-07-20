@@ -128,6 +128,43 @@ func TestHubRelayToUnknownPeerErrors(t *testing.T) {
 	}
 }
 
+// TestHubRejectsDuplicateName proves the fail-loud name-uniqueness rule: a second
+// peer claiming a live name is rejected with an error frame (not admitted into an
+// ambiguous roster that would strand a tree child), while a distinct name still
+// joins fine.
+func TestHubRejectsDuplicateName(t *testing.T) {
+	srv, wsURL := newTestServer(t)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// First "leaf" joins cleanly.
+	connA := dial(ctx, t, wsURL+"&name=leaf")
+	defer connA.CloseNow()
+	if m := readMsg(ctx, t, connA); m.Type != TypeJoined {
+		t.Fatalf("A first frame = %q, want %q", m.Type, TypeJoined)
+	}
+
+	// Second "leaf" must be rejected with an error naming the clash.
+	connB := dial(ctx, t, wsURL+"&name=leaf")
+	defer connB.CloseNow()
+	m := readMsg(ctx, t, connB)
+	if m.Type != TypeError {
+		t.Fatalf("duplicate-name peer got %q, want %q", m.Type, TypeError)
+	}
+	if !strings.Contains(m.Error, "leaf") {
+		t.Errorf("error %q does not mention the duplicate name", m.Error)
+	}
+
+	// A distinct name still joins.
+	connC := dial(ctx, t, wsURL+"&name=relay")
+	defer connC.CloseNow()
+	if m := readMsg(ctx, t, connC); m.Type != TypeJoined {
+		t.Fatalf("distinct-name peer got %q, want %q", m.Type, TypeJoined)
+	}
+}
+
 // newTestServer mounts a fresh Hub on an httptest server and returns it plus the
 // ws:// URL of the /ws endpoint (room "demo").
 func newTestServer(t *testing.T) (*httptest.Server, string) {
