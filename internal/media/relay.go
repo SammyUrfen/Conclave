@@ -278,9 +278,9 @@ func (f *forwarder) keyframeForChild(child string) {
 // removeChild prunes every forwarding leg toward a departed child, so the forward
 // loop stops iterating dead legs and outs cannot grow without bound across
 // join/leave churn. The child's RTCP-drain goroutine exits on its own (its sender
-// closes), which is what drops the meter gauge — this only trims the slices. A fresh
-// slice is allocated rather than mutated in place so a concurrent forward() holding
-// an older snapshot is unaffected.
+// closes with the child's session), which is what drops the meter gauge — this only
+// trims the slices. A fresh slice is allocated rather than mutated in place so a
+// concurrent forward() holding an older snapshot is unaffected.
 func (f *forwarder) removeChild(child string) {
 	f.mu.Lock()
 	for _, s := range f.sources {
@@ -292,6 +292,26 @@ func (f *forwarder) removeChild(child string) {
 		}
 		s.outs = kept
 	}
+	f.mu.Unlock()
+}
+
+// removeSource drops the forwardSource for a departed SOURCE peer — the peer whose
+// media the relay was fanning out. removeChild only handles the departed peer in its
+// CHILD role (legs INTO it, which die when its own session closes); a peer that was
+// a source leaves behind an f.sources entry that nothing else ever deletes, so
+// without this the map grows without bound across sender churn. The source's own
+// read loop (forward) has already returned (its TrackRemote closed), so deleting the
+// entry is safe.
+//
+// Honest limit (Phase 5): the source's downstream legs live on OTHER children's
+// still-open sessions, so their tracks and RTCP-drain goroutines linger — and keep
+// their meter gauge up — until those children themselves leave. Tearing them down
+// now would mean RemoveTrack on established sessions, i.e. the renegotiation that is
+// Phase 5's job. This trims the unbounded map growth (the real leak) and leaves the
+// bounded, self-resolving remainder to the churn phase.
+func (f *forwarder) removeSource(src string) {
+	f.mu.Lock()
+	delete(f.sources, src)
 	f.mu.Unlock()
 }
 

@@ -2,6 +2,7 @@ package media
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"sync"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/pion/webrtc/v4"
 
+	"github.com/SammyUrfen/conclave/internal/overlay"
 	"github.com/SammyUrfen/conclave/internal/signaling"
 )
 
@@ -24,9 +26,17 @@ type RouterConfig struct {
 	// Topology, when non-nil, switches the Router from full mesh to tree mode: a
 	// peer opens a session only to its topology neighbours (not to every other
 	// peer), and a relay forwards media among them. SelfName is this peer's label
-	// in that topology (how it finds itself among the edges). Nil ⇒ mesh (Phase 2).
-	Topology *Topology
+	// in that topology (how it finds itself among the edges). Nil ⇒ mesh (Phase 2),
+	// unless Managed is set.
+	Topology *overlay.Topology
 	SelfName string
+
+	// Managed puts the Router in tree mode with NO static topology: it waits for the
+	// coordinator to push one over signaling (a TypeTopology frame) and realises it
+	// at run time (Phase 4). A managed peer connects to nobody until its first
+	// topology arrives, then behaves exactly as a static-tree peer would. Ignored
+	// when Topology is non-nil (an explicit tree wins over a pushed one).
+	Managed bool
 }
 
 // Router owns a signaling.Client and turns its single inbound frame stream into
@@ -56,6 +66,12 @@ type Router struct {
 	selfID   string
 	selfName string
 	peers    map[string]*peerLink
+	// topo is the CURRENT topology driving tree decisions. In static tree mode it is
+	// set once at construction; in managed mode it starts nil and is replaced each
+	// time the coordinator pushes a new one (applyTopology). Guarded by mu because
+	// applyTopology runs on the Run goroutine while Stats/remote-track sinks read it
+	// from others.
+	topo *overlay.Topology
 	// name↔id maps translate between the stable topology names and the runtime ids
 	// the server assigns. Filled from the joined roster + peer-joined/peer-left, so
 	// every tree decision is made in names and resolved to an id here.
@@ -80,15 +96,42 @@ func NewRouter(log *slog.Logger, client *signaling.Client, cfg RouterConfig) *Ro
 		cfg:      cfg,
 		meter:    &uploadMeter{},
 		selfName: cfg.SelfName,
+		topo:     cfg.Topology,
 		peers:    make(map[string]*peerLink),
 		nameByID: make(map[string]string),
 		idByName: make(map[string]string),
 	}
-	// A relay in tree mode gets a forwarder; a leaf (or mesh peer) does not.
-	if cfg.Topology != nil && cfg.Topology.IsRelay(cfg.SelfName) {
+	// Create the forwarder now if this peer is (static tree) or may become (managed)
+	// a relay. Building it up front — rather than lazily when a pushed topology first
+	// promotes a managed leaf — keeps r.fwd write-once and so free of any read/write
+	// race with the pion goroutines that consult it; an unused forwarder on a leaf is
+	// inert (empty maps, no goroutines). Whether it is ACTUALLY used for a given
+	// track is gated on the live topology via isRelayNow(), not on fwd != nil.
+	if cfg.Managed || (cfg.Topology != nil && cfg.Topology.IsRelay(cfg.SelfName)) {
 		r.fwd = newForwarder(r.log, r.meter, r.spawnTracked)
 	}
 	return r
+}
+
+// treeMode reports whether the Router runs as a tree (static or coordinator-managed)
+// rather than a full mesh.
+func (r *Router) treeMode() bool { return r.cfg.Topology != nil || r.cfg.Managed }
+
+// currentTopo returns the topology in force right now (nil in mesh mode, or in
+// managed mode before the first push). Safe to call concurrently with applyTopology.
+func (r *Router) currentTopo() *overlay.Topology {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.topo
+}
+
+// isRelayNow reports whether this peer forwards media under the CURRENT topology.
+// It — not "do we hold a forwarder" — is the authority on whether an arriving track
+// should be fanned out, because a managed peer always holds a forwarder but is only
+// sometimes a relay.
+func (r *Router) isRelayNow() bool {
+	t := r.currentTopo()
+	return t != nil && t.IsRelay(r.selfName)
 }
 
 // spawnTracked runs fn as a goroutine joined by the Router's WaitGroup, so shutdown
@@ -202,8 +245,51 @@ func (r *Router) handle(ctx context.Context, msg signaling.Message) {
 		r.forgetPeer(msg.From)
 	case signaling.TypeOffer, signaling.TypeAnswer, signaling.TypeCandidate:
 		r.deliver(msg)
+	case signaling.TypeTopology:
+		r.applyTopology(ctx, msg.Payload)
 	case signaling.TypeError:
 		r.log.Warn("signaling error frame", slog.String("error", msg.Error))
+	}
+}
+
+// applyTopology realises a topology the coordinator pushed (managed mode). It
+// swaps in the new tree and opens a session to every neighbour it can already
+// resolve to an id; a neighbour not yet in the roster is picked up later, when its
+// peer-joined frame runs maybeStartPeer against this now-current topology. The two
+// orders — topology-then-peer and peer-then-topology — both converge, because both
+// funnel through maybeStartPeer and startPeer is idempotent per peer.
+//
+// Phase 4 is deliberately ADDITIVE: it connects new neighbours but does not tear
+// down a session to a peer the new tree drops. Mid-call re-parenting and teardown
+// (and the renegotiation a new upstream source forces onto existing children) are
+// the churn problem Phase 5 owns; doing them here would be a half-built version of
+// that phase. A dropped-neighbour is logged so the gap is visible, not silent.
+func (r *Router) applyTopology(ctx context.Context, payload []byte) {
+	if !r.cfg.Managed {
+		r.log.Debug("ignoring pushed topology (not in managed mode)")
+		return
+	}
+	var topo overlay.Topology
+	if err := json.Unmarshal(payload, &topo); err != nil {
+		r.log.Warn("bad topology payload", slog.Any("error", err))
+		return
+	}
+	r.mu.Lock()
+	r.topo = &topo
+	r.mu.Unlock()
+
+	neighbors := topo.NeighborsOf(r.selfName)
+	r.log.Info("applied pushed topology",
+		slog.Int("edges", len(topo.Edges)), slog.Bool("relay", topo.IsRelay(r.selfName)),
+		slog.Any("neighbors", neighbors))
+
+	for _, name := range neighbors {
+		r.mu.Lock()
+		id := r.idByName[name]
+		r.mu.Unlock()
+		if id != "" {
+			r.maybeStartPeer(ctx, id)
+		}
 	}
 }
 
@@ -232,22 +318,26 @@ func (r *Router) forgetPeer(id string) {
 // maybeStartPeer starts a session with peerID, except in tree mode where a peer
 // only connects to its topology neighbours — everyone else is reached *through* the
 // tree, which is the entire point of the relay (a leaf holds one connection, not
-// N−1).
+// N−1). In managed mode with no topology pushed yet, it connects to nobody.
 func (r *Router) maybeStartPeer(ctx context.Context, peerID string) {
-	if r.cfg.Topology != nil {
+	if r.treeMode() {
+		topo := r.currentTopo()
+		if topo == nil {
+			return
+		}
 		r.mu.Lock()
 		peerName := r.nameByID[peerID]
 		r.mu.Unlock()
-		if peerName == "" || !r.isNeighbor(peerName) {
+		if peerName == "" || !neighborOf(topo, r.selfName, peerName) {
 			return
 		}
 	}
 	r.startPeer(ctx, peerID)
 }
 
-// isNeighbor reports whether name is directly linked to us in the topology.
-func (r *Router) isNeighbor(name string) bool {
-	for _, n := range r.cfg.Topology.NeighborsOf(r.selfName) {
+// neighborOf reports whether name is directly linked to self in topo.
+func neighborOf(topo *overlay.Topology, self, name string) bool {
+	for _, n := range topo.NeighborsOf(self) {
 		if n == name {
 			return true
 		}
@@ -276,13 +366,14 @@ func (r *Router) startPeer(ctx context.Context, peerID string) {
 	// (the relay offers every edge, because only an offer can add its forwarded
 	// m-lines), and a relay proactively asks upstream for a keyframe when a child
 	// connects, so the joiner gets an I-frame instead of black video.
+	topo := r.currentTopo()
 	var offererOverride *bool
 	var onState func(webrtc.PeerConnectionState)
-	if r.cfg.Topology != nil {
-		o := r.cfg.Topology.Offers(r.selfName, peerName)
+	if topo != nil {
+		o := topo.Offers(r.selfName, peerName)
 		offererOverride = &o
 	}
-	if r.fwd != nil {
+	if r.isRelayNow() {
 		childName := peerName
 		onState = func(st webrtc.PeerConnectionState) {
 			if st == webrtc.PeerConnectionStateConnected {
@@ -322,8 +413,8 @@ func (r *Router) startPeer(ctx context.Context, peerID string) {
 	//   offerer, no media → a recvonly transceiver so it still has something to offer
 	var track *webrtc.TrackLocalStaticSample
 	switch {
-	case r.fwd != nil:
-		r.setupRelayEdge(session, peerName)
+	case r.isRelayNow():
+		r.setupRelayEdge(session, topo, peerName)
 	case r.cfg.SendMedia:
 		track, err = session.AddVideoTrack("video", "conclave")
 		if err != nil {
@@ -353,7 +444,7 @@ func (r *Router) startPeer(ctx context.Context, peerID string) {
 // into a first offer plus one renegotiation. Either way this converges without glare
 // — the relay is the sole offerer on the edge, so there is never a colliding offer
 // to reconcile (which pion could not roll back anyway).
-func (r *Router) setupRelayEdge(session *Session, peerName string) {
+func (r *Router) setupRelayEdge(session *Session, topo *overlay.Topology, peerName string) {
 	// Receive peerName's own media; the reader is wired in remoteTrackSink.
 	if err := session.AddRecvOnlyVideo(); err != nil {
 		r.log.Warn("relay recvonly transceiver", slog.String("peer_name", peerName), slog.Any("error", err))
@@ -361,7 +452,7 @@ func (r *Router) setupRelayEdge(session *Session, peerName string) {
 	r.fwd.setUpstream(peerName, session)
 
 	// This edge also carries every OTHER neighbour's media down to peerName.
-	for _, src := range r.cfg.Topology.NeighborsOf(r.selfName) {
+	for _, src := range topo.NeighborsOf(r.selfName) {
 		if src == peerName {
 			continue
 		}
@@ -421,8 +512,10 @@ func (r *Router) remoteTrackSink(ctx context.Context, peerID string) func(*webrt
 
 		// Relay: this is a source's media — hand the single reader to the forwarder
 		// to fan out. A TrackRemote has exactly ONE reader, so the relay must not
-		// also record/count it here; the forwarder's read loop IS the reader.
-		if r.fwd != nil {
+		// also record/count it here; the forwarder's read loop IS the reader. Gated
+		// on the LIVE topology, not on holding a forwarder: a managed peer always
+		// holds one but is only a relay while the current tree gives it children.
+		if r.isRelayNow() {
 			r.fwd.forward(peerName, track)
 			return
 		}
@@ -485,11 +578,14 @@ func (r *Router) stopPeer(peerID string) {
 	if link.session != nil {
 		_ = link.session.Close()
 	}
-	// Relay: drop this child's forwarding legs so the forward loop stops iterating
-	// dead legs and outs can't grow across join/leave churn. (The child's RTCP-drain
-	// exits on its own when its sender closes, which is what drops the meter gauge.)
+	// Relay: drop the departed peer in BOTH forwarding roles. removeChild trims the
+	// legs INTO it (its own session closing reaps their drains); removeSource drops
+	// the forwardSource for its media so f.sources can't grow without bound as senders
+	// churn. (Its downstream legs on surviving children linger until they leave — a
+	// Phase-5 teardown item, see removeSource.)
 	if r.fwd != nil && peerName != "" {
 		r.fwd.removeChild(peerName)
+		r.fwd.removeSource(peerName)
 	}
 	r.log.Info("session stopped", slog.String("peer_id", peerID))
 }
