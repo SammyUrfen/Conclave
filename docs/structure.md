@@ -40,16 +40,19 @@ conclave/
 │   │   ├── hub_test.go          integration test: two real ws clients join/relay/leave, under -race.
 │   │   ├── client_test.go       table-driven wsURLFor test.
 │   │   └── doc.go               package doc (control/data-plane split, server-authoritative identity).
-│   ├── media/                   LIVE. data plane: pion/webrtc sessions + full mesh (relay path Phase 3).
-│   │   ├── session.go           Session: PeerConnection (VP8 pinned) + single-offerer negotiation (pion can't rollback).
+│   ├── media/                   LIVE. data plane: pion/webrtc sessions, full mesh + tree relay (peer-SFU).
+│   │   ├── session.go           Session: PeerConnection (VP8 pinned) + single-offerer negotiation (pion can't rollback); AddForwardTrack/WriteRTCP for relaying.
 │   │   ├── transport.go         Transport interface (consumer-defined): Send + Incoming signaling frames.
-│   │   ├── router.go            Router: demux one signaling.Client into per-peer Sessions; media policy + Stats() snapshot.
+│   │   ├── topology.go          Topology: hardcoded relay tree (edges in names) + pure Parent/Children/Neighbors/IsRelay/Offers queries.
+│   │   ├── relay.go             forwarder: per-source read→fan-out (TrackRemote→TrackLocalStaticRTP) + SSRC-translated, throttled upstream PLI.
+│   │   ├── router.go            Router: demux into per-peer Sessions; mesh OR tree mode (name↔id, neighbour-only, relay setup); Stats() snapshot.
 │   │   ├── source.go            outbound: PlayIVF (file) / SendSynthetic → a sampleWriter (interface over the track).
 │   │   ├── sink.go              inbound: RecordVP8 (→ IVF file) / DrainAndCount over a TrackRemote.
 │   │   ├── meter.go             upload meter: sync/atomic byte counter + 1s sampler logging aggregate/per-peer kbit/s.
 │   │   ├── session_test.go      integration test: two sessions connect over loopback + forward a track, -race.
 │   │   ├── mesh_test.go         integration test: 3 peers full-mesh over the real Hub + bidirectional media, -race.
-│   │   └── doc.go               package doc (data plane; Phase 3 grows the relay-forwarding core).
+│   │   ├── relay_test.go        Topology unit + deterministic PLI-SSRC-translation unit + 3-peer tree forwarding integration, -race.
+│   │   └── doc.go               package doc (data plane; mesh + the elected-relay forwarding core).
 │   ├── overlay/                 forwarding-graph model + BuildTree (PURE: greedy, degree-bounded, depth-limited).
 │   │   └── doc.go               Planned (Phase 4).
 │   ├── metrics/                 telemetry types {upload, rtt, loss, cpu, nat} + coordinator fan-in.
@@ -118,7 +121,7 @@ The golden rule: **imports point one way and never cycle.** Read the "May import
 |---|---|---|---|---|
 | `logging` | slog handler construction, level/format parsing | **Live (Phase 0)** | — (leaf) | everything (`cmd/*`, most `internal/*`) |
 | `signaling` | WS transport, rooms, message relay (SDP/ICE opaque) | **Live (Phase 1)** | `logging` | `cmd/*`, `coordinator` (via interface) |
-| `media` | pion sessions + full mesh, single-offerer negotiation, upload meter; RTP/RTCP relay forwarding (P3) | **Live (Phase 2)** | `logging`, `signaling` | `cmd/peer` |
+| `media` | pion sessions; full mesh + tree relay (peer-SFU RTP forwarding, upstream PLI); single-offerer negotiation; upload meter | **Live (Phase 3)** | `logging`, `signaling` | `cmd/peer` |
 | `overlay` | graph model + pure `BuildTree` heuristic | Phase 4 | — (leaf, pure) | `coordinator`, `simnet` |
 | `metrics` | telemetry types + coordinator fan-in | Phase 4 | `logging` | `coordinator`, peers (producers) |
 | `coordinator` | metrics → `BuildTree` → signaling; hysteresis; failover; migration | Phase 4+ (election Phase 6) | `overlay`, `metrics`, `signaling` | `cmd/*`, `simnet` |

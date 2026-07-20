@@ -83,7 +83,9 @@ with `logger.With(...)` rather than repeated at each call site.
 | `self_id` | string | **Live** | This node's own server-assigned peer id (e.g. on `joined room`) |
 | `room_id` | string | **Live** | Meeting/room the event belongs to |
 | `room_size` | int | **Live** | Members in the room after a join/leave |
-| `component` | string | **Live** | Sub-service within a binary: `signaling` \| `signaling-client` \| `media` \| `media-router` |
+| `component` | string | **Live** | Sub-service within a binary: `signaling` \| `signaling-client` \| `media` \| `media-router` \| `relay` \| `upload-meter` |
+| `self_name` / `peer_name` | string | **Live** | Stable topology labels (tree mode): this peer's name, and the neighbour a line is about |
+| `source` / `child` | string | **Live** | Relay forwarding: the media source being fanned out, and the downstream child a leg targets |
 | `state` | string | **Live** | WebRTC state on a transition (`connecting`/`connected`/`failed`; ICE or PeerConnection) |
 | `offerer` | bool | **Live** | Negotiation role — `true` if this peer initiates offers; the other only answers (glare-free single-offerer, since pion can't roll back a local offer) |
 | `kbit_per_sec` | float64 | **Live** | Aggregate outbound send rate across all tracks, sampled each second (`upload` message) |
@@ -93,7 +95,7 @@ with `logger.With(...)` rather than repeated at each call site.
 | `ssrc` | uint32 | **Live** | RTP synchronization source of a remote track |
 | `packets` | int | **Live** | RTP packet count recorded/received on a track |
 | `from` / `type` / `sdp_type` | string | **Live** | Signaling-frame fields mirrored into logs (sender id, message type, SDP kind) |
-| `parent_id` | string | Reserved (Phase 3) | Upstream node in the relay tree (edge source) |
+| `parent_id` | string | Reserved (Phase 4) | Coordinator-computed upstream node in the relay tree (Phase 3 uses `self_name`/`source`/`child`) |
 | `role` | string | Reserved (Phase 4) | `coordinator` \| `relay` \| `leaf` |
 | `rtt_ms` | int/float | Reserved (Phase 4) | Measured round-trip latency, milliseconds |
 | `upload_bps` | int | Reserved (Phase 4) | Measured upload bandwidth, bits/sec (the scarce resource) |

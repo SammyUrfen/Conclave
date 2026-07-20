@@ -70,7 +70,7 @@ Full narrative and trade-offs: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 | **0** | **Repo bootstrap & Go foundations** | ✅ **done** |
 | **1** | **Signaling server + 2-peer WebRTC call** | ✅ **done** |
 | 2 | Full mesh up to ~4 peers (feel the ceiling) | ✅ **done** |
-| 3 | Static relay tree — *the peer SFU* ⭐ novel core | ⬜ |
+| 3 | Static relay tree — *the peer SFU* ⭐ novel core | ✅ **done** |
 | 4 | Metrics plane + coordinator computes the tree | ⬜ |
 | 5 | Join/leave handover with backup parents | ⬜ |
 | 6 | Coordinator election + migration | ⬜ |
@@ -102,6 +102,20 @@ Hub) and a live 4-peer demo. **The measured ceiling:** real 720p VP8 ≈1.5 Mbit
 stream, so each peer uploads ≈4.6 Mbit/s at 4 peers and ≈6 Mbit/s at 5 — enough to
 saturate a typical home uplink. That linear cost is the whole reason for the elected
 SFU that Phase 3 begins.
+
+**Phase 3 delivers:** the novel core — a **participant that forwards other
+participants' media**. A hardcoded tree (`-topology tree.json`, `-name`) makes one
+peer a *relay*: it reads each source's RTP (`TrackRemote.ReadRTP`) and fans it out to
+the other children (`TrackLocalStaticRTP.WriteRTP`) with **no re-encode**, plumbing
+keyframe requests (PLI) back upstream to the original sender with the SSRC translated
+(the classic SFU footgun). Signaling now carries a stable peer name so a tree authored
+in names resolves to runtime ids. Verified by a 3-peer `-race` test (a leaf receives
+another leaf's media *through the relay*, with no direct session to the source — a
+topological proof — plus a deterministic SSRC-translation test and clean-shutdown
+join) and a live demo: a relay forwarded a leaf's real 720p VP8 to another leaf, which
+recorded **124 decodable frames** it could only have received via the relay. Honest
+limit: file/synthetic sources have no live encoder, so PLI *plumbing* is proven but
+keyframe *response* awaits a browser sender (Phase 7).
 
 ---
 
@@ -164,7 +178,7 @@ conclave/
   internal/             # compiler-enforced private packages (package-by-feature)
     logging/            # slog construction + level parsing  (live)
     signaling/          # WS hub + peer client, SDP/ICE relay (live)
-    media/              # pion sessions + mesh, single-offerer negotiation, upload meter (live; relay Phase 3)
+    media/              # pion sessions, mesh + tree relay (peer-SFU), upload meter (live)
     overlay/            # graph model + greedy tree builder   (Phase 4)
     metrics/            # telemetry types, collection, fan-in (Phase 4)
     coordinator/        # election + graph orchestration      (Phase 4+)

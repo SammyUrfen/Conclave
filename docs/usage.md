@@ -244,6 +244,42 @@ elected relay (Phase 3+) exists to break. (Measured on one host over loopback, s
 it's the honest per-stream bitrate × (N−1); the real cross-machine collapse point is
 a projection from those numbers.)
 
+### Tree relay — the peer-SFU (Phase 3)
+
+Instead of everyone-to-everyone, elect one peer to *forward* for the others. The tree
+is hardcoded in a shared JSON file (names, not runtime ids), and each peer is given
+its name with `-name`:
+
+```console
+$ cat tree.json
+{ "edges": [ {"parent":"relay","child":"leaf-b"}, {"parent":"relay","child":"leaf-d"} ] }
+```
+
+Four terminals — the server, the relay, a sender leaf, a recorder leaf:
+
+```console
+$ make run-server
+$ ./bin/peer -call -room tree -name relay  -topology tree.json          # pure forwarder
+$ ./bin/peer -call -room tree -name leaf-b -topology tree.json -media call720.ivf
+$ ./bin/peer -call -room tree -name leaf-d -topology tree.json -record out.ivf
+```
+
+`leaf-d` connects **only** to the relay — never to `leaf-b` — yet `out.ivf` is
+`leaf-b`'s video (`ffprobe out.ivf` → `codec_name=vp8`): the relay read `leaf-b`'s RTP
+and fanned it out with no re-encode. Notes:
+
+- **`-topology` requires `-name`** (a peer must know which node it is); a bad topology
+  file fails loud at startup. Omit both ⇒ full-mesh mode.
+- **The relay's upload is what scales.** Watch `msg="upload" component=upload-meter`
+  on the relay climb with its child count while each leaf stays flat at one stream —
+  the whole point of the elected SFU, and Phase 2's ceiling inverted.
+- **Keyframes:** the relay forwards PLI (keyframe requests) upstream to the original
+  sender with the SSRC translated (`-log-level debug` shows `forwarded keyframe
+  request upstream`). A *file* source can't act on a PLI (no live encoder), so a late
+  joiner decodes from the file's next natural keyframe; a real browser sender (Phase 7)
+  would respond on demand.
+- **Depth ≤ 2, single relay** for now — no election or migration yet (Phases 4–6).
+
 ---
 
 ## The `/healthz` contract
