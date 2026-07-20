@@ -2,7 +2,7 @@
 
 How to run and drive the two binaries: the central `server` and the `peer`. Everything below is real, current behavior — every log line and HTTP response in this doc was captured from the actual binaries, not hand-written. Anything not yet built is marked **Planned (Phase N)**.
 
-> **Status — Phase 1 (signaling + 2-peer call).** The `server` answers `GET /healthz` **and** hosts the WebSocket signaling hub at `GET /ws?room=<id>`. The `peer` has two modes: the Phase 0 **probe** (dial `/healthz` once and exit) and **call** (`-call`: join a room and establish a WebRTC call, optionally sending a VP8 track and recording the received one). Media flows peer-to-peer over WebRTC (SRTP/UDP); the server only relays signaling frames.
+> **Status — Phase 4 (coordinator computes the tree).** The `server` answers `GET /healthz`, hosts the WebSocket signaling hub at `GET /ws?room=<id>&name=<label>`, and — with `-coordinate` — runs the **coordinator**: it ingests peer telemetry, computes a relay tree, and pushes it. The `peer` has three call flavours: a plain 2-peer/mesh call, a **static tree** (`-topology tree.json -name …`, Phase 3), and a **managed** call (`-managed`, Phase 4) where it reports telemetry and realises the pushed tree. Media flows peer-to-peer over WebRTC (SRTP/UDP); the server only relays signaling frames and computes topology — it never touches media.
 
 ---
 
@@ -46,6 +46,10 @@ Always-up control node. Today it serves `GET /healthz`; from Phase 1 on it grows
 | `-addr` | `:9000` | TCP address to listen on, `host:port`. `:9000` binds all interfaces on port 9000; `127.0.0.1:9000` binds loopback only. |
 | `-log-level` | `info` | Minimum level to emit: `debug` \| `info` \| `warn` \| `error`. Case-insensitive; `warning` is accepted as `warn`. Unknown value → startup error (exit 1). |
 | `-log-format` | `text` | `text` (human `key=value`) or `json` (one object per line). Any unrecognized value falls back to `json` rather than erroring. |
+| `-coordinate` | `false` | **Phase 4.** Run the coordinator: observe room membership/telemetry and push a computed relay tree to managed peers. Off ⇒ a plain signaling relay (Phases 1–3 unchanged). |
+| `-max-depth` | `2` | Coordinator: max relay-tree depth in hops root→leaf (latency accumulates per hop, so kept small). |
+| `-stream-kbps` | `2000` | Coordinator: assumed per-stream upload cost. A node's child capacity = its advertised upload budget ÷ this. |
+| `-default-upload-kbps` | `0` | Coordinator: upload budget assumed for a peer that hasn't reported yet. `0` ⇒ treat it as a **leaf** until its first report proves it can relay (conservative; prevents a transient wrong-relay tree). |
 
 ### `peer` — participant node (probe + call)
 
@@ -63,6 +67,11 @@ A conclave participant with two modes. **Probe** (default) is the Phase 0 health
 | `-media` | `""` | VP8 IVF file to stream (looped). Empty sends synthetic, non-decodable frames that still prove the transport (RTP flows, the far side's `OnTrack` fires). |
 | `-record` | `""` | Write the first received track to this IVF file. Empty just counts packets. A real VP8 sender produces a playable file. |
 | `-stun` | `""` | STUN server URL, e.g. `stun:stun.l.google.com:19302`. Empty is fine on one host (host candidates connect directly); needed for two machines behind NAT. |
+| `-name` | `""` | **Tree modes.** This peer's stable label in the topology (e.g. `relay`, `leaf-b`). Required by `-topology` and `-managed` so the peer can locate itself; carried to the server as `?name=`. |
+| `-topology` | `""` | **Static tree (Phase 3).** Path to a JSON tree file (edges in names). Enables tree mode; requires `-name`; fails loud on a malformed tree. Empty ⇒ full mesh. |
+| `-managed` | `false` | **Managed tree (Phase 4).** Report telemetry and realise the coordinator's pushed tree. Requires `-name`; mutually exclusive with `-topology`. |
+| `-upload-kbps` | `3000` | **Managed mode.** Advertised upload budget for forwarding others' media. High ⇒ likely a relay; `0` ⇒ a forced leaf. |
+| `-nat` | `direct` | **Managed mode.** Declared NAT class: `direct` \| `turn`. `turn` (symmetric/CGNAT) forces this peer to a leaf. Unknown value → startup error (exit 1). |
 
 ---
 
@@ -279,6 +288,40 @@ and fanned it out with no re-encode. Notes:
   joiner decodes from the file's next natural keyframe; a real browser sender (Phase 7)
   would respond on demand.
 - **Depth ≤ 2, single relay** for now — no election or migration yet (Phases 4–6).
+
+### Managed room — the coordinator computes the tree (Phase 4)
+
+Drop the JSON file: with `-coordinate` on the server and `-managed` on the peers, the
+tree is *computed from telemetry*, not authored. Each peer advertises an upload budget
+(`-upload-kbps`) and NAT class (`-nat`); the coordinator elects the highest-upload peer
+as the root relay, runs the greedy `BuildTree`, and pushes the result down a `topology`
+frame that each peer realises with the same relay machinery.
+
+```console
+$ make run-server ARGS="-coordinate -stream-kbps 2000 -max-depth 2"
+… msg="coordinator enabled" component=… max_depth=2 stream_kbps=2000
+… msg="computed topology" component=coordinator room_id=mgmt root=relay nodes=3 edges=2
+
+$ ./bin/peer -call -managed -room mgmt -name relay  -upload-kbps 8000               # strong ⇒ elected relay
+$ ./bin/peer -call -managed -room mgmt -name leaf-b -upload-kbps 0 -media call.ivf  # sender leaf
+$ ./bin/peer -call -managed -room mgmt -name leaf-d -upload-kbps 0 -record out.ivf  # receiver leaf
+```
+
+`leaf-d`'s log shows `applied pushed topology … relay=false neighbors=[relay]` — it
+connects only to the relay — and `out.ivf` is `leaf-b`'s VP8 forwarded through it
+(`ffprobe out.ivf` → `codec_name=vp8`). Notes:
+
+- **`-managed` requires `-name`** and is mutually exclusive with `-topology`. A peer
+  reports telemetry every few seconds; the coordinator recomputes on join/leave (and a
+  node's first report), never on a mere metric wiggle (anti-thrash).
+- **Upload budget shapes the tree.** Give two peers high `-upload-kbps` and the builder
+  makes a two-level tree under the depth bound; mark a peer `-nat turn` and it is forced
+  to a leaf no matter how much upload it claims.
+- **Additive apply (Phase 4 scope).** A *new* peer joining attaches cleanly; mid-call
+  re-parenting/teardown and a new upstream source's renegotiation are Phase 5. Keep one
+  clearly-strongest relay so the root doesn't change mid-call.
+- **Deterministic testing.** All the graph/churn logic is exercised media-free by the
+  `simnet` harness (`go test ./internal/simnet/...`) — see `docs/testing.md`.
 
 ---
 

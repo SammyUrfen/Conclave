@@ -26,8 +26,8 @@ participants and can *migrate***. Learning/portfolio project, not shipping.
 | 1 | Signaling + 2-peer WebRTC call | ✅ done |
 | 2 | Full mesh to ~4 peers (feel the ceiling) | ✅ done |
 | 3 | Static relay tree — the peer SFU ⭐ | ✅ done |
-| 4 | Metrics plane + coordinator computes the tree | ⬜ next |
-| 5 | Join/leave handover + backup parents | ⬜ |
+| 4 | Metrics plane + coordinator computes the tree | ✅ done |
+| 5 | Join/leave handover + backup parents | ⬜ next |
 | 6 | Coordinator election + migration | ⬜ |
 | 7 | Simulcast/SVC, TURN, polish & demo | ⬜ |
 

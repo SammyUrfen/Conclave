@@ -71,7 +71,7 @@ Full narrative and trade-offs: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 | **1** | **Signaling server + 2-peer WebRTC call** | ✅ **done** |
 | 2 | Full mesh up to ~4 peers (feel the ceiling) | ✅ **done** |
 | 3 | Static relay tree — *the peer SFU* ⭐ novel core | ✅ **done** |
-| 4 | Metrics plane + coordinator computes the tree | ⬜ |
+| 4 | Metrics plane + coordinator computes the tree | ✅ **done** |
 | 5 | Join/leave handover with backup parents | ⬜ |
 | 6 | Coordinator election + migration | ⬜ |
 | 7 | Simulcast/SVC, TURN fallback, polish & demo | ⬜ |
@@ -116,6 +116,24 @@ join) and a live demo: a relay forwarded a leaf's real 720p VP8 to another leaf,
 recorded **124 decodable frames** it could only have received via the relay. Honest
 limit: file/synthetic sources have no live encoder, so PLI *plumbing* is proven but
 keyframe *response* awaits a browser sender (Phase 7).
+
+**Phase 4 delivers:** the tree stops being hardcoded — a **coordinator computes it
+from live telemetry**. Peers report an upload budget + NAT class (`internal/metrics`);
+a coordinator running in the server fans those reports in on a single-goroutine event
+loop and runs a pure greedy **`overlay.BuildTree`** (degree-bounded by upload,
+depth-limited, min-latency, TURN→forced-leaf) on every membership change, pushing the
+result down a new `topology` frame that peers realise with the Phase-3 relay machinery
+(`-managed`, no `-topology` file). The star of the phase is the **`simnet`** harness:
+a deterministic, media-free network that drives the *real* `BuildTree` under hundreds
+of seeded random fleets and a long churn scenario, asserting an independent
+`overlay.Validate` oracle every step — the FoundationDB/TigerBeetle "deterministic
+simulation" idea in miniature. Verified three ways: the property/churn `simnet` tests,
+a `-race` coordinator test (async fan-in, root election, anti-thrash, leave-recompute)
+and a **live managed-room demo** whose leaf recorded **33 decodable VP8 frames**
+forwarded through a relay the *coordinator elected from telemetry* — the Phase-3
+topology, now computed. Honest limits: apply is **additive** (a new peer attaches; mid-call
+re-parent/teardown is Phase 5); upload/NAT are *declared* (real probing is Phase 7);
+recompute fires only on membership change (full hysteresis is Phase 5).
 
 ---
 
@@ -164,6 +182,22 @@ writes `out.ivf`, playable in any VP8 player. Omit `-media` to send synthetic
 frames (proves transport without a file); add `-stun stun:stun.l.google.com:19302`
 for two machines behind NAT.
 
+**Let the coordinator compute the tree (Phase 4):**
+
+```sh
+make run-server ARGS="-coordinate -stream-kbps 2000 -max-depth 2"   # coordinator ON
+
+# a strong relay advertises upload budget; leaves advertise little/none.
+go run ./cmd/peer -call -managed -name relay  -upload-kbps 8000 -room mgmt
+go run ./cmd/peer -call -managed -name leaf-b -upload-kbps 0 -media sample.ivf -room mgmt
+go run ./cmd/peer -call -managed -name leaf-d -upload-kbps 0 -record out.ivf   -room mgmt
+```
+
+No `-topology` file: each peer reports telemetry, the server elects the highest-upload
+peer as the root relay, computes `relay → {leaf-b, leaf-d}`, and pushes it. `leaf-d`
+records media forwarded *through the computed relay* (`ffprobe out.ivf` → `vp8`). A
+TURN-bound peer (`-nat turn`) is forced to a leaf.
+
 Every flag: [`docs/usage.md`](docs/usage.md). Tooling install: [`docs/setup.md`](docs/setup.md).
 
 ---
@@ -177,12 +211,12 @@ conclave/
     peer/main.go        # a participant node
   internal/             # compiler-enforced private packages (package-by-feature)
     logging/            # slog construction + level parsing  (live)
-    signaling/          # WS hub + peer client, SDP/ICE relay (live)
+    signaling/          # WS hub + peer client, SDP/ICE relay + metrics/topology frames (live)
     media/              # pion sessions, mesh + tree relay (peer-SFU), upload meter (live)
-    overlay/            # graph model + greedy tree builder   (Phase 4)
-    metrics/            # telemetry types, collection, fan-in (Phase 4)
-    coordinator/        # election + graph orchestration      (Phase 4+)
-    simnet/             # in-memory simulated network          (Phase 4)
+    overlay/            # tree model + pure greedy BuildTree + Validate oracle (live)
+    metrics/            # telemetry Report + peer-side Reporter (live)
+    coordinator/        # metrics fan-in → BuildTree → push (control-plane brain) (live)
+    simnet/             # deterministic media-free network driving real BuildTree (live)
   docs/                 # ROADMAP + living design docs
   Makefile
 ```

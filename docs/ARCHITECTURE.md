@@ -2,7 +2,7 @@
 
 > **What this document is.** The conceptual narrative and the trade-off record for conclave — *why* the system is shaped the way it is, not *how* to run it. If you want commands and milestones, read [`ROADMAP.md`](./ROADMAP.md); if you want package responsibilities, read the code. This file exists so that a future maintainer (probably future-me) can reconstruct the reasoning behind every load-bearing decision without re-deriving it.
 >
-> **Status:** living document, kept in sync with the roadmap. Ground truth as of **Phase 0 complete** (bootstrap + `/healthz` + logging). Everything past Phase 0 is design intent, labelled by phase.
+> **Status:** living document, kept in sync with the roadmap. Ground truth as of **Phase 4 complete** (elected peer-SFU + coordinator computes the tree from telemetry + `simnet` harness). Everything past Phase 4 (hysteresis/failover, election/migration, simulcast/TURN) is design intent, labelled by phase.
 >
 > **One-line framing:** an **SFU (Selective Forwarding Unit) that is *elected* from among the participants and can *migrate***.
 
@@ -194,6 +194,12 @@ Naming the trade-off honestly:
 - **Why that's the right call anyway:** (a) it's fast enough to run inside a control loop reacting to churn; (b) it's deterministic and easy to reason about and test; (c) — the honest kicker — **the inputs are noisy.** RTT and upload estimates jitter constantly. Optimizing hard against noisy measurements is *false precision*: you'd burn compute finding the "optimal" tree for numbers that are wrong by the time you finish. A fast, good-enough tree that we re-run on real changes beats a slow, "optimal" tree fit to noise.
 
 This is the same instinct as any greedy-vs-exact call in scheduling or routing: when the objective is fuzzy and the input churns, a cheap heuristic you can re-run beats an expensive optimum you can't.
+
+**Realized (Phase 4).** `overlay.BuildTree` is exactly this greedy heuristic (attach strongest-upload nodes first so they become the relays; each remaining node to the eligible parent with min RTT, then fewest children, then name); `overlay.Validate` is an independent oracle the tests assert against, and `overlay.PickRoot` is the default root policy (highest-upload non-TURN node). Three honest details worth pinning down:
+
+- **The coordinator runs *inside the central server* in Phase 4** — a documented stepping stone. It is already the always-up fan-in point, so hosting the role there defers coordinator-handover to Phase 6, where the role migrates to an elected peer and the server becomes pure arbiter (§8).
+- **RTT is unpopulated live** (measuring pairwise RTT before peers connect is a chicken-and-egg the coordinate-system/probe work of Phase 7 solves). `BuildTree` tolerates missing RTT — an unknown parent scores worst, so with no RTT the tie-break becomes *fewest children*, i.e. **load-balancing** attachment, which is the right default on a LAN. `simnet` injects real latency matrices to exercise the min-latency path.
+- **A not-yet-reported peer is treated as a leaf** (default upload 0) until its first report proves capacity — conservative, because Phase 4's apply is *additive* (it connects new neighbours but does not tear down a dropped one), so a transient wrong-relay tree could not be fully undone. Recompute fires only on a threshold event (join/leave/first report); full hysteresis on degradation is §7 / Phase 5.
 
 ---
 

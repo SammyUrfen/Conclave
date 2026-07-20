@@ -2,7 +2,7 @@ docs/testing.md
 
 # Testing
 
-> Living doc — kept in sync with the code. Reflects the tree at the end of Phase 1 (signaling + WebRTC media).
+> Living doc — kept in sync with the code. Reflects the tree at the end of Phase 4 (coordinator computes the tree + the `simnet` deterministic harness).
 
 How conclave is tested, why it's tested that way, and where the coverage honestly stops today. This is also a Go-testing primer: the two tests that exist are the reference implementations of the idiom you'll copy for the rest of the project.
 
@@ -19,7 +19,7 @@ How conclave is tested, why it's tested that way, and where the coverage honestl
 
 Everything that *can't* be pure — opening a socket, reading `os.Stdin`, exiting the process — is deliberately shoved to the program's edge. `main()` is a three-line `run(os.Args[1:]) error` hop precisely so that the logic under it never has to touch `os.Exit`. `logging.New` takes an `io.Writer` instead of hard-coding `os.Stdout`, so a test can point it at a `bytes.Buffer`. The logger is constructed once and injected downward; nothing reads a global. This is the same discipline as separating orchestration from mechanism — the mechanism stays testable, the orchestration stays thin.
 
-This matters more, not less, as the project grows. The Phase 4 overlay `BuildTree` and the Phase 6 election logic are the crown jewels, and they are the *hardest* things to test if they're entangled with pion, cameras, and real sockets. The plan (below) is to keep them pure — graph and policy in, graph and decisions out — so they can be tested deterministically with zero media stack.
+This matters more, not less, as the project grows. The overlay `BuildTree` (Phase 4, done) and the Phase 6 election logic are the crown jewels, and they are the *hardest* things to test if they're entangled with pion, cameras, and real sockets. Phase 4 made good on the plan: `overlay` is pure (graph + policy in, tree + decisions out), so `BuildTree`/`Validate` are unit-tested in microseconds and the `simnet` harness drives them under hundreds of seeded fleets and long churn scenarios — **with zero media stack**. The same purity is the foundation the Phase 5–6 logic will be built and tested on.
 
 **Priority order** (the owner's, applied to tests): Correctness > Reliability > UX > Maintainability > Performance. A test exists to catch a *correctness* regression first. We do not write tests for coverage theater, and we do not claim "done" without running them — `make check` is the gate.
 
@@ -135,9 +135,13 @@ Beyond the pure unit tests, Phase 1 adds two **integration** tests. They use rea
 | Signaling hub (join/roster/relay/spoof/leave) | `internal/signaling` | ✅ `TestHubRelaysBetweenPeers`, `TestHubRelayToUnknownPeerErrors` | **Integration:** two real ws clients over `httptest`. Proves server-stamped identity and routing. |
 | Media session (connect + forward a track) | `internal/media` | ✅ `TestSessionConnectsAndForwardsTrack` | **Integration:** two pion sessions, in-memory signaling, real loopback ICE+DTLS, synthetic VP8. Proves single-offerer negotiation + the media path. |
 | Full mesh (N-peer, bidirectional media, clean shutdown) | `internal/media` | ✅ `TestMeshThreePeersFullyConnect` | **Integration:** 3 peers over the *real* signaling Hub (`httptest`), all sending. Asserts full-mesh formation (each peer `connected` to both others), **media flowing both ways** (each receives a track from every other), and that a ctx-cancel joins every Router goroutine (WaitGroup returns — a leak would hang the test). Under `-race`. |
-| Topology queries | `internal/media` | ✅ `TestTopology` | Pure. Parent/Children/Neighbors/IsRelay and the offerer rule (the relay offers every edge). |
+| Topology queries + loader | `internal/overlay` | ✅ `TestTopology`, `TestLoadTopology` | Pure. Parent/Children/Neighbors/IsRelay/Nodes + the offerer rule, and fail-loud file validation (empty/self-parent/two-parents/bad-json). |
+| `BuildTree` + `Validate` + `PickRoot` | `internal/overlay` | ✅ `TestBuildTree`, `TestBuildTreeDeterministic`, `TestValidateCatches` | Pure, table-driven: star, capacity-forced depth-2, TURN-forced-leaf, RTT tiebreak, over-constrained error, unknown/TURN root. Determinism across 50 runs (guards against map-order dependence). `Validate` is exercised as an independent oracle *and* proven to reject broken trees. |
 | Relay PLI SSRC translation | `internal/media` | ✅ `TestForwarderTranslatesPLISSRC` | **Deterministic unit** on the #1 SFU footgun: an upstream keyframe request carries the *source* SSRC (not a downstream one), `SenderSSRC=0`, the throttle drops an immediate second request, and a source with no media (ssrc 0) emits none. No timing. |
 | Tree relay (forward through a peer) | `internal/media` | ✅ `TestRelayForwardsThroughTree` | **Integration:** 3 peers over the real Hub with a hardcoded tree (relay → leaf-b, leaf-d). Proves a leaf receives another leaf's media **forwarded by the relay** — the proof is *topological*: leaf-d holds a track while having no session to leaf-b, so the bytes transited the relay. Also asserts an upstream PLI fired and that shutdown joins every forwarder goroutine. Under `-race`. |
+| Coordinator (fan-in → compute → push) | `internal/coordinator` | ✅ `TestCoordinatorComputesTree`, `…AntiThrash`, `…LeaveRecomputes`, `…SkipsUnnamed` | **Async, `-race`:** drives the single-goroutine event loop through a fake `Sender`. Proves it elects the highest-upload root, pushes each leaf its tree, does **not** re-root on a subsequent metric (anti-thrash) but *does* use the stored value at the next join, recomputes on leave, and skips a nameless peer. |
+| Metrics reporter | `internal/metrics` | ✅ `TestReporterEmitsImmediatelyThenTicks`, `…SurvivesSendError`, `…DefaultsInterval` | Emits once immediately then ticks; a send error is logged, never fatal (best-effort telemetry); a zero interval falls back to the default. |
+| `overlay.BuildTree` under churn (the crown jewel) | `internal/simnet` | ✅ `TestBuildTreeProperty`, `TestChurnKeepsInvariants`, `TestLatencyAttachment`, `TestScenarioDeterministic` | **Deterministic simulation:** 300 seeded random fleets each either error honestly or pass `Validate`; 200 churn steps (join/leave) never break an invariant; injected latency steers attachment; a seed replays the exact same tree. No pion, no clock — the FoundationDB/TigerBeetle idea in miniature. |
 | `logging.New` | `internal/logging` | ❌ | Low risk, currently untested. |
 | `healthzHandler` / `newMux` / `run()` | `cmd/*` | ❌ (manual only) | Verified by hand + the live `-call` demo (both peers `connected`; `ffprobe` confirms decodable VP8 output). |
 | `media.Router` demux + lifecycle | `internal/media` | ✅ `TestMeshThreePeersFullyConnect` (mesh) | The Router's per-peer demux and `joined`/`peer-joined` handling are now exercised by the 3-peer mesh test; `peer-left` churn under load still awaits a `simnet`-style Phase-4 test. |
@@ -162,9 +166,9 @@ The lowest-hanging, highest-value gap. `net/http/httptest` gives an in-memory se
 
 Drive it with `httptest.NewRecorder()` + `mux.ServeHTTP(rec, req)` (or `httptest.NewServer` for a full round-trip), assert on `rec.Code` and the decoded body. This pins the wire contract that Phase 1 grows.
 
-### Phase 4: `internal/simnet` — deterministic simulation
+### `internal/simnet` — deterministic simulation (built in Phase 4)
 
-The centerpiece of the testing strategy, and the reason the hard logic is being kept pure. `internal/simnet` (placeholder today, built in Phase 4) is an **in-memory simulated network**: a fake clock, injectable per-link latency and upload bandwidth, and scriptable churn (joins, leaves, sustained degradation, coordinator loss). The overlay's `BuildTree`, the metrics fan-in, the failover/backup-parent logic, and eventually the Phase 6 election + migration all run **against simnet with no pion, no UDP, no cameras.**
+The centerpiece of the testing strategy, and the reason the hard logic is kept pure. `internal/simnet` is an **in-memory simulated network**: a fleet of nodes with injectable upload budgets, NAT classes, and pairwise latencies, plus scriptable churn (joins, leaves) via `Add`/`Remove`/`RemoveRandom`. Phase 4 drives the overlay's `BuildTree` against it — hundreds of seeded random fleets and a 200-step churn scenario, each asserted against the independent `overlay.Validate` oracle — **with no pion, no UDP, no cameras.** As the coordinator's control loop, the failover/backup-parent logic, and eventually the Phase 6 election + migration grow, they will run against this same harness (a seeded clock and scripted degradation are the next additions).
 
 This is the [FoundationDB](https://apple.github.io/foundationdb/testing.html) / [TigerBeetle](https://tigerbeetle.com/) **deterministic-simulation** idea, in miniature. The pitch: replace every source of nondeterminism (wall clock, real network, real scheduler) with a seeded, controllable one, so an entire distributed scenario is a *pure function of its seed*. Then:
 
@@ -181,8 +185,8 @@ We are **not** building full FoundationDB-grade simulation; the honest framing i
 | 0 (done) | `ParseLevel`, `healthURLFor` | Table-driven unit tests. |
 | 1 (done) | `wsURLFor`; signaling hub; media session (connect + track) | Table-driven unit + `httptest`/loopback integration under `-race`. |
 | 1 (gap) | `/healthz` handler body/405; `Router` lifecycle demux | `httptest` handler test; `Router` unit test with a fake client. |
-| 3–4 | `BuildTree` (degree-bounded, depth-limited, min-latency) | Pure-function table tests + property checks (tree is connected, no cycle, respects degree cap). |
-| 4 | metrics fan-in, overlay under churn | `simnet` deterministic scenarios. |
+| 3–4 (done) | `BuildTree` (degree-bounded, depth-limited, min-latency) | Pure-function table tests + `simnet` property checks (connected, no cycle, depth/degree bounds, TURN-leaf) against the `Validate` oracle. |
+| 4 (done) | metrics fan-in, overlay under churn | `-race` coordinator test (fake `Sender`) + `simnet` deterministic churn scenarios. |
 | 5–6 | failover, backup parents, **election + migration** | `simnet` with adversarial interleavings; assert epoch/term fencing. |
 
 ---
