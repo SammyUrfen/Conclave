@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -27,6 +28,8 @@ import (
 
 	"github.com/SammyUrfen/conclave/internal/logging"
 	"github.com/SammyUrfen/conclave/internal/media"
+	"github.com/SammyUrfen/conclave/internal/metrics"
+	"github.com/SammyUrfen/conclave/internal/overlay"
 	"github.com/SammyUrfen/conclave/internal/signaling"
 )
 
@@ -50,8 +53,16 @@ func run(args []string) error {
 	recordPath := fs.String("record", "", "write the first received track to this IVF file; empty just counts (call mode)")
 	stun := fs.String("stun", "", "STUN server URL, e.g. stun:stun.l.google.com:19302 (call mode; empty is fine on one host)")
 	name := fs.String("name", "", "stable topology name for this peer, e.g. relay|leaf-b (tree mode)")
-	topology := fs.String("topology", "", "path to a tree topology JSON file; enables tree mode (empty ⇒ full mesh)")
+	topology := fs.String("topology", "", "path to a tree topology JSON file; enables static tree mode (empty ⇒ full mesh)")
+	managed := fs.Bool("managed", false, "join a coordinator-managed room: report telemetry and realise the pushed tree (requires -name; no static -topology)")
+	uploadKbps := fs.Int("upload-kbps", 3000, "advertised upload budget for forwarding others' media, kbit/s (managed mode)")
+	natType := fs.String("nat", "direct", "declared NAT class: direct|turn (turn ⇒ forced leaf) (managed mode)")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	nat, err := parseNAT(*natType)
+	if err != nil {
 		return err
 	}
 
@@ -73,6 +84,9 @@ func run(args []string) error {
 			stun:         *stun,
 			name:         *name,
 			topologyPath: *topology,
+			managed:      *managed,
+			uploadKbps:   *uploadKbps,
+			nat:          nat,
 		})
 	}
 	return runProbe(logger, *server, *timeout)
@@ -83,6 +97,23 @@ type callConfig struct {
 	server, room, mediaPath, recordPath, stun string
 	name, topologyPath                        string
 	send                                      bool
+	managed                                   bool
+	uploadKbps                                int
+	nat                                       overlay.NATType
+}
+
+// parseNAT validates the -nat flag into an overlay.NATType, failing loud on an
+// unknown value rather than silently treating a typo as "direct" (which could
+// wrongly make a TURN-bound peer eligible to relay).
+func parseNAT(s string) (overlay.NATType, error) {
+	switch s {
+	case "direct":
+		return overlay.NATDirect, nil
+	case "turn":
+		return overlay.NATRelayed, nil
+	default:
+		return "", fmt.Errorf("invalid -nat %q: must be direct or turn", s)
+	}
 }
 
 // runCall joins a signaling room and runs WebRTC calls with the peers in it
@@ -93,16 +124,26 @@ func runCall(logger *slog.Logger, cfg callConfig) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Tree mode: load the shared topology and require a name so this peer can find
-	// itself in it. Fail loud on bad config rather than silently falling back to mesh.
-	var topo *media.Topology
+	// Tree mode has two flavours: a STATIC topology loaded from a file (Phase 3), or
+	// a MANAGED room where the coordinator computes and pushes the tree (Phase 4).
+	// Both need a -name so this peer can find itself; fail loud rather than silently
+	// falling back to mesh.
+	var topo *overlay.Topology
 	if cfg.topologyPath != "" {
 		if cfg.name == "" {
 			return fmt.Errorf("-topology requires -name so this peer can locate itself in the tree")
 		}
 		var err error
-		if topo, err = media.LoadTopology(cfg.topologyPath); err != nil {
+		if topo, err = overlay.LoadTopology(cfg.topologyPath); err != nil {
 			return err
+		}
+	}
+	if cfg.managed {
+		if cfg.topologyPath != "" {
+			return fmt.Errorf("-managed and -topology are mutually exclusive: a pushed tree or a static one, not both")
+		}
+		if cfg.name == "" {
+			return fmt.Errorf("-managed requires -name so the coordinator can place this peer in the tree")
 		}
 	}
 
@@ -129,14 +170,46 @@ func runCall(logger *slog.Logger, cfg callConfig) error {
 		RecordPath: cfg.recordPath,
 		Topology:   topo,
 		SelfName:   cfg.name,
+		Managed:    cfg.managed,
 	})
 	logger.Info("running call",
 		slog.Bool("send", cfg.send), slog.String("media", cfg.mediaPath),
 		slog.String("record", cfg.recordPath), slog.Bool("stun", cfg.stun != ""),
-		slog.Bool("tree", topo != nil))
+		slog.Bool("tree", topo != nil), slog.Bool("managed", cfg.managed))
 
-	if err := router.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		return err
+	// callCtx bounds this call. Cancelling it — on SIGINT, or when router.Run returns
+	// on its own because the signaling stream closed — also stops the telemetry
+	// reporter, so no goroutine outlives runCall.
+	callCtx, callCancel := context.WithCancel(ctx)
+	defer callCancel()
+
+	var wg sync.WaitGroup
+	if cfg.managed {
+		// The reporter is decoupled from signaling: it samples a Report (here, the
+		// declared budget + NAT) and ships it through this send closure, which is the
+		// only thing that knows about the wire. Telemetry is best-effort — a send
+		// error is the reporter's to log, never the peer's to fail on.
+		reporter := metrics.NewReporter(logger, metrics.DefaultInterval,
+			func() metrics.Report {
+				return metrics.Report{Name: cfg.name, UploadKbps: cfg.uploadKbps, NAT: cfg.nat}
+			},
+			func(rep metrics.Report) error {
+				payload, err := json.Marshal(rep)
+				if err != nil {
+					return err
+				}
+				return client.Send(signaling.Message{Type: signaling.TypeMetrics, Payload: payload})
+			},
+		)
+		wg.Add(1)
+		go func() { defer wg.Done(); reporter.Run(callCtx) }()
+	}
+
+	runErr := router.Run(callCtx)
+	callCancel() // stop the reporter even if Run returned via stream-close, not ctx
+	wg.Wait()
+	if runErr != nil && !errors.Is(runErr, context.Canceled) {
+		return runErr
 	}
 	logger.Info("call ended")
 	return nil

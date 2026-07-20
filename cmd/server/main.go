@@ -21,7 +21,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/SammyUrfen/conclave/internal/coordinator"
 	"github.com/SammyUrfen/conclave/internal/logging"
+	"github.com/SammyUrfen/conclave/internal/overlay"
 	"github.com/SammyUrfen/conclave/internal/signaling"
 )
 
@@ -44,7 +46,20 @@ func run(args []string) error {
 	addr := fs.String("addr", ":9000", "TCP address to listen on (host:port)")
 	logLevel := fs.String("log-level", "info", "log level: debug|info|warn|error")
 	logFormat := fs.String("log-format", "text", "log format: json|text")
+	coordinate := fs.Bool("coordinate", false, "run the Phase 4 coordinator: compute and push relay trees from peer telemetry")
+	maxDepth := fs.Int("max-depth", 2, "coordinator: max relay-tree depth in hops root→leaf")
+	streamKbps := fs.Int("stream-kbps", 2000, "coordinator: assumed per-stream upload cost, kbit/s (a node's child capacity = upload budget / this)")
+	defaultUpload := fs.Int("default-upload-kbps", 0, "coordinator: upload budget assumed for a peer that has not reported yet; 0 ⇒ leaf until it reports")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	// Fail loud on bad coordinator config at startup, not silently later. Without
+	// this, -stream-kbps 0 or -max-depth 0 is accepted and only surfaces as a Warn
+	// from every recompute (BuildTree rejects the constraints), so a managed room
+	// just never gets a tree — the exact "mysterious missing stream" we refuse to
+	// ship. Same discipline as ParseLevel rejecting a bad -log-level.
+	if err := validateCoordinatorFlags(*coordinate, *streamKbps, *maxDepth); err != nil {
 		return err
 	}
 
@@ -70,6 +85,28 @@ func run(args []string) error {
 	// The signaling hub is a process-lived dependency, constructed here at the
 	// edge and injected into the mux — no package globals.
 	hub := signaling.NewHub(logger)
+
+	// Phase 4: optionally run the coordinator inside the server. It observes room
+	// membership/telemetry through the hub and pushes computed trees back through it
+	// — the two halves wired here at the edge, so neither package imports the other
+	// (the hub calls an Observer it defines; the coordinator sends through a Sender
+	// it defines, adapted to hub.SendTo below). Off by default: without -coordinate
+	// the server is the plain Phase 1–3 signaling relay.
+	if *coordinate {
+		coord := coordinator.New(logger, coordinator.Config{
+			MaxDepth:          *maxDepth,
+			StreamKbps:        *streamKbps,
+			DefaultUploadKbps: *defaultUpload,
+		}, hubSender{hub: hub})
+		hub.SetObserver(coord)
+		go func() {
+			if err := coord.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				logger.Error("coordinator stopped", slog.Any("error", err))
+			}
+		}()
+		logger.Info("coordinator enabled",
+			slog.Int("max_depth", *maxDepth), slog.Int("stream_kbps", *streamKbps))
+	}
 
 	srv := &http.Server{
 		Addr:    *addr,
@@ -112,6 +149,46 @@ func run(args []string) error {
 		logger.Info("server stopped cleanly")
 		return nil
 	}
+}
+
+// validateCoordinatorFlags rejects coordinator constraints that BuildTree cannot
+// satisfy, but only when the coordinator is actually enabled (the flags are inert
+// otherwise). Pulled out as a pure helper so it is unit-testable without starting a
+// server. These mirror overlay.BuildTree's own preconditions, checked here so the
+// failure is a clear startup error rather than a silent per-recompute warning.
+func validateCoordinatorFlags(coordinate bool, streamKbps, maxDepth int) error {
+	if !coordinate {
+		return nil
+	}
+	if streamKbps <= 0 {
+		return fmt.Errorf("-stream-kbps must be > 0, got %d", streamKbps)
+	}
+	if maxDepth < 1 {
+		return fmt.Errorf("-max-depth must be >= 1, got %d", maxDepth)
+	}
+	return nil
+}
+
+// hubSender adapts the signaling Hub to coordinator.Sender: it marshals a computed
+// topology into a TypeTopology frame and delivers it to one peer by id. This is the
+// glue that keeps the coordinator ignorant of the wire (it holds a Sender, not a
+// Hub) and the Hub ignorant of the coordinator (it holds an Observer, not a
+// coordinator) — the seam lives here, in main, where both are already known.
+type hubSender struct {
+	hub *signaling.Hub
+}
+
+func (s hubSender) SendTopology(roomID, peerID string, topo *overlay.Topology) error {
+	payload, err := json.Marshal(topo)
+	if err != nil {
+		return fmt.Errorf("marshal topology: %w", err)
+	}
+	if !s.hub.SendTo(roomID, peerID, signaling.Message{
+		Type: signaling.TypeTopology, To: peerID, Payload: payload,
+	}) {
+		return fmt.Errorf("peer %q not present in room %q", peerID, roomID)
+	}
+	return nil
 }
 
 // newMux wires the HTTP routes. The logger and hub are injected so handlers can
