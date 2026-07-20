@@ -49,6 +49,8 @@ func run(args []string) error {
 	mediaPath := fs.String("media", "", "VP8 IVF file to send; empty sends synthetic frames (call mode; implies -send)")
 	recordPath := fs.String("record", "", "write the first received track to this IVF file; empty just counts (call mode)")
 	stun := fs.String("stun", "", "STUN server URL, e.g. stun:stun.l.google.com:19302 (call mode; empty is fine on one host)")
+	name := fs.String("name", "", "stable topology name for this peer, e.g. relay|leaf-b (tree mode)")
+	topology := fs.String("topology", "", "path to a tree topology JSON file; enables tree mode (empty ⇒ full mesh)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -63,12 +65,14 @@ func run(args []string) error {
 
 	if *call {
 		return runCall(logger, callConfig{
-			server:     *server,
-			room:       *room,
-			send:       *send || *mediaPath != "",
-			mediaPath:  *mediaPath,
-			recordPath: *recordPath,
-			stun:       *stun,
+			server:       *server,
+			room:         *room,
+			send:         *send || *mediaPath != "",
+			mediaPath:    *mediaPath,
+			recordPath:   *recordPath,
+			stun:         *stun,
+			name:         *name,
+			topologyPath: *topology,
 		})
 	}
 	return runProbe(logger, *server, *timeout)
@@ -77,6 +81,7 @@ func run(args []string) error {
 // callConfig is the parsed configuration for call mode.
 type callConfig struct {
 	server, room, mediaPath, recordPath, stun string
+	name, topologyPath                        string
 	send                                      bool
 }
 
@@ -88,16 +93,29 @@ func runCall(logger *slog.Logger, cfg callConfig) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Tree mode: load the shared topology and require a name so this peer can find
+	// itself in it. Fail loud on bad config rather than silently falling back to mesh.
+	var topo *media.Topology
+	if cfg.topologyPath != "" {
+		if cfg.name == "" {
+			return fmt.Errorf("-topology requires -name so this peer can locate itself in the tree")
+		}
+		var err error
+		if topo, err = media.LoadTopology(cfg.topologyPath); err != nil {
+			return err
+		}
+	}
+
 	// The dial timeout bounds only the WebSocket handshake, not the call.
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	client, err := signaling.Dial(dialCtx, logger, cfg.server, cfg.room)
+	client, err := signaling.Dial(dialCtx, logger, cfg.server, cfg.room, cfg.name)
 	cancel()
 	if err != nil {
 		return err
 	}
 	defer client.Close()
 	logger.Info("connected to signaling",
-		slog.String("server", cfg.server), slog.String("room", cfg.room))
+		slog.String("server", cfg.server), slog.String("room", cfg.room), slog.String("name", cfg.name))
 
 	var iceServers []webrtc.ICEServer
 	if cfg.stun != "" {
@@ -109,10 +127,13 @@ func runCall(logger *slog.Logger, cfg callConfig) error {
 		SendMedia:  cfg.send,
 		MediaPath:  cfg.mediaPath,
 		RecordPath: cfg.recordPath,
+		Topology:   topo,
+		SelfName:   cfg.name,
 	})
 	logger.Info("running call",
 		slog.Bool("send", cfg.send), slog.String("media", cfg.mediaPath),
-		slog.String("record", cfg.recordPath), slog.Bool("stun", cfg.stun != ""))
+		slog.String("record", cfg.recordPath), slog.Bool("stun", cfg.stun != ""),
+		slog.Bool("tree", topo != nil))
 
 	if err := router.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		return err
