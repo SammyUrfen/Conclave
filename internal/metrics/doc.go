@@ -6,5 +6,6 @@
 // N producers, one owned aggregate — and the trade-off (serialize via a channel
 // vs. a shared map + RWMutex) is made explicit where it lives.
 //
-// Populated in Phase 4.
+// Report is that telemetry; Reporter is the peer-side producer that ships it every
+// interval. The consuming fan-in lives in the coordinator package.
 package metrics
