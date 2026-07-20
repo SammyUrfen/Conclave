@@ -7,5 +7,6 @@
 // coordinator election/handover (Phase 6) are only testable because their
 // decisions run behind an interface this package can substitute.
 //
-// Populated in Phase 4.
+// Network is the harness: Add/Remove/SetRTT model a fleet and its churn, and Build
+// drives the real overlay.BuildTree so tests assert overlay.Validate holds.
 package simnet
