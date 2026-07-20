@@ -14,14 +14,19 @@
 // A Router adapts a *signaling.Client into per-peer Transports, demultiplexing
 // the single inbound signaling stream (joined/peer-joined/peer-left plus routed
 // offer/answer/candidate) into one Session per remote peer, and meters aggregate
-// upload across all of them. For Phase 2 that is a full mesh — every peer holds a
-// PeerConnection to every other — which is what makes the O(N) upload cost visible.
+// upload across all of them. With no topology it runs a full mesh — every peer
+// holds a PeerConnection to every other — which is what makes the O(N) upload cost
+// visible.
+//
+// Given a Topology it instead runs in tree mode: a peer connects only to its
+// topology neighbours, and a relay (a peer with children) becomes the novel core —
+// a tiny, tree-shaped SFU. The forwarder reads RTP off each source's
+// *webrtc.TrackRemote and fans it, without re-encoding, into a per-downstream
+// TrackLocalStaticRTP, plumbing keyframe requests (PLI) back upstream to the
+// original sender with the SSRC translated. That is what lets a *participant* relay
+// others' media, so the sender's upload stays O(1) and the relay bears the fan-out.
 //
 // Media sources (PlayIVF, SendSynthetic) feed an outbound track; sinks
 // (RecordVP8, DrainAndCount) consume a remote track. Codecs are pinned to VP8 in
 // the MediaEngine so both ends agree without depending on default ordering.
-//
-// Phase 3 grows this into the novel core: reading RTP off a *webrtc.TrackRemote
-// and forwarding it into per-downstream TrackLocalStaticRTP (with RTCP/PLI
-// plumbing) so a *participant* relays others' media — a tiny, tree-shaped SFU.
 package media

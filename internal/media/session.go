@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 
 	"github.com/SammyUrfen/conclave/internal/signaling"
@@ -30,6 +31,13 @@ type SessionConfig struct {
 	OnRemoteTrack func(*webrtc.TrackRemote, *webrtc.RTPReceiver)
 	// OnState fires on every PeerConnection state transition. Optional.
 	OnState func(webrtc.PeerConnectionState)
+
+	// Offerer, when non-nil, fixes who initiates negotiation instead of deriving it
+	// from id order. The Router sets it from the topology in tree mode — the relay
+	// must offer on every edge, because only a fresh offer can add the forwarded
+	// m-lines it publishes, and an SDP answer cannot. Nil ⇒ mesh default (the
+	// higher id offers).
+	Offerer *bool
 }
 
 // Session drives one webrtc.PeerConnection to one remote peer, exchanging SDP and
@@ -91,7 +99,11 @@ func NewSession(cfg SessionConfig) (*Session, error) {
 
 	// Deterministic role: the peer with the higher id offers, the other answers.
 	// Any total order on the (distinct) ids works; both sides compute the same one.
+	// In tree mode the Router overrides this so the relay offers on every edge.
 	offerer := cfg.SelfID > cfg.PeerID
+	if cfg.Offerer != nil {
+		offerer = *cfg.Offerer
+	}
 	s := &Session{
 		log: cfg.Log.With(
 			slog.String("component", "media"),
@@ -148,6 +160,32 @@ func (s *Session) AddVideoTrack(id, streamID string) (*webrtc.TrackLocalStaticSa
 
 // Offerer reports whether this side initiates negotiation (vs only answering).
 func (s *Session) Offerer() bool { return s.offerer }
+
+// AddForwardTrack adds an outbound VP8 track that carries RAW RTP packets
+// (TrackLocalStaticRTP), for a relay to forward another peer's media without
+// re-encoding, and returns the track plus its RTPSender. The sender matters: the
+// caller MUST drain sender.ReadRTCP() or the interceptor chain stalls — and that
+// drain loop is also where downstream PLIs are caught to forward upstream. Called
+// before Start (add-track-before-Start) so the forwarded m-line rides the one
+// offer with no renegotiation.
+func (s *Session) AddForwardTrack(id, streamID string) (*webrtc.TrackLocalStaticRTP, *webrtc.RTPSender, error) {
+	track, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000}, id, streamID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("new forward track: %w", err)
+	}
+	sender, err := s.pc.AddTrack(track)
+	if err != nil {
+		return nil, nil, fmt.Errorf("add forward track: %w", err)
+	}
+	return track, sender, nil
+}
+
+// WriteRTCP sends application-generated RTCP (a keyframe request) toward this
+// session's peer. A relay uses it on the UPSTREAM session to ask the original
+// sender for a keyframe when a downstream needs one. It silently no-ops if the
+// peer is gone, so a nil return is not proof of delivery.
+func (s *Session) WriteRTCP(pkts []rtcp.Packet) error { return s.pc.WriteRTCP(pkts) }
 
 // AddRecvOnlyVideo adds a receive-only video transceiver. The Router calls this on
 // the offerer side when this peer sends no media of its own, so that (a) there is a
