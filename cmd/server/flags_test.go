@@ -276,8 +276,22 @@ func TestCoordinatorConfigWiring(t *testing.T) {
 		t.Fatalf("parseFlags: %v", err)
 	}
 	got := f.coordinatorConfig(7 * time.Second)
+
+	// StickinessMs is a *float64, so it must be asserted BY VALUE and then cleared
+	// before the struct comparison: == on a pointer field compiles and silently
+	// compares addresses, which would make this test pass against any value at all.
+	// That is the same class of quiet wrongness the pointer was introduced to remove,
+	// so it is worth spelling out rather than reaching for reflect.DeepEqual.
+	if got.StickinessMs == nil {
+		t.Fatal("coordinatorConfig().StickinessMs is nil; the flag never reached the config")
+	}
+	if *got.StickinessMs != 40 {
+		t.Fatalf("StickinessMs = %v, want 40", *got.StickinessMs)
+	}
+	got.StickinessMs = nil
+
 	want := coordinator.Config{
-		MaxDepth: 3, StreamKbps: 1500, DefaultUploadKbps: 500, StickinessMs: 40,
+		MaxDepth: 3, StreamKbps: 1500, DefaultUploadKbps: 500,
 		Dwell: 11 * time.Second, RecomputeCooldown: 6 * time.Second,
 		DegradedAfter: 4 * time.Second, GoneAfter: 9 * time.Second,
 		JoinSettle: 2 * time.Second, SocketDetection: 7 * time.Second,
@@ -294,7 +308,7 @@ func TestArbiterConfigWiring(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseFlags: %v", err)
 	}
-	got := f.arbiterConfig()
+	got := f.arbiterConfig(signaling.WSLivenessBudget)
 	if !got.Elect || !got.Coordinate {
 		t.Fatalf("arbiterConfig() Elect=%v Coordinate=%v, want both true", got.Elect, got.Coordinate)
 	}

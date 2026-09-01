@@ -143,7 +143,9 @@ func TestLocalCoordinatorDerivesFromTheAnnouncedConfig(t *testing.T) {
 		{"MaxDepth", local.MaxDepth, cc.MaxDepth},
 		{"StreamKbps", local.StreamKbps, cc.StreamKbps},
 		{"DefaultUploadKbps", local.DefaultUploadKbps, cc.DefaultUploadKbps},
-		{"StickinessMs", local.StickinessMs, cc.StickinessMs},
+		// Dereferenced: the pointer is a local API convenience and must never be
+		// compared against the wire's plain float, which would compare an address.
+		{"StickinessMs", *local.StickinessMs, cc.StickinessMs},
 		{"Dwell", local.Dwell, cc.Dwell()},
 		{"RecomputeCooldown", local.RecomputeCooldown, cc.RecomputeCooldown()},
 		{"DegradedAfter", local.DegradedAfter, cc.DegradedAfter()},
