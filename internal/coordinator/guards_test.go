@@ -213,3 +213,81 @@ func TestTurnBoundPeersAreForcedToBeLeaves(t *testing.T) {
 		t.Fatalf("the reachable relay must root the tree, got %q", topo.Root)
 	}
 }
+
+// TestDuplicateNameResolutionIsDeterministic pins the one place the projection's
+// iteration order genuinely decides an outcome.
+//
+// A mutation audit found `sortedPeerIDs` unsorted survives every other test, and the
+// analysis behind that is correct as far as it goes: overlay.PickRoot computes a maximum
+// under a total order and overlay.processingOrder re-sorts newcomers, so BuildTree's
+// output is invariant to input slice order — GIVEN UNIQUE NAMES. The projection is where
+// that proviso is established, and it establishes it by keeping the FIRST record for a
+// colliding name and dropping the rest. Which record is "first" is exactly this order.
+//
+// The two peers below claim one name with very different capacities, so the choice is
+// not cosmetic: keep p1 and the meet has a relay with room for three leaves; keep p2 and
+// the fleet has no member able to serve a single child, so no tree exists at all. Under
+// map iteration a meet would flip between those two outcomes on nothing but the hash
+// seed — which is why this runs the whole fleet repeatedly rather than once.
+func TestDuplicateNameResolutionIsDeterministic(t *testing.T) {
+	// 20 independent runs: a projection that ranged the map would have to win a
+	// coin flip every time to survive this.
+	const runs = 20
+	for i := 0; i < runs; i++ {
+		h := newHarness(t, baseConfig())
+		h.member("room", "p1", "a", 8000) // ample: capacity for four children
+		h.member("room", "p2", "a", 400)  // below one stream: cannot parent anyone
+		h.member("room", "p3", "b", 0)
+		h.member("room", "p4", "c", 0)
+		h.member("room", "p5", "d", 0)
+
+		topo := h.published("room")
+		if topo == nil {
+			t.Fatalf("run %d: the lowest-id record for a colliding name must win, and it can "+
+				"serve this fleet; got no tree (events=%v)", i, kindsOf(h))
+		}
+		if topo.Root != "a" || len(topo.Edges) != 3 {
+			t.Fatalf("run %d: want a rooted at a with three leaves, got %+v", i, topo.Edges)
+		}
+	}
+}
+
+// TestFanOutOrderIsDeterministic pins the projection's other real consumer: the order a
+// published tree is handed to the outbound queue. It is part of a replayable trace, so
+// it must be a function of the fleet and not of Go's hash seed — the same rule
+// overlay.Topology.Edges and metrics.Heartbeat.Children already follow.
+func TestFanOutOrderIsDeterministic(t *testing.T) {
+	h := newHarness(t, baseConfig())
+	// Joined in an order that is deliberately not the sorted one.
+	h.member("room", "p9", "c", 0)
+	h.member("room", "p3", "a", 8000)
+	h.member("room", "p7", "b", 0)
+
+	topo := h.published("room")
+	if topo == nil {
+		t.Fatalf("no tree published; events=%v", kindsOf(h))
+	}
+	var got []string
+	for _, p := range h.fs.sinceRev(topo.Rev - 1) {
+		got = append(got, p.peerID)
+	}
+	want := []string{"p3", "p7", "p9"}
+	if len(got) != len(want) {
+		t.Fatalf("every member must be pushed once per publish; got %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("fan-out must be ordered by peer id so a trace replays; got %v want %v", got, want)
+		}
+	}
+}
+
+// kindsOf renders the recorded event kinds, which is what a failure message should
+// print: "no tree" is far less useful than the sequence that led there.
+func kindsOf(h *harness) []string {
+	var out []string
+	for _, ev := range h.fp.all() {
+		out = append(out, string(ev.Kind))
+	}
+	return out
+}
