@@ -44,13 +44,30 @@ of Phase 7 — simulcast/SVC and TURN/coturn — was **not** built.
 
 Update this table and the `docs/` files as each phase lands — they are **living**.
 
-> **One limitation to know before you claim anything about Phase 6.**
-> `metrics.Report`'s `CPUPct`, `LossPct` and `RTTServerMs` are never populated in
-> production, so every eligible peer scores 0.85–1.0 in `arbiter.Score`.
-> `DemoteBelowScore` can never be crossed and `PromoteMarginScore` can never be
-> met: **voluntary promotion/demotion is unreachable live — only bootstrap and
-> failover elections fire.** The logic is real and simnet-tested; the sensors are
-> not built. See `docs/DESIGN.md` §8.1.
+> **What the telemetry now measures, and what still bounds it.**
+> `metrics.Report`'s `CPUPct`, `RTTServerMs`, `LossPct` and `PeerRTT` are
+> **measured live** as of the sensor work: CPU from `/proc/stat` deltas, server
+> RTT from a WebSocket ping, uplink loss from the RTCP receiver reports the relay
+> already drains, and pairwise RTT from the nominated ICE candidate pair (pion
+> collects **no** RTPSender stats, so `RemoteInboundRTPStreamStats` is a zero
+> value — see `TestPionPopulatesSelectedPairRTT`). Voluntary promotion **and**
+> demotion have both been observed live. Three things still bound it:
+>
+> 1. **Demotion needs all three signals.** `Score` is `0.30 cpu + 0.35 rtt +
+>    0.20 loss + 0.15 uptime` and `DemoteBelowScore` is `0.35` on a strict `<`,
+>    so a settled peer maximally bad on CPU and RTT but clean on loss scores
+>    *exactly* 0.35 and cannot be demoted. Pinned by
+>    `TestScoreFloorOfAFullyDegradedPeer`.
+> 2. **Pairwise RTT is partial.** A peer can only measure a path it has a
+>    PeerConnection over, so `Node.RTT` covers current neighbours plus ones it
+>    held within `media.RTTMemory` (2 min). A peer never connected to stays
+>    unknown, so a first attachment is still RTT-blind.
+> 3. **`arbiter.ScoreQuantum` exists because the sensors are real.** Candidate
+>    ranking compares *quantized* fitness; ranking on raw score lets microseconds
+>    of jitter reorder the top two every second, which restarts the election
+>    dwell forever and pins the role. See `TestDwellSurvivesChallengerJitter`.
+>
+> See `docs/DESIGN.md` §8.1.
 
 ## Commands
 - `make run-server` · `make run-peer` · `make test` (race)
