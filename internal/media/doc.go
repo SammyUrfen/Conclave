@@ -43,6 +43,14 @@
 //     sequence/timestamp series across the switch. A keyframe does not repair a
 //     broken transport ordering; it repairs reference state, one layer up.
 //
+// A pushed tree is also AUTHORIZED before it is applied: overlay.Fence answers "may
+// I act on this" (the sender is the coordinator the arbiter named, at exactly the
+// epoch this peer was told is current, with a strictly newer revision), which is a
+// different question from Topology.Supersedes' "is this newer". Only the arbiter's
+// announcement — carried up to the host by OnCoordinator and back down through
+// AdoptCoordinator, so this package never learns the arbiter's types — may raise a
+// peer's epoch.
+//
 // Media sources (PlayIVF, SendSynthetic) feed an outbound track; sinks
 // (RecordVP8, DrainAndCount) consume a remote track. Codecs are pinned to VP8 in
 // the MediaEngine so both ends agree without depending on default ordering.

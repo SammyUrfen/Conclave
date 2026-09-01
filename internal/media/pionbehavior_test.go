@@ -2,6 +2,7 @@ package media
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync/atomic"
@@ -129,16 +130,51 @@ func TestNegotiationRetryResendsTheCommittedOffer(t *testing.T) {
 		return len(bTr.offerSDPs()) == 1+NegotiationRetries
 	})
 
-	sdps := bTr.offerSDPs()
-	for i, sdp := range sdps[1:] {
-		if sdp != sdps[0] {
-			t.Errorf("retry %d sent a DIFFERENT offer; the retry must re-send the committed one, "+
-				"not mint a new one pion would refuse to apply", i+1)
-		}
-	}
+	assertOneCommittedOffer(t, bTr.offerSDPs())
 	if st := offerer.pc.SignalingState(); st != webrtc.SignalingStateHaveLocalOffer {
 		t.Errorf("signaling state = %s after the retry ladder, want have-local-offer", st)
 	}
+}
+
+// assertOneCommittedOffer checks that every SDP in the slice is the SAME offer.
+//
+// The comparison is on the `o=` origin line, not the whole body, and that is not a
+// weakening: SDP origin carries the session id AND the session version, which
+// CreateOffer increments on every call — so a retry that minted a fresh offer changes
+// it, and a retry that re-sent the committed one cannot. The bodies themselves
+// legitimately differ, because LocalDescription() appends the ICE candidates gathered
+// since the last call, which is exactly the behaviour we want on a re-send.
+func assertOneCommittedOffer(t *testing.T, sdps []string) {
+	t.Helper()
+	if len(sdps) < 2 {
+		t.Fatalf("only %d offers to compare", len(sdps))
+	}
+	want := originLine(sdps[0])
+	if want == "" {
+		t.Fatalf("no o= line in the first offer:\n%s", sdps[0])
+	}
+	for i, sdp := range sdps[1:] {
+		if got := originLine(sdp); got != want {
+			t.Errorf("re-send %d has origin %q, want %q — a changed session version means "+
+				"CreateOffer ran again, which pion forbids from have-local-offer", i+1, got, want)
+		}
+	}
+}
+
+// originLine returns the `o=` line of a WIRE description — the JSON-encoded
+// webrtc.SessionDescription a Session actually sends — which carries the session id
+// and the session version.
+func originLine(wire string) string {
+	var desc webrtc.SessionDescription
+	if err := json.Unmarshal([]byte(wire), &desc); err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(desc.SDP, "\n") {
+		if line = strings.TrimSpace(line); strings.HasPrefix(line, "o=") {
+			return line
+		}
+	}
+	return ""
 }
 
 // TestNegotiationAnswerTimeoutResends pins §15.13 item 5. The offer LANDS on the
@@ -181,10 +217,5 @@ func TestNegotiationAnswerTimeoutResends(t *testing.T) {
 		return len(bTr.offerSDPs()) == 1+NegotiationRetries && clk.createdCount() == NegotiationRetries
 	})
 
-	sdps := bTr.offerSDPs()
-	for i, sdp := range sdps[1:] {
-		if sdp != sdps[0] {
-			t.Errorf("re-send %d differed from the committed offer", i+1)
-		}
-	}
+	assertOneCommittedOffer(t, bTr.offerSDPs())
 }

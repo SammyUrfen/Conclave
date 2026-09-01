@@ -40,16 +40,32 @@ type RouterConfig struct {
 	// when Topology is non-nil (an explicit tree wins over a pushed one).
 	Managed bool
 
-	// Backup enables honouring the coordinator's precomputed backup parents on a
-	// primary-parent failure, without asking anyone. NOTE the zero value is false,
-	// so a managed peer that wants the fast failover path must set it explicitly —
-	// see the report on §7.5, which specifies "default true" for a plain bool.
-	Backup bool
+	// DisableBackup opts OUT of honouring the coordinator's precomputed backup
+	// parents on a primary-parent failure.
+	//
+	// The polarity is inverted deliberately (§15.13): "default true" is not
+	// expressible for a plain Go bool, so a field named Backup would have silently
+	// DISABLED failover for any caller who forgot it — the wrong direction to fail
+	// in for the entire point of Phase 5. The zero value is the safe case here, and
+	// that is the only formulation that does not depend on a caller remembering.
+	// cmd/peer is the single place the polarity flips, translating -backup=false.
+	DisableBackup bool
 
 	// Clock is the time source for every re-parent deadline and the relay's PLI
 	// throttle. Injected so a test drives them instead of sleeping. Nil ⇒
 	// clock.System().
 	Clock clock.Clock
+
+	// OnCoordinator hands the RAW body of an arbiter announcement (a TypeCoordinator
+	// frame's Payload) up to the host, which decodes it and calls AdoptCoordinator.
+	//
+	// The round trip exists because media may not import arbiter: decoding the type
+	// here would either add that edge or fork the wire contract into a second
+	// private copy. The host needs the announcement anyway — it is what starts and
+	// stops its own coordinator control loop — so this costs nothing but one call.
+	// Nil ⇒ announcements are dropped, which is correct for mesh and static-tree
+	// modes that have no control plane.
+	OnCoordinator func(payload []byte)
 
 	// OnReparented is called after this peer promotes its own backup parent, with
 	// the outcome the control plane needs to ratify (or urgently repair) the
@@ -95,8 +111,15 @@ type Router struct {
 	// as done.
 	parentInUse string
 
-	// staleRejected counts pushed topologies dropped by the ordering fence. A
-	// nonzero count is visible proof the fence works, not an error condition.
+	// fence is this peer's view of control-plane AUTHORITY (§6.5): the epoch the
+	// arbiter last announced, who it named coordinator for that epoch, and the
+	// highest revision actually applied. Guarded by mu because AdoptCoordinator is
+	// called by the host from its own goroutine while applyTopology reads it on Run.
+	fence overlay.Fence
+
+	// staleRejected counts pushed topologies the fence refused — wrong sender, wrong
+	// epoch, or a non-advancing revision. A nonzero count is visible proof the fence
+	// works, not an error condition.
 	staleRejected atomic.Uint64
 
 	// reparentHook, when non-nil, observes re-parent state transitions. It exists
@@ -283,6 +306,12 @@ func (r *Router) handle(ctx context.Context, msg signaling.Message) {
 	switch msg.Type {
 	case signaling.TypeJoined:
 		r.mu.Lock()
+		// A (re)join drops authority (§5.7 rule 6): a reconnecting peer must adopt
+		// whatever the arbiter announces NEXT rather than trusting what it
+		// remembers. This is what closes the arbiter-restart hole — an arbiter
+		// minting epochs from 1 again could otherwise never command a peer still
+		// holding a higher epoch from the previous process.
+		r.fence.Reset()
 		r.selfID = msg.To
 		if r.selfName != "" {
 			r.nameByID[msg.To] = r.selfName
@@ -306,6 +335,13 @@ func (r *Router) handle(ctx context.Context, msg signaling.Message) {
 		r.deliver(ctx, msg)
 	case signaling.TypeTopology:
 		r.applyTopology(ctx, msg.From, msg.Payload)
+	case signaling.TypeCoordinator:
+		// The arbiter naming a coordinator. media cannot decode the announcement
+		// (that type lives in arbiter, which media may not import), so the body goes
+		// up to the host, which decodes it and calls AdoptCoordinator.
+		if r.cfg.OnCoordinator != nil {
+			r.cfg.OnCoordinator(msg.Payload)
+		}
 	case signaling.TypeError:
 		r.log.Warn("signaling error frame", slog.String("error", msg.Error))
 	}
@@ -338,16 +374,21 @@ func (r *Router) applyTopology(ctx context.Context, from string, payload []byte)
 		r.log.Warn("bad topology payload", slog.Any("error", err))
 		return
 	}
-	// Ordering fence: a duplicate or reordered push is dropped and counted rather
-	// than applied, so a late frame cannot undo a newer tree.
-	//
-	// NOTE this is only the ORDERING half of the §6.5 fence. The AUTHORIZATION half
-	// — "from is the coordinator the arbiter named for the epoch I currently believe
-	// in" — needs overlay.Fence, which is not yet shipped; see the report.
-	if !topo.Supersedes(r.currentTopo()) {
+	// The fence (§6.5), and it is AUTHORIZATION, not ordering. Topology.Supersedes
+	// answers "is this tree newer" — true no matter who sent it — so gating on it
+	// would let any peer that stamped a large epoch onto a tree naming itself root
+	// be universally obeyed. Fence.Accept answers "may I act on this": the sender
+	// must be the coordinator the ARBITER named, at exactly the epoch this peer was
+	// told is current, with a strictly newer revision. It is the only predicate
+	// allowed to gate an apply, and this is its only call site.
+	r.mu.Lock()
+	ok, reason := r.fence.Accept(from, &topo)
+	r.mu.Unlock()
+	if !ok {
 		r.staleRejected.Add(1)
-		r.log.Debug("rejected a non-advancing topology",
-			slog.String("from", from), slog.Uint64("epoch", topo.Epoch), slog.Uint64("rev", topo.Rev))
+		r.log.Debug("rejected a pushed topology",
+			slog.String("from", from), slog.String("reason", reason),
+			slog.Uint64("epoch", topo.Epoch), slog.Uint64("rev", topo.Rev))
 		return
 	}
 
@@ -356,6 +397,11 @@ func (r *Router) applyTopology(ctx context.Context, from string, payload []byte)
 
 	r.mu.Lock()
 	r.topo = &topo
+	// Advance the applied watermark only now, after the tree has been adopted —
+	// Accept and Applied are separate so a push that never got this far is retried
+	// by the next one rather than being silently skipped because the watermark moved
+	// without the tree ever being realised.
+	r.fence.Applied(&topo)
 	r.mu.Unlock()
 	if !diff.reparent {
 		r.noteParent(&topo)
@@ -942,9 +988,42 @@ func (r *Router) acceptsBackupChild(peerID string) bool {
 	return name != "" && topo.BackupOf(name) == r.selfName
 }
 
-// StaleRejected reports how many pushed topologies the ordering fence dropped. A
-// nonzero count is proof the fence works, not an error condition.
+// StaleRejected reports how many pushed topologies the fence refused. A nonzero
+// count is proof the fence works, not an error condition — it is what the Phase 6
+// handover demo points at.
 func (r *Router) StaleRejected() uint64 { return r.staleRejected.Load() }
+
+// AdoptCoordinator applies an arbiter announcement to this peer's fence and reports
+// whether it was adopted (false for a stale or duplicate epoch, which leaves the
+// fence untouched).
+//
+// It is the ONLY way to raise this peer's epoch, and that exclusivity is the whole
+// safety argument: authority flows from the single writer that mints it, never from
+// the node claiming the job. The host calls it from OnCoordinator, having decoded
+// the announcement body media is not allowed to know the shape of.
+func (r *Router) AdoptCoordinator(epoch uint64, coordinatorID string) bool {
+	r.mu.Lock()
+	adopted := r.fence.AdoptAnnouncement(epoch, coordinatorID)
+	r.mu.Unlock()
+	if adopted {
+		r.log.Info("adopted coordinator announcement",
+			slog.Uint64("epoch", epoch), slog.String("coordinator_id", coordinatorID))
+	} else {
+		r.staleRejected.Add(1)
+		r.log.Debug("ignored a stale coordinator announcement",
+			slog.Uint64("epoch", epoch), slog.String("coordinator_id", coordinatorID))
+	}
+	return adopted
+}
+
+// Fence returns a snapshot of this peer's authority state, for the host to report to
+// the dashboard and for tests to assert on. It is a value copy on purpose: nothing
+// outside the Router may mutate the fence.
+func (r *Router) Fence() overlay.Fence {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.fence
+}
 
 func (r *Router) closeAll() {
 	r.mu.Lock()
