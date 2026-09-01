@@ -136,11 +136,12 @@ func TestBoundedEdgeDelta(t *testing.T) {
 		}
 	})
 
-	t.Run("one self-promotion changes 0", func(t *testing.T) {
-		// The promoted node landed on the backup it was assigned; the coordinator
-		// ratifies by patching its WORKING copy, so the delta is measured against that
-		// — while the ORACLE is fed the PUBLISHED tree, which is the only artifact that
-		// still carries the backup assignment the promotion is checked against.
+	t.Run("one self-promotion changes exactly 1", func(t *testing.T) {
+		// The bound is stated against the PUBLISHED tree, because that is the tree the
+		// oracle takes and the tree the peers were actually running: against it, a
+		// promotion IS a real, visible, checkable parent change. (An earlier draft
+		// stated 0, measured against the patched working copy — wrong in the direction
+		// that makes a CORRECT implementation look like a bug.)
 		promoted := "x"
 		backup := prev.BackupOf(promoted)
 		if backup == "" {
@@ -155,8 +156,21 @@ func TestBoundedEdgeDelta(t *testing.T) {
 		if err := Validate(next, nodes, deltaCons(2)); err != nil {
 			t.Fatalf("Validate: %v", err)
 		}
+		got := changedParents(prev, next)
+		if len(got) != 1 || got[0] != promoted {
+			t.Errorf("changed parents vs the published tree = %v, want exactly [%s]", got, promoted)
+		}
+		// The strict form: a promoted node must land on the backup it was ASSIGNED, not
+		// on whatever node it liked. The published tree is the only artifact that still
+		// carries that assignment, which is precisely why the oracle takes it.
+		if got := next.ParentOf(promoted); got != prev.BackupOf(promoted) {
+			t.Errorf("%s promoted onto %q, want its assigned backup %q", promoted, got, prev.BackupOf(promoted))
+		}
+		// Secondary, and the reason three trees are named rather than two: against the
+		// coordinator's patched WORKING copy the same promotion is invisible, because
+		// the ratified edge is already in it. Same transition, two different questions.
 		if got := changedParents(working, next); len(got) != 0 {
-			t.Errorf("changed parents vs the working copy = %v, want none: the ratified edge is already in it", got)
+			t.Errorf("changed parents vs the working copy = %v, want none", got)
 		}
 		ch := Churn{Promoted: []string{promoted}}
 		if err := ValidateLocalRepair(prev, next, nodes, deltaCons(2), ch); err != nil {
