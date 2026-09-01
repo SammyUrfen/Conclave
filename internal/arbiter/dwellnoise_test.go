@@ -67,6 +67,52 @@ func TestDwellSurvivesChallengerJitter(t *testing.T) {
 	t.Logf("handed over to %q after jittered reporting", m.Coordinator)
 }
 
+// TestDwellSurvivesABucketBoundary covers the case quantized ranking does NOT fully
+// erase, and it exists because instrumenting a live run turned up a mechanism that
+// reasoning had missed.
+//
+// Two peers with a sub-quantum score gap normally share a bucket, where the name
+// tiebreak makes the ordering stable. But the uptime term drives BOTH scores steadily
+// upward over a meet's first two minutes, so the pair sweeps across boundary after
+// boundary — and at each crossing the marginally better peer enters the higher bucket
+// first. When that peer sorts LATER by name, the best challenger flips for the
+// duration of the crossing and the dwell restarts. The boundary case is therefore not
+// a rare accident; it recurs on a schedule, driven by a term that always moves.
+//
+// What this asserts is that the handover still COMPLETES. The crossings delay it —
+// live instrumentation counted 8 challenger flips over 370 samples, against a flip on
+// nearly every sample before quantization — but each stable interval between
+// crossings is long enough for the dwell to elapse, and the drift stops entirely once
+// uptime saturates. A pending-target stickiness rule was written to erase even this
+// and then deleted: it bought nothing this test can detect, and absorbing a
+// boundary-scale difference also absorbs an exact tie, at which point the pending
+// target (whichever peer joined first) decides a tie that
+// TestTiesBreakDeterministically requires the NAME order to decide.
+//
+// alpha is deliberately the WORSE peer and the alphabetically first one. With those
+// aligned the flip cannot happen at all, and this test would pass against the bug.
+func TestDwellSurvivesABucketBoundary(t *testing.T) {
+	near := func(name string, rtt float64) peerOpts {
+		return peerOpts{name: name, uploadKbps: 5000, coordinatable: true, cpuPct: 5, rttMs: rtt}
+	}
+	h := newHarness(t, arbiter.Config{
+		Elect: true, Coordinate: true, ArbiterID: arbiter.DefaultArbiterID,
+	})
+	h.join("m", "p1", near("alpha", 5.0)) // name-first, marginally WORSE
+	h.join("m", "p2", near("bravo", 0.7)) // name-later, marginally BETTER
+
+	// A score gap of 0.35 x (4.3ms / 300ms) = 0.005 — half a quantum, i.e. below the
+	// resolution this system claims to distinguish, and 1.4% of the useful RTT range.
+	// Sized so the pair spends about half of every boundary period in different
+	// buckets; a much smaller gap makes the crossing window so narrow that whether a
+	// beat lands inside it is luck.
+	h.elapse("m", 150*time.Second)
+
+	if got := h.meet("m").Coordinator; got == "" {
+		t.Fatal("the arbiter still holds the meet: the dwell never elapsed between boundary crossings")
+	}
+}
+
 // TestDwellStillRejectsARealTargetChange is the other half, and it is what stops the
 // fix above from becoming "ignore the target entirely".
 //
