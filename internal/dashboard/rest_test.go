@@ -175,7 +175,8 @@ func TestCreateMeet(t *testing.T) {
 		if join["ws_url"] != "ws://localhost:9000/ws?room=standup" {
 			t.Errorf("join.ws_url = %v", join["ws_url"])
 		}
-		if join["peer_command"] != "peer -call -managed -server http://localhost:9000 -room standup -name YOUR_NAME" {
+		wantCmd := "peer -call -managed -server http://localhost:9000 -room standup -name " + joinNamePlaceholder
+		if join["peer_command"] != wantCmd {
 			t.Errorf("join.peer_command = %v", join["peer_command"])
 		}
 	})
@@ -273,7 +274,9 @@ func TestJoinURLDerivation(t *testing.T) {
 			if join["ws_url"] != tt.wantWS {
 				t.Errorf("ws_url = %v, want %v", join["ws_url"], tt.wantWS)
 			}
-			wantCmd := "peer -call -managed -server " + tt.wantHTTP + " -room m1 -name YOUR_NAME"
+			// Built from the constant, not a literal, so the placeholder cannot drift
+			// back to a value policy.ValidPeerName rejects without a test noticing.
+			wantCmd := "peer -call -managed -server " + tt.wantHTTP + " -room m1 -name " + joinNamePlaceholder
 			if join["peer_command"] != wantCmd {
 				t.Errorf("peer_command = %v, want %v", join["peer_command"], wantCmd)
 			}

@@ -39,8 +39,9 @@
 // before consulting the configured patterns and ignoring the scheme — which a DNS
 // rebinding attacker satisfies by construction, reaching a loopback or LAN server they
 // could not otherwise dial. Both the REST CORS surface and the upgrade therefore run the
-// single policy.Origins matcher, and the library's check is disabled outright. See
-// allowUpgradeOrigin.
+// single policy.Origins matcher — the REST surface through Match, the upgrade through
+// AllowUpgrade, which is the same call internal/signaling's /ws upgrade makes — and the
+// library's check is disabled outright. See allowUpgradeOrigin.
 //
 // THIRD: no unauthenticated request may drive a control-plane goroutine at request rate.
 // Assembling a snapshot round-trips the coordinator's single Run goroutine and listing

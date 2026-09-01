@@ -613,36 +613,29 @@ const (
 	admitAtCapacity
 )
 
-// allowUpgradeOrigin decides whether an upgrade request's Origin is permitted, using the
-// SAME policy.Origins matcher the REST CORS surface uses.
+// allowUpgradeOrigin is the upgrade-time origin decision, delegated in full to
+// policy.Origins.AllowUpgrade — the SAME call internal/signaling's /ws upgrade makes, so
+// the two endpoints cannot diverge.
 //
-// # Why this does not use websocket.AcceptOptions.OriginPatterns
+// # Why AcceptOptions.OriginPatterns is not used
 //
 // coder/websocket's authenticateOrigin returns ALLOW when r.Host equals the Origin's
-// host, BEFORE it consults OriginPatterns at all, and comparing hosts only — the scheme
-// is ignored. That is a second matcher with a rule policy.Origins does not have, and it
-// is exploitable: an attacker who points a name they control at this server's address
-// gets a victim's browser to send Host: evil.com and Origin: http://evil.com, the
-// short-circuit fires, and the upgrade succeeds against an allow-list naming neither.
-// The reached server may be on loopback or a LAN the attacker cannot dial — which is
-// exactly the reachability assumption that makes an unauthenticated dashboard defensible
-// in the first place. It also let a plaintext origin claim a host the allow-list only
-// permits over https.
+// host, BEFORE consulting OriginPatterns and comparing hosts only, ignoring the scheme.
+// That is a second matcher carrying a rule policy.Origins does not have, and it is
+// exploitable: an attacker who points a name they control at this server's address gets
+// a victim's browser to send Host: evil.com and Origin: http://evil.com, the shortcut
+// fires, and the upgrade succeeds against an allow-list naming neither — reaching a
+// loopback or LAN server the attacker cannot dial, which is the very reachability
+// assumption that makes an unauthenticated dashboard defensible. It also let a plaintext
+// origin claim a host the allow-list permits only over https. policy.Origins.Patterns()
+// carries a doc block saying not to gate an upgrade with it.
 //
-// So the library's check is disabled (InsecureSkipVerify) and the decision is made here,
-// through the one matcher. internal/signaling's upgrade has the identical hole and the
-// identical fix; the matcher is shared already, and the six lines of gate around it are
-// the natural next thing to lift into policy — see the report accompanying this change.
-//
-// An ABSENT Origin is allowed, matching the library's behaviour and for the same reason:
-// Origin is a browser-supplied header, a Go peer or a health checker sends none, and a
-// page cannot suppress its own. Rejecting those would break every non-browser client
-// while stopping no attack.
+// So the library's check is switched off (InsecureSkipVerify) and the decision is made
+// here. Note the consequence, which is the hole closing rather than a regression: a page
+// served from the ARBITER'S OWN ORIGIN is no longer auto-allowed and must be listed in
+// -allowed-origins. Self-origin auto-allow IS the rebinding vector. The default list
+// covers localhost and 127.0.0.1, so the intended Pages-plus-local-server setup is
+// unaffected; a hosted deployment that serves its own dashboard must list its origin.
 func (s *Server) allowUpgradeOrigin(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
-	if origin == "" {
-		return true
-	}
-	_, ok := s.origins.Match(origin)
-	return ok
+	return s.origins.AllowUpgrade(r.Header.Get("Origin"))
 }
