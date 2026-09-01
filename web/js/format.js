@@ -60,10 +60,18 @@ export function fmtPct(v) {
   return `${v.toFixed(1)}%`;
 }
 
-/** fitness (0–1, 3 decimals per §9.4a). */
-export function fmtFitness(v) {
+/**
+ * fitness_lower_bound (0–1, 3 decimals per §9.4a). Renamed from `fitness` in the wire
+ * contract (v2.6): `arbiter.Fitness.UptimeSec` is unreachable from the coordinator's
+ * snapshot, so the true score is short by up to the 0.15 uptime weight. The key names the
+ * caveat instead of footnoting it — a value quietly 0.15 too low is invisibly wrong
+ * otherwise — so this formatter prefixes every value with "≥" and must never be presented
+ * as an exact score. 0 is a real, common value (disqualified from coordinating: TURN-bound,
+ * not live, or not coordinatable) and must still render as "≥0.000", never dashed.
+ */
+export function fmtFitnessLowerBound(v) {
   if (!isFiniteNumber(v)) return '—';
-  return v.toFixed(3);
+  return `≥${v.toFixed(3)}`;
 }
 
 /** *_kbps — kbit/s, integer. */
