@@ -29,8 +29,10 @@ import (
 
 	"github.com/SammyUrfen/conclave/internal/arbiter"
 	"github.com/SammyUrfen/conclave/internal/clock"
+	"github.com/SammyUrfen/conclave/internal/coordinator"
 	"github.com/SammyUrfen/conclave/internal/logging"
 	"github.com/SammyUrfen/conclave/internal/media"
+	"github.com/SammyUrfen/conclave/internal/meetconfig"
 	"github.com/SammyUrfen/conclave/internal/metrics"
 	"github.com/SammyUrfen/conclave/internal/overlay"
 	"github.com/SammyUrfen/conclave/internal/signaling"
@@ -376,17 +378,17 @@ type coordinatorAdopter func(epoch uint64, coordinatorID string) bool
 // adoption and silently unfence the peer, which is a privilege-escalation regression
 // rather than a cosmetic one.
 //
-// self is returned as well as logged so the Phase 6 wiring that starts and stops an
-// in-process coordinator has the predicate ready — and tested — rather than
-// rediscovering it at the call site.
-func adoptAnnouncement(log *slog.Logger, selfID func() string, adopt coordinatorAdopter, payload []byte) (adopted, self bool) {
-	var ann arbiter.Announcement
+// The decoded announcement is returned along with the two predicates so the caller
+// can drive the coordinator lifecycle without decoding the same bytes twice — and so
+// self, which starts and stops an in-process coordinator, is a tested value rather
+// than something rediscovered at the call site.
+func adoptAnnouncement(log *slog.Logger, selfID func() string, adopt coordinatorAdopter, payload []byte) (ann arbiter.Announcement, adopted, self bool) {
 	if err := json.Unmarshal(payload, &ann); err != nil {
 		// A malformed announcement is dropped, not fatal: the arbiter re-broadcasts
 		// the current announcement on every membership change, so the next one
 		// repairs this peer.
 		log.Warn("bad coordinator announcement", slog.Any("error", err))
-		return false, false
+		return arbiter.Announcement{}, false, false
 	}
 	// Compared by the SERVER-ASSIGNED ID, never by -name: an announcement names the
 	// coordinator by id, so a peer matching it against its own name could never
@@ -396,7 +398,7 @@ func adoptAnnouncement(log *slog.Logger, selfID func() string, adopt coordinator
 	id := selfID()
 	self = id != "" && id == ann.CoordinatorID
 	if !adopt(ann.Epoch, ann.CoordinatorID) {
-		return false, self
+		return ann, false, self
 	}
 	log.Info("coordinator announced",
 		slog.Uint64("epoch", ann.Epoch),
@@ -404,7 +406,7 @@ func adoptAnnouncement(log *slog.Logger, selfID func() string, adopt coordinator
 		slog.String("coordinator_id", ann.CoordinatorID),
 		slog.String("reason", string(ann.Reason)),
 		slog.Bool("self", self))
-	return true, self
+	return ann, true, self
 }
 
 // overlayReporter is the slice of media.Router the heartbeat reads: this peer's
@@ -482,6 +484,346 @@ func controlFrame(t signaling.Type, body any) (signaling.Message, error) {
 		return signaling.Message{}, fmt.Errorf("marshal %s payload: %w", t, err)
 	}
 	return signaling.Message{Type: t, Payload: payload}, nil
+}
+
+// planeCoordinator is the slice of coordinator.Coordinator an elected peer drives.
+//
+// Consumer-defined and narrow, for the same reason overlayReporter is: it lets the
+// plane's routing and lifecycle be asserted against a fake instead of a real control
+// loop, and it makes a drift in the coordinator's surface a compile error here rather
+// than a peer that silently stops feeding it something.
+type planeCoordinator interface {
+	Run(ctx context.Context) error
+	SetRoster(roomID string, members []coordinator.Member)
+	PeerJoined(roomID, peerID, name string)
+	PeerLeft(roomID, peerID string)
+	Metrics(roomID, peerID string, payload []byte)
+	Heartbeat(roomID, peerID string, payload []byte)
+	Reparented(roomID, peerID string, payload []byte)
+	SetEpoch(roomID string, epoch uint64)
+	Yield(roomID string, newEpoch uint64)
+}
+
+// planeQueueDepth bounds the plane's inbound backlog.
+//
+// 64 is roomy for a meet's control traffic — a handful of peers beating at 1 Hz plus
+// membership churn — and the depth matters far less than the discipline around it:
+// this queue exists so media's Run goroutine never waits on the coordinator.
+const planeQueueDepth = 64
+
+// planeEvent is one thing for the plane's goroutine to do: a control frame to route,
+// an election outcome to act on, or a test barrier. One queue rather than three
+// channels because ORDER MATTERS — media delivers the announcement and the frames
+// that follow it on one goroutine in wire order, and an election that arrived before
+// a membership change must be applied before it.
+type planeEvent struct {
+	frame signaling.Message
+	ann   *arbiter.Announcement
+	self  bool
+	ack   chan struct{}
+}
+
+// peerPlane hosts the coordinator when THIS peer is the elected one.
+//
+// It is the peer-side analogue of cmd/server's object graph, minus the arbiter: the
+// same coordinator.Coordinator, fed from the frames the server forwards rather than
+// from an Observer, publishing through the peer's one signaling client rather than
+// through the Hub.
+//
+// It exists because an elected peer that hosts nothing is strictly worse than no
+// election at all — the arbiter hands the role away and the meet is never repaired
+// again, silently, because a working server-hosted coordinator was replaced by a peer
+// that adopted the title and no duties.
+type peerPlane struct {
+	log      *slog.Logger
+	room     string
+	selfName string
+	clk      clock.Clock
+	send     func(signaling.Message) error
+
+	// events is the queue-and-return seam. post writes here from media's Run
+	// goroutine and returns immediately; everything below runs on the plane's own
+	// goroutine, which is therefore the single owner of coord/holding/epoch.
+	events  chan planeEvent
+	dropped atomic.Uint64
+	refused atomic.Uint64
+	// hosts is read by hosting() from other goroutines, so it is atomic rather than
+	// a plain bool guarded by the single-owner rule.
+	hosts atomic.Bool
+
+	// newCoordinator is the constructor, injected so a test can substitute a fake
+	// and count how many are built. Nil is filled in by newPeerPlane.
+	newCoordinator func(coordinator.Config) planeCoordinator
+
+	// Owned by the run goroutine.
+	coord    planeCoordinator
+	coordCtx context.CancelFunc
+	wg       sync.WaitGroup
+}
+
+// newPeerPlane builds an idle plane. Nothing is constructed until this peer is
+// actually elected: before that there is no configuration to build one from, because
+// the meet's tuning arrives on the announcement.
+func newPeerPlane(log *slog.Logger, room, selfName string, clk clock.Clock,
+	send func(signaling.Message) error) *peerPlane {
+	p := &peerPlane{
+		log:      log.With(slog.String("component", "peer-coordinator")),
+		room:     room,
+		selfName: selfName,
+		clk:      clk,
+		send:     send,
+		events:   make(chan planeEvent, planeQueueDepth),
+	}
+	p.newCoordinator = func(cfg coordinator.Config) planeCoordinator {
+		return coordinator.New(p.log, cfg, planeSender{room: p.room, send: p.send}, nil)
+	}
+	return p
+}
+
+// post hands one control frame to the plane. Called from media's Run goroutine, so it
+// MUST NOT block: that goroutine routes every session's offer/answer/candidate, and
+// stalling it would break the media plane in order to feed the control plane.
+//
+// Overflow drops and counts. A dropped telemetry frame is self-correcting — the peer
+// reports again on its next tick — whereas a wedged Run goroutine is not corrected by
+// anything.
+func (p *peerPlane) post(msg signaling.Message) {
+	select {
+	case p.events <- planeEvent{frame: msg}:
+	default:
+		p.dropped.Add(1)
+		p.log.Warn("dropped a control frame: plane queue full", slog.String("type", string(msg.Type)))
+	}
+}
+
+// announce reports an arbiter announcement to the plane.
+//
+// The (adopted, self) pair is exactly what the fence already computed, and BOTH halves
+// are load-bearing. Acting on an unadopted announcement would let §6.2's
+// re-announcement — broadcast on every membership change at an UNCHANGED epoch, which
+// AdoptAnnouncement correctly refuses — restart a running coordinator for no reason.
+func (p *peerPlane) announce(ann arbiter.Announcement, adopted, self bool) {
+	if !adopted {
+		return
+	}
+	a := ann
+	select {
+	case p.events <- planeEvent{ann: &a, self: self}:
+	default:
+		// An election is not telemetry: losing one leaves the meet without a
+		// coordinator until the next membership change re-broadcasts it. Loud.
+		p.dropped.Add(1)
+		p.log.Error("dropped a coordinator announcement: plane queue full",
+			slog.Uint64("epoch", ann.Epoch), slog.Bool("self", self))
+	}
+}
+
+// Dropped counts events shed by post/announce. Nonzero means the control link
+// outran the plane, which is a diagnosis rather than an error.
+func (p *peerPlane) Dropped() uint64 { return p.dropped.Load() }
+
+// Refused counts elections declined because the announced configuration could not
+// drive a coordinator. Nonzero is a CONFIGURATION fault on the arbiter, not a
+// transient: every announcement carries the same config until a redeploy.
+func (p *peerPlane) Refused() uint64 { return p.refused.Load() }
+
+// hosting reports whether this peer is currently the coordinator for its meet.
+func (p *peerPlane) hosting() bool { return p.hosts.Load() }
+
+// sync blocks until every event posted before the call has been handled. It is the
+// test barrier — the plane is inherently asynchronous, and polling for "has it
+// happened yet" is how a suite becomes flaky. Same role as coordinator.Sync.
+func (p *peerPlane) sync() {
+	ack := make(chan struct{})
+	p.events <- planeEvent{ack: ack}
+	<-ack
+}
+
+// run owns every mutation of the plane's state until ctx is cancelled, then stops the
+// hosted coordinator and joins its goroutine so nothing outlives the call.
+func (p *peerPlane) run(ctx context.Context) {
+	defer p.stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-p.events:
+			p.handle(ctx, ev)
+		}
+	}
+}
+
+func (p *peerPlane) handle(ctx context.Context, ev planeEvent) {
+	switch {
+	case ev.ack != nil:
+		close(ev.ack)
+	case ev.ann != nil:
+		p.onElection(ctx, *ev.ann, ev.self)
+	case p.coord != nil:
+		p.route(ev.frame)
+	}
+	// The last case tests coord != nil, NOT hosting(), and the difference is
+	// deliberate: a YIELDED coordinator keeps being fed. Yield drops the tree — a
+	// belief this node is no longer authoritative about — while telemetry, health and
+	// membership came off the wire and are still true, so a re-elected node starts
+	// warm instead of paying a full join settle over again.
+	//
+	// A frame arriving before this peer has EVER been elected is dropped rather than
+	// buffered: there is nothing to hold it, and replaying it after a later election
+	// would feed a stale view of a membership that has since moved on.
+}
+
+// route feeds one control frame to the hosted coordinator.
+//
+// Every telemetry frame is attributed to msg.From — the ORIGINAL peer's id, which the
+// server preserves when it forwards (§8 rule 2). The coordinator keys its member
+// records on that id, so attributing a forwarded frame to the server, or to this
+// peer, would file another node's telemetry under the wrong node.
+func (p *peerPlane) route(msg signaling.Message) {
+	switch msg.Type {
+	case signaling.TypeMembership:
+		// The authoritative roster, and the reason TypeMembership exists at all: a
+		// coordinator that is a PEER gets no Observer callbacks, so without this frame
+		// it would learn joins only implicitly and graceful leaves not at all.
+		p.coord.SetRoster(p.room, membersFrom(msg.Peers))
+	case signaling.TypePeerJoined:
+		p.coord.PeerJoined(p.room, msg.From, msg.Name)
+	case signaling.TypePeerLeft:
+		p.coord.PeerLeft(p.room, msg.From)
+	case signaling.TypeMetrics:
+		p.coord.Metrics(p.room, msg.From, msg.Payload)
+	case signaling.TypeHeartbeat:
+		p.coord.Heartbeat(p.room, msg.From, msg.Payload)
+	case signaling.TypeReparented:
+		p.coord.Reparented(p.room, msg.From, msg.Payload)
+	}
+}
+
+// membersFrom translates the wire roster into the coordinator's own membership type.
+// The translation lives here so coordinator imports nothing new — the same
+// consumer-side discipline as every other seam in this binary.
+func membersFrom(peers []signaling.Peer) []coordinator.Member {
+	members := make([]coordinator.Member, 0, len(peers))
+	for _, pr := range peers {
+		members = append(members, coordinator.Member{ID: pr.ID, Name: pr.Name})
+	}
+	return members
+}
+
+// onElection applies one adopted announcement to the coordinator lifecycle.
+//
+// The coordinator is constructed ONCE and then kept, because Yield is designed to keep
+// it warm: yielding drops the tree (a belief this node is no longer authoritative
+// about) but preserves telemetry, health and membership (observations that came off
+// the wire and are still true). Rebuilding on every handover would discard those and
+// make a re-election pay a full join settle for nothing.
+func (p *peerPlane) onElection(ctx context.Context, ann arbiter.Announcement, self bool) {
+	if !self {
+		if p.coord != nil && p.hosts.Load() {
+			// newEpoch is the term that REPLACED this node, and passing it raises the
+			// meet's epoch floor so the very announcement that demoted us can never
+			// also resume us.
+			p.coord.Yield(p.room, ann.Epoch)
+			p.hosts.Store(false)
+			p.log.Info("yielded the coordinator role",
+				slog.Uint64("epoch", ann.Epoch), slog.String("to", ann.Coordinator))
+		}
+		return
+	}
+
+	if p.coord == nil {
+		cfg, err := planeConfig(ann.Config, p.selfName, p.clk)
+		if err != nil {
+			// Refuse LOUDLY and start nothing. Nobody upstream will stop us: the
+			// arbiter only warns about an unusable config, on the reasoning that an
+			// arbiter which refuses to start is worse than one that says why every
+			// meet is uncoordinated. A coordinator built from it would run, publish
+			// nothing, and look healthy — which is the exact failure this whole item
+			// exists to remove, relocated one layer down.
+			p.refused.Add(1)
+			p.log.Error("refusing the coordinator role: the announced configuration cannot drive one",
+				slog.Uint64("epoch", ann.Epoch), slog.Any("error", err))
+			return
+		}
+		p.coord = p.newCoordinator(cfg)
+		coordCtx, cancel := context.WithCancel(ctx)
+		p.coordCtx = cancel
+		p.wg.Add(1)
+		go func() {
+			defer p.wg.Done()
+			if err := p.coord.Run(coordCtx); err != nil && !errors.Is(err, context.Canceled) {
+				p.log.Error("hosted coordinator stopped", slog.Any("error", err))
+			}
+		}()
+		p.log.Info("hosting the coordinator for this meet",
+			slog.Uint64("epoch", ann.Epoch), slog.String("self_name", p.selfName),
+			slog.Int("max_depth", cfg.MaxDepth), slog.Int("stream_kbps", cfg.StreamKbps))
+	}
+
+	// Both the first election and every later one: the term is what makes this node
+	// authoritative again, and only a strictly higher SetEpoch resumes a yielded
+	// coordinator.
+	p.coord.SetEpoch(p.room, ann.Epoch)
+	p.hosts.Store(true)
+}
+
+// stop tears the hosted coordinator down and joins its goroutine.
+func (p *peerPlane) stop() {
+	if p.coordCtx != nil {
+		p.coordCtx()
+	}
+	p.wg.Wait()
+	p.hosts.Store(false)
+}
+
+// planeConfig turns the meet's announced tuning into a coordinator.Config this peer
+// can actually run, or refuses it.
+//
+// It validates FIRST, because arbiter.CoordinatorConfig's zero fields are meaningful
+// values rather than absences: an unresolved config would translate cleanly into a
+// coordinator that silently retunes the meet, and a zero StreamKbps into one whose
+// every BuildTree call hard-errors.
+//
+// Then it fills in the two fields the wire deliberately cannot carry:
+//
+//   - SelfName, and this is the trap. The translator leaves it empty because it
+//     differs per holder, and an EMPTY SelfName is precisely how a coordinator marks
+//     itself as the one running inside the arbiter process. A peer that forgets it
+//     gets a coordinator that believes it is the arbiter.
+//   - Clock, a per-process capability rather than a value, so a test drives this
+//     coordinator's timers instead of sleeping.
+func planeConfig(cc arbiter.CoordinatorConfig, selfName string, clk clock.Clock) (coordinator.Config, error) {
+	if err := cc.Validate(); err != nil {
+		return coordinator.Config{}, fmt.Errorf("announced coordinator config: %w", err)
+	}
+	cfg := meetconfig.Coordinator(cc)
+	cfg.SelfName = selfName
+	cfg.Clock = clk
+	return cfg, nil
+}
+
+// planeSender publishes computed topologies back through the peer's ONE signaling
+// client (§8 forbids a second control link).
+//
+// It satisfies coordinator.Sender's "must not block, must not do network I/O on the
+// calling goroutine" the same way the server's hubSender does: signaling.Client.Send
+// writes to a buffered channel and returns, and the write pump does the socket work.
+// It is also called from the coordinator's own sender goroutine, never its control
+// loop, so even a full buffer delays pushes rather than stalling recomputation.
+type planeSender struct {
+	room string
+	send func(signaling.Message) error
+}
+
+func (s planeSender) SendTopology(roomID, peerID string, topo *overlay.Topology) error {
+	payload, err := json.Marshal(topo)
+	if err != nil {
+		return fmt.Errorf("marshal topology: %w", err)
+	}
+	// To addresses the recipient; From is left for the server to stamp with this
+	// peer's id, which is what the receiving peer's fence checks against the
+	// coordinator the arbiter named.
+	return s.send(signaling.Message{Type: signaling.TypeTopology, To: peerID, Payload: payload})
 }
 
 // realizedFunc reports this peer's REALIZED topology state — the parent and children
@@ -697,14 +1039,31 @@ func runCall(ctx context.Context, logger *slog.Logger, cfg callConfig) error {
 		return client.Send(msg)
 	})
 
-	// router is captured by the two callbacks below before it exists. That is safe,
-	// not a race: NewRouter returns on this goroutine before Run is called on it, and
+	// plane hosts the coordinator if the arbiter elects this peer. It is built for
+	// every managed peer and stays idle until then: an election can arrive at any
+	// moment, and constructing the queue lazily would mean dropping the frames that
+	// arrive in the same breath as the announcement.
+	var plane *peerPlane
+	if cfg.managed {
+		plane = newPeerPlane(logger, cfg.room, cfg.name, clk, client.Send)
+	}
+
+	// router is captured by the callbacks below before it exists. That is safe, not a
+	// race: NewRouter returns on this goroutine before Run is called on it, and
 	// nothing invokes a callback until Run is executing — so the assignment
 	// happens-before every read.
 	var router *media.Router
 	rcfg := routerConfigFor(cfg, topo, iceServers, clk, reparents.post, func(payload []byte) {
-		adoptAnnouncement(logger, router.SelfID, router.AdoptCoordinator, payload)
+		ann, adopted, self := adoptAnnouncement(logger, router.SelfID, router.AdoptCoordinator, payload)
+		if plane != nil {
+			plane.announce(ann, adopted, self)
+		}
 	})
+	if plane != nil {
+		// Every control frame this peer's coordinator would need, queued and returned
+		// immediately — media calls this on its Run goroutine.
+		rcfg.OnControlFrame = plane.post
+	}
 	router = media.NewRouter(logger, client, rcfg)
 	logger.Info("running call",
 		slog.Bool("send", cfg.send), slog.String("media", cfg.mediaPath),
@@ -715,6 +1074,11 @@ func runCall(ctx context.Context, logger *slog.Logger, cfg callConfig) error {
 	if topo != nil || cfg.managed {
 		wg.Add(1)
 		go func() { defer wg.Done(); reparents.run(callCtx) }()
+	}
+
+	if plane != nil {
+		wg.Add(1)
+		go func() { defer wg.Done(); plane.run(callCtx) }()
 	}
 
 	if cfg.managed {
@@ -763,9 +1127,16 @@ func runCall(ctx context.Context, logger *slog.Logger, cfg callConfig) error {
 	// The session totals. stale_rejected also rides every heartbeat, so the control
 	// plane and the dashboard see it live; this line is the local closing summary,
 	// and it is proof the fence works rather than an error condition.
-	logger.Info("call ended",
+	ended := []any{
 		slog.Uint64("stale_rejected", router.StaleRejected()),
-		slog.Uint64("reparent_reports_dropped", reparents.Dropped()))
+		slog.Uint64("reparent_reports_dropped", reparents.Dropped()),
+	}
+	if plane != nil {
+		ended = append(ended,
+			slog.Uint64("control_frames_dropped", plane.Dropped()),
+			slog.Uint64("elections_refused", plane.Refused()))
+	}
+	logger.Info("call ended", ended...)
 	return nil
 }
 
