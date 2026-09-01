@@ -69,6 +69,32 @@ type RouterConfig struct {
 	// modes that have no control plane.
 	OnCoordinator func(payload []byte)
 
+	// OnControlFrame surfaces the frames the control plane runs on — TypeMembership,
+	// TypeMetrics, TypeHeartbeat, TypeReparented, and the TypePeerJoined /
+	// TypePeerLeft lifecycle pair — to whoever hosts this Router.
+	//
+	// It exists because the Router is the SOLE consumer of the peer's one signaling
+	// stream (§8 forbids a second control link) and NewRouter takes a concrete
+	// client, so a host cannot interpose: Transport is per-Session, not per-Router.
+	// Without this seam an elected peer adopts the coordinator role and then never
+	// hears a single frame its control loop needs, so the tree is never repaired and
+	// electing a coordinator is strictly worse than not electing one.
+	//
+	// It is the rest of the thought OnCoordinator started: the host needs the
+	// announcement to know it has the job, and it needs these to be able to do it.
+	//
+	// Additional, never a replacement: the Router still acts on the lifecycle frames
+	// itself, keeping its own name↔id bookkeeping, and the frames it owns outright
+	// (media signaling, joined, topology, coordinator, error) are deliberately not
+	// surfaced — this is a control-plane seam, not a tap on the stream.
+	//
+	// CALLED ON THE Run GOROUTINE. The host must queue and return; anything that
+	// blocks here stalls the peer's entire signaling loop, which is the same hazard
+	// the coordinator avoids by moving its sends off its own loop. cmd/peer's
+	// reparentSender is the pattern to copy. Nil ⇒ the frames are dropped as before,
+	// which is correct for every peer that is not hosting a coordinator.
+	OnControlFrame func(signaling.Message)
+
 	// OnReparented is called after this peer promotes its own backup parent, with
 	// the outcome the control plane needs to ratify (or urgently repair) the
 	// decision. Declared as a callback so media never learns the wire format — the
@@ -383,9 +409,11 @@ func (r *Router) handle(ctx context.Context, msg signaling.Message) {
 	case signaling.TypePeerJoined:
 		r.learnPeer(msg.From, msg.Name)
 		r.maybeStartPeer(ctx, msg.From)
+		r.surfaceControlFrame(msg)
 	case signaling.TypePeerLeft:
 		r.stopPeer(msg.From)
 		r.forgetPeer(msg.From)
+		r.surfaceControlFrame(msg)
 	case signaling.TypeOffer, signaling.TypeAnswer, signaling.TypeCandidate:
 		r.deliver(ctx, msg)
 	case signaling.TypeTopology:
@@ -399,7 +427,23 @@ func (r *Router) handle(ctx context.Context, msg signaling.Message) {
 		}
 	case signaling.TypeError:
 		r.log.Warn("signaling error frame", slog.String("error", msg.Error))
+	case signaling.TypeMembership, signaling.TypeMetrics,
+		signaling.TypeHeartbeat, signaling.TypeReparented:
+		// Nothing here acts on these; they belong to whoever hosts the control
+		// plane. The Router's job is to stop swallowing them.
+		r.surfaceControlFrame(msg)
 	}
+}
+
+// surfaceControlFrame hands one frame to the host, unchanged. It passes the whole
+// Message rather than a decoded body because the sender id matters as much as the
+// payload: a forwarded heartbeat arrives stamped with the ORIGINAL peer's id (§8
+// rule 2), and that is the key a coordinator files it under.
+func (r *Router) surfaceControlFrame(msg signaling.Message) {
+	if r.cfg.OnControlFrame == nil {
+		return
+	}
+	r.cfg.OnControlFrame(msg)
 }
 
 // applyTopology realises a coordinator-pushed topology. It DIFFS the incoming tree
