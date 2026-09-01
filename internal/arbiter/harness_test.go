@@ -162,13 +162,15 @@ type wireReport struct {
 // harness owns one Arbiter under a virtual clock, plus the peers a scenario has
 // introduced so the test can beat all of them without restating the roster.
 type harness struct {
-	t     *testing.T
-	a     *arbiter.Arbiter
-	clk   *fakeClock
-	ann   *recAnnouncer
-	pub   *recPublisher
-	stop  context.CancelFunc
-	done  chan error
+	t    *testing.T
+	a    *arbiter.Arbiter
+	clk  *fakeClock
+	ann  *recAnnouncer
+	pub  *recPublisher
+	stop context.CancelFunc
+	done chan struct{} // CLOSED (not sent to) when Run returns, so a test that
+	// already waited for shutdown and the t.Cleanup that waits again can both
+	// observe it.
 	mu    sync.Mutex
 	peers map[string][]string // roomID -> peer ids, in join order
 	names map[string]string   // peerID -> name
@@ -187,12 +189,12 @@ func newHarness(t *testing.T, cfg arbiter.Config) *harness {
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &harness{
 		t: t, a: a, clk: clk, ann: ann, pub: pub, stop: cancel,
-		done:  make(chan error, 1),
+		done:  make(chan struct{}),
 		peers: map[string][]string{},
 		names: map[string]string{},
 		beats: map[string]uint64{},
 	}
-	go func() { h.done <- a.Run(ctx) }()
+	go func() { _ = a.Run(ctx); close(h.done) }()
 	t.Cleanup(func() {
 		cancel()
 		select {
