@@ -1,21 +1,42 @@
 package coordinator
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/SammyUrfen/conclave/internal/metrics"
 	"github.com/SammyUrfen/conclave/internal/overlay"
 )
 
-// reportRTT files a routine (non-first) report carrying measured pairwise RTT.
-func (d *driver) reportRTT(peerID, name string, upload int, rtt map[string]float64) {
+// rttReport builds a report carrying measured pairwise RTT, normalised the way the
+// peer's Reporter does before sending.
+func rttReport(name string, upload int, rtt map[string]float64) metrics.Report {
 	peers := make([]metrics.PeerRTT, 0, len(rtt))
 	for n, ms := range rtt {
 		peers = append(peers, metrics.PeerRTT{Name: n, RTTMs: ms})
 	}
 	rep := metrics.Report{Name: name, UploadKbps: upload, PeerRTT: peers}
 	rep.Normalize()
-	d.c.handle(event{kind: evReport, roomID: "r", peerID: peerID, report: rep})
+	return rep
+}
+
+// reportRTT files a routine (non-first) report carrying measured pairwise RTT.
+func (d *driver) reportRTT(peerID, name string, upload int, rtt map[string]float64) {
+	d.c.handle(event{kind: evReport, roomID: "r", peerID: peerID, report: rttReport(name, upload, rtt)})
+}
+
+// joinRTT is driver.join with the FIRST report already carrying measurements.
+//
+// The seeding is not decoration. Without RTT the builder falls through to rank 3
+// (fewest children), which attaches the second relay UNDER the first rather than
+// beside it — and at MaxDepth 2 a depth-2 relay cannot take children at all, so the
+// "closer relay" would be excluded by a hard constraint before latency was ever
+// consulted. Seeding produces the flat two-relay fleet these tests are about, and it
+// is also the realistic state: by the time a peer is choosing between relays it has
+// been connected long enough to have measured some of them.
+func (d *driver) joinRTT(peerID, name string, upload int, rtt map[string]float64) {
+	d.c.handle(event{kind: evJoin, roomID: "r", peerID: peerID, name: name})
+	d.c.handle(event{kind: evReport, roomID: "r", peerID: peerID, report: rttReport(name, upload, rtt)})
 }
 
 // TestProjectCarriesMeasuredRTTIntoTheBuilder pins the one line that connects the new
@@ -68,7 +89,11 @@ func TestProjectGivesAProvisionalNodeNoRTT(t *testing.T) {
 		if !n.Provisional {
 			t.Fatal("precondition: z should be provisional")
 		}
-		if len(n.RTT) != 0 {
+		// nil, not merely empty. `len(n.RTT) != 0` would pass against an empty
+		// non-nil map, which is the exact shape a careless "always allocate" refactor
+		// produces — and this test would then read as coverage while measuring
+		// nothing.
+		if n.RTT != nil {
 			t.Errorf("a provisional node carries RTT %v; it has measured nothing", n.RTT)
 		}
 		return
@@ -76,28 +101,44 @@ func TestProjectGivesAProvisionalNodeNoRTT(t *testing.T) {
 	t.Fatal("z is not in the projection")
 }
 
-// TestProjectDoesNotAliasTheReportsSlice pins that the builder cannot mutate the
-// coordinator's stored telemetry, and that two rebuilds from the same report produce
-// independent maps. Sharing one map across every projection would make a future
-// builder optimisation that writes into Node.RTT corrupt the stored report — the kind
-// of aliasing bug that shows up as a tree that changes without an event.
-func TestProjectDoesNotAliasTheReportsSlice(t *testing.T) {
+// TestProjectHandsOutAFreshRTTMapEachTime pins map IDENTITY, not just map contents,
+// and the distinction is why this test is written the awkward way.
+//
+// The obvious version — mutate the returned map, project again, check the value came
+// back — does not discriminate. A cached shared map still passes it, because the
+// repopulating loop overwrites the tampered entry on the way out. The property that
+// actually matters is that no two projections hand overlay the same mutable object:
+// project runs per rebuild and its output is handed to a package that is free to
+// treat its input as its own, so a cached map would couple every rebuild to the last
+// one through state nobody declared.
+func TestProjectHandsOutAFreshRTTMapEachTime(t *testing.T) {
 	d := newDriver(t)
 	d.join("p1", "a", 8000)
 	d.join("p2", "b", 4000)
 	d.reportRTT("p2", "b", 4000, map[string]float64{"a": 10})
 
-	first, _ := d.c.project(d.c.rooms["r"])
-	for i := range first {
-		if first[i].Name == "b" {
-			first[i].RTT["a"] = 999
+	rttOf := func(nodes []overlay.Node, name string) map[string]float64 {
+		t.Helper()
+		for _, n := range nodes {
+			if n.Name == name {
+				return n.RTT
+			}
 		}
+		t.Fatalf("%q is not in the projection", name)
+		return nil
 	}
+
+	first, _ := d.c.project(d.c.rooms["r"])
 	second, _ := d.c.project(d.c.rooms["r"])
-	for _, n := range second {
-		if n.Name == "b" && n.RTT["a"] != 10 {
-			t.Errorf("second projection saw %v; the first projection's map was shared", n.RTT["a"])
-		}
+	a, b := rttOf(first, "b"), rttOf(second, "b")
+	if a == nil || b == nil {
+		t.Fatal("both projections must carry b's RTT")
+	}
+	if reflect.ValueOf(a).Pointer() == reflect.ValueOf(b).Pointer() {
+		t.Error("two projections returned the SAME map; overlay is being handed shared mutable state")
+	}
+	if b["a"] != 10 {
+		t.Errorf("second projection saw %v, want 10", b["a"])
 	}
 }
 
@@ -117,11 +158,12 @@ func TestProjectDoesNotAliasTheReportsSlice(t *testing.T) {
 // the test drives it that way rather than reaching past it.
 func TestACloserRelayWinsTheReParent(t *testing.T) {
 	d := newDriver(t)
-	// Root with room for both relays; two relays with room for a child each.
-	d.join("p0", "r", 20000)
-	d.join("p1", "p1", 8000)
-	d.join("p2", "p2", 8000)
-	d.join("p3", "c", 0)
+	// A flat fleet: root with room for both relays, both relays beside each other at
+	// depth 1, and c a leaf under p1.
+	d.joinRTT("p0", "r", 20000, nil)
+	d.joinRTT("p1", "p1", 8000, map[string]float64{"r": 1})
+	d.joinRTT("p2", "p2", 8000, map[string]float64{"r": 1, "p1": 200})
+	d.joinRTT("p3", "c", 0, map[string]float64{"r": 200, "p1": 1, "p2": 90})
 
 	published := d.c.rooms["r"].published
 	if published == nil {
@@ -133,7 +175,7 @@ func TestACloserRelayWinsTheReParent(t *testing.T) {
 
 	// c now measures its incumbent at 100 ms and the other relay at 5 ms: a 95 ms
 	// advantage, far past the 25 ms default stickiness margin.
-	d.reportRTT("p3", "c", 0, map[string]float64{"p1": 100, "p2": 5})
+	d.reportRTT("p3", "c", 0, map[string]float64{"r": 200, "p1": 100, "p2": 5})
 
 	// The measurement alone must not move anything — that is the anti-thrash rule.
 	if got := d.c.rooms["r"].published.ParentOf("c"); got != "p1" {
@@ -158,17 +200,20 @@ func TestACloserRelayWinsTheReParent(t *testing.T) {
 // alone is satisfiable by a constant answer.
 func TestStickinessHoldsAgainstASmallImprovement(t *testing.T) {
 	d := newDriver(t)
-	d.join("p0", "r", 20000)
-	d.join("p1", "p1", 8000)
-	d.join("p2", "p2", 8000)
-	d.join("p3", "c", 0)
+	d.joinRTT("p0", "r", 20000, nil)
+	d.joinRTT("p1", "p1", 8000, map[string]float64{"r": 1})
+	d.joinRTT("p2", "p2", 8000, map[string]float64{"r": 1, "p1": 200})
+	d.joinRTT("p3", "c", 0, map[string]float64{"r": 200, "p1": 1, "p2": 90})
 
 	if got := d.c.rooms["r"].published.ParentOf("c"); got != "p1" {
 		t.Fatalf("precondition: c starts under p1, got %q", got)
 	}
 
-	// 10 ms better — real, measured, and below DefaultStickinessMs (25).
-	d.reportRTT("p3", "c", 0, map[string]float64{"p1": 100, "p2": 90})
+	// 10 ms better — real, measured, and below DefaultStickinessMs (25). The root is
+	// held far away so that IT cannot break incumbency either; this test is about the
+	// margin, and a second challenger sneaking under it would pass for the wrong
+	// reason.
+	d.reportRTT("p3", "c", 0, map[string]float64{"r": 200, "p1": 100, "p2": 90})
 	d.join("p4", "d", 0)
 
 	if got := d.c.rooms["r"].published.ParentOf("c"); got != "p1" {
