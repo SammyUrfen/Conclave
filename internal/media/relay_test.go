@@ -40,7 +40,7 @@ func (c *captureRTCP) count() int {
 // upstream keyframe request must carry the SOURCE's SSRC, never a downstream one,
 // or the source ignores it and the picture stays black. It also checks the throttle.
 func TestForwarderTranslatesPLISSRC(t *testing.T) {
-	f := newForwarder(slog.New(slog.NewTextHandler(io.Discard, nil)), &uploadMeter{}, func(func()) {})
+	f := newForwarder(slog.New(slog.NewTextHandler(io.Discard, nil)), &uploadMeter{}, func(func()) {}, newFakeClock())
 	up := &captureRTCP{}
 	f.setUpstream("src", up)
 
@@ -80,7 +80,7 @@ func TestForwarderTranslatesPLISSRC(t *testing.T) {
 // peer) must leave a source entry alone, while removeSource drops it so f.sources
 // cannot grow without bound as senders come and go.
 func TestForwarderRemoveSource(t *testing.T) {
-	f := newForwarder(slog.New(slog.NewTextHandler(io.Discard, nil)), &uploadMeter{}, func(func()) {})
+	f := newForwarder(slog.New(slog.NewTextHandler(io.Discard, nil)), &uploadMeter{}, func(func()) {}, newFakeClock())
 	f.setUpstream("A", &captureRTCP{}) // creates forwardSource "A"
 	// A leg carrying source A's media down to child B.
 	f.mu.Lock()
