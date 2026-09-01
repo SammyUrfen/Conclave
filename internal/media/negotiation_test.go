@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -407,5 +408,149 @@ func TestSessionRemoveTrack(t *testing.T) {
 			o, _, _ := bTr.counts()
 			return o == before+1
 		})
+	})
+}
+
+// TestNegotiationLadderExhaustionIsReported closes the MAJOR where a session went
+// permanently and SILENTLY mute.
+//
+// When the answer-deadline ladder ran out it simply returned: `negotiating` stayed
+// true, the pc stayed in `have-local-offer`, and both serializer guards then blocked
+// every future offer for the life of the session. Nothing logged at Error, and the
+// claim that "a wedged session self-heals on the next tree" is false — the diff sees
+// that neighbour as live, wanted and same-role, so the session survives every
+// subsequent push and each AddForwardTrack lands on a pc that will never offer again.
+//
+// Exhaustion must therefore (a) clear the in-flight flag so the Session's own state
+// is honest, and (b) TELL somebody, so the owner can re-create the edge.
+func TestNegotiationLadderExhaustionIsReported(t *testing.T) {
+	// The transport delivers; there is simply no answerer at the other end, which is
+	// the role-inversion window that motivated the ladder in the first place.
+	bTr, _ := newGatedPair("b", "a")
+	clk := newFakeClock()
+
+	failures := make(chan struct{}, 8)
+	offerer, err := NewSession(SessionConfig{
+		Log: discardLog(), SelfID: "b", PeerID: "a", Transport: bTr, Clock: clk,
+		OnNegotiationFailed: func() { failures <- struct{}{} },
+	})
+	if err != nil {
+		t.Fatalf("new offerer: %v", err)
+	}
+	defer offerer.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	offerer.Start(ctx)
+
+	if _, _, err := offerer.AddForwardTrack("fwd-1", "conclave"); err != nil {
+		t.Fatalf("add forward track: %v", err)
+	}
+	waitFor(t, "the first offer", 5*time.Second, func() bool {
+		o, _, _ := bTr.counts()
+		return o == 1
+	})
+	for i := 1; i <= NegotiationRetries; i++ {
+		clk.waitCreated(t, i)
+		clk.advance(NegotiationAnswerTimeout)
+	}
+	waitFor(t, "the ladder to be spent", 5*time.Second, func() bool {
+		o, _, _ := bTr.counts()
+		return o == 1+NegotiationRetries
+	})
+
+	select {
+	case <-failures:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the ladder gave up without telling anyone; the edge is silently mute forever")
+	}
+	// Exactly once: a storm of callbacks would have the Router re-creating the edge
+	// in a loop.
+	select {
+	case <-failures:
+		t.Error("the exhaustion callback fired more than once")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	offerer.mu.Lock()
+	stillNegotiating := offerer.negotiating
+	offerer.mu.Unlock()
+	if stillNegotiating {
+		t.Error("negotiating is still set after the ladder gave up: the Session's own view " +
+			"of itself is wrong, and every later offer is suppressed by its own guard")
+	}
+}
+
+// TestRemovalNudgeSurvivesTheAnswer closes the MAJOR where the removal renegotiation
+// was usually lost.
+//
+// The nudge was spawned BEFORE SetRemoteDescription, so it read the signaling state
+// while the pc was still `have-local-offer`, deferred, and left pendingLocalChange
+// set — and pion provably never re-fires for a removal (see
+// TestPionRemoveTrackDoesNotRenegotiate), so nothing ever picked it up. The departed
+// source's m-line then lingered as exactly the stale sendrecv that stopPeer exists to
+// clean up.
+//
+// Discrimination: the removal happens while an offer is OUTSTANDING, which is the
+// only window in which the ordering matters, and the assertion is on the SDP that
+// follows the answer. Against the old ordering no further offer is produced at all
+// and this times out.
+func TestRemovalNudgeSurvivesTheAnswer(t *testing.T) {
+	bTr, aTr := newGatedPair("b", "a")
+	bTr.gated = true // hold the first offer so the removal lands mid-negotiation
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	answerer, err := NewSession(SessionConfig{Log: discardLog(), SelfID: "a", PeerID: "b", Transport: aTr})
+	if err != nil {
+		t.Fatalf("new answerer: %v", err)
+	}
+	defer answerer.Close()
+	offerer, err := NewSession(SessionConfig{Log: discardLog(), SelfID: "b", PeerID: "a", Transport: bTr})
+	if err != nil {
+		t.Fatalf("new offerer: %v", err)
+	}
+	defer offerer.Close()
+	var handlerRuns atomic.Int64
+	offerer.negotiationProbe = func(bool) { handlerRuns.Add(1) }
+	answerer.Start(ctx)
+	offerer.Start(ctx)
+
+	_, sender, err := offerer.AddForwardTrack("fwd-gone", "conclave")
+	if err != nil {
+		t.Fatalf("add forward track: %v", err)
+	}
+	waitFor(t, "the first offer", 5*time.Second, func() bool {
+		o, _, _ := bTr.counts()
+		return o == 1
+	})
+	spent := handlerRuns.Load()
+
+	// Removed while the offer is in flight, so the serializer defers.
+	if err := offerer.RemoveTrack(sender); err != nil {
+		t.Fatalf("RemoveTrack: %v", err)
+	}
+	// WAIT for RemoveTrack's own nudge to have run and been rejected before letting
+	// the answer through. Without this wait the test does not discriminate at all:
+	// that nudge is spawned, so its scheduling is a lottery, and on a fast machine it
+	// usually lands AFTER the answer has already returned the pc to stable — quietly
+	// covering for the answer path even when the answer path is wrong. Once it is
+	// spent, the answer path is provably the only thing left that can carry the
+	// removal.
+	waitFor(t, "the deferred nudge to be spent", 5*time.Second, func() bool {
+		return handlerRuns.Load() > spent
+	})
+	bTr.release()
+
+	waitFor(t, "the renegotiation the removal earned", 10*time.Second, func() bool {
+		o, _, _ := bTr.counts()
+		return o >= 2
+	})
+	waitFor(t, "the removal to reach the wire", 10*time.Second, func() bool {
+		desc := offerer.pc.LocalDescription()
+		if desc == nil {
+			return false
+		}
+		dirs := directionLines(desc.SDP)
+		return len(dirs) == 1 && dirs[0] == "a=recvonly"
 	})
 }

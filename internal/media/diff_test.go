@@ -41,9 +41,14 @@ func TestDiffTopology(t *testing.T) {
 			live: liveState{
 				parent: "a",
 				// b and a are both relays here, so the name tie-break makes b the
-				// offerer toward a; b is the relay on the (b,c) edge.
-				roles: map[string]bool{"a": true, "c": true},
-				legs:  []leg{{src: "a", child: "c"}, {src: "c", child: "a"}},
+				// offerer toward a; b is the relay on the (b,c) edge. Both sessions
+				// were built as relay edges.
+				roles:     map[string]bool{"a": true, "c": true},
+				relayEdge: map[string]bool{"a": true, "c": true},
+				peerRelay: map[string]bool{"a": true, "c": false},
+				// a is a relay, so it publishes no media of its own and there is no
+				// (a -> c) leg to carry. The only transit source here is c, upward.
+				legs: []leg{{src: "c", child: "a"}},
 			},
 			want: topoDiff{},
 		},
@@ -51,7 +56,10 @@ func TestDiffTopology(t *testing.T) {
 			name: "a dropped neighbour is closed",
 			self: "a",
 			next: tree("a", [2]string{"a", "b"}),
-			live: liveState{roles: map[string]bool{"b": true, "c": true}},
+			live: liveState{
+				roles:     map[string]bool{"b": true, "c": true},
+				relayEdge: map[string]bool{"b": true, "c": true},
+			},
 			want: topoDiff{remove: []string{"c"}},
 		},
 		{
@@ -66,10 +74,12 @@ func TestDiffTopology(t *testing.T) {
 			live: liveState{
 				// Under a→b→c both endpoints were relays, so the tie-break gave the
 				// offer to b: a's live session is baked as the ANSWERER.
-				roles: map[string]bool{"b": false},
-				legs:  nil,
+				roles:     map[string]bool{"b": false},
+				relayEdge: map[string]bool{"b": true},
+				peerRelay: map[string]bool{"b": true}, // b WAS a relay under a→b→c
+				legs:      nil,
 			},
-			want: topoDiff{add: []string{"c"}, invert: []string{"b"}},
+			want: topoDiff{add: []string{"c"}, recreate: []string{"b"}},
 		},
 		{
 			name: "a re-parent keeps the old parent out of the removals",
@@ -86,8 +96,9 @@ func TestDiffTopology(t *testing.T) {
 			self: "a",
 			next: tree("a", [2]string{"a", "b"}, [2]string{"a", "c"}, [2]string{"a", "d"}),
 			live: liveState{
-				roles: map[string]bool{"b": true, "c": true},
-				legs:  []leg{{src: "b", child: "c"}, {src: "c", child: "b"}},
+				roles:     map[string]bool{"b": true, "c": true},
+				relayEdge: map[string]bool{"b": true, "c": true},
+				legs:      []leg{{src: "b", child: "c"}, {src: "c", child: "b"}},
 			},
 			want: topoDiff{
 				add:     []string{"d"},
@@ -98,8 +109,12 @@ func TestDiffTopology(t *testing.T) {
 			name: "a leaf that becomes a relay opens its children",
 			self: "b",
 			next: tree("a", [2]string{"a", "b"}, [2]string{"b", "c"}, [2]string{"b", "d"}),
-			live: liveState{parent: "a", roles: map[string]bool{"a": false}},
-			want: topoDiff{add: []string{"c", "d"}, invert: []string{"a"}},
+			live: liveState{
+				parent: "a", roles: map[string]bool{"a": false},
+				relayEdge: map[string]bool{"a": false}, // b was a LEAF when this edge was built
+				peerRelay: map[string]bool{"a": true},  // a was already the relay
+			},
+			want: topoDiff{add: []string{"c", "d"}, recreate: []string{"a"}},
 		},
 	}
 

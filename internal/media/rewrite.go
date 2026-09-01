@@ -85,9 +85,17 @@ func (w *rtpRewriter) Rewrite(pkt *rtp.Packet) *rtp.Packet {
 	out.SequenceNumber = pkt.SequenceNumber + w.seqOff
 	out.Timestamp = pkt.Timestamp + w.tsOff
 
+	// The high-water mark only ever moves FORWARD. A NACK retransmission or a
+	// reordered packet arrives with an older sequence number and is still forwarded
+	// (dropping it would defeat the NACK that asked for it), but letting it drag the
+	// mark backwards would make the next Switch rebase from there — splicing the new
+	// upstream on top of a range the child has already seen. A duplicate-sequence
+	// overlap reads as corruption to a jitter buffer, where a gap only reads as loss.
+	if !w.started || int16(out.SequenceNumber-w.lastSeq) > 0 {
+		w.lastSeq = out.SequenceNumber
+		w.lastTS = out.Timestamp
+	}
 	w.started = true
-	w.lastSeq = out.SequenceNumber
-	w.lastTS = out.Timestamp
 	return &out
 }
 

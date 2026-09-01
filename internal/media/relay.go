@@ -302,6 +302,33 @@ func (f *forwarder) removeOut(src, child string) *webrtc.RTPSender {
 	return sender
 }
 
+// sourcesVia reports every source whose media is arriving over one upstream session
+// — the whole far side of that edge, since a source is keyed by ORIGIN and one edge
+// carries every origin behind it. Sorted, so teardown is deterministic.
+func (f *forwarder) sourcesVia(up rtcpWriter) []string {
+	f.mu.RLock()
+	var out []string
+	for name, s := range f.sources {
+		if s.upstream != nil && s.upstream == up {
+			out = append(out, name)
+		}
+	}
+	f.mu.RUnlock()
+	sort.Strings(out)
+	return out
+}
+
+// rebindUpstreamSession re-points every source fed by old onto next and splices each
+// affected downstream leg. This is the re-parent commit: the source KEYS do not
+// change — a source is named for who originated it, and a new parent relays the same
+// origins — so the children's forwarded tracks are the same objects throughout and
+// the whole subtree pays no renegotiation.
+func (f *forwarder) rebindUpstreamSession(old, next rtcpWriter) {
+	for _, src := range f.sourcesVia(old) {
+		f.renameSource(src, src, next)
+	}
+}
+
 // legs reports every (source → child) relationship the forwarder currently holds,
 // sorted, so the Router can diff it against a topology deterministically.
 func (f *forwarder) legs() []leg {
