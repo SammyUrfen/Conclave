@@ -53,7 +53,7 @@ func TestScenarioStepOrdering(t *testing.T) {
 	}
 }
 
-// TestScenarioStartDefaultsToAFixedEpoch: a scenario that started at time.Now()
+// TestScenarioStartDefaultsToAFixedEpoch: a scenario seeded from the wall clock
 // would not replay, so the zero ScenarioConfig must pin a literal instant.
 func TestScenarioStartDefaultsToAFixedEpoch(t *testing.T) {
 	a := NewScenario(ScenarioConfig{})
@@ -188,14 +188,16 @@ func runReportScenario(t *testing.T, order []string, stragglers int) (*overlay.T
 	t.Helper()
 	const settleFor = 200 * time.Millisecond
 
-	sc := NewScenario(ScenarioConfig{Seed: 5})
+	sc := NewScenario(ScenarioConfig{
+		Seed:        5,
+		Constraints: overlay.Constraints{MaxDepth: 2, StreamKbps: 2000, StickinessMs: overlay.DefaultStickinessMs},
+	})
 	for _, n := range convergeFleet() {
 		sc.Net().Add(n)
 	}
 	sc.ReportOrder(order...)
 
-	cons := overlay.Constraints{MaxDepth: 2, StreamKbps: 2000, StickinessMs: overlay.DefaultStickinessMs}
-	mc := newModelCoordinator(sc.Net(), sc.Clock(), sc.Clock().Now(), cons, settleFor)
+	mc := newModelCoordinator(sc.Net(), sc.Clock(), sc.Clock().Now(), sc.Constraints(), settleFor)
 	defer mc.Stop()
 	sc.AddBarrier("coordinator", mc.Sync)
 

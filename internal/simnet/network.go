@@ -22,13 +22,25 @@ type Network struct {
 	// rtt is a symmetric pairwise latency matrix (ms); absent pairs are "unknown",
 	// which BuildTree tolerates. It is what makes latencies "injectable".
 	rtt map[string]map[string]float64
+
+	// The failure-injection state (see injection.go). It is kept on the Network
+	// rather than on the Scenario because these are facts about the WORLD, not
+	// about one script: a coordinator adapter, a scenario step, and an assertion
+	// must all be able to ask the same question and get the same answer.
+	departures []Departure
+	partitions map[string]map[string]bool
+	isolated   map[string]bool
+	degraded   map[string]map[string]linkQuality
 }
 
 // New returns an empty Network.
 func New() *Network {
 	return &Network{
-		nodes: make(map[string]overlay.Node),
-		rtt:   make(map[string]map[string]float64),
+		nodes:      make(map[string]overlay.Node),
+		rtt:        make(map[string]map[string]float64),
+		partitions: make(map[string]map[string]bool),
+		isolated:   make(map[string]bool),
+		degraded:   make(map[string]map[string]linkQuality),
 	}
 }
 
@@ -90,33 +102,63 @@ func (n *Network) Len() int { return len(n.nodes) }
 // OverlayNodes projects the fleet into BuildTree's input in deterministic insertion
 // order, attaching each node's RTT row. Iterating order (not the map) is what keeps
 // the projection — and thus the whole simulation — reproducible.
+//
+// This is the ONE place the injected faults meet the builder, which is why it is
+// worth naming what does and does not cross: an injected Degrade OVERRIDES the
+// measured round-trip (so a degraded link genuinely re-parents a child), while a
+// Partition does not appear at all — the overlay model has no way to say "these two
+// cannot be neighbours", and faking it through the RTT matrix would read as
+// "unknown", which the builder treats as a load-balancing tie. See Partition.
 func (n *Network) OverlayNodes() []overlay.Node {
 	out := make([]overlay.Node, 0, len(n.order))
 	for _, name := range n.order {
 		node := n.nodes[name]
-		if row := n.rtt[name]; len(row) > 0 {
-			cp := make(map[string]float64, len(row))
-			for k, v := range row {
-				cp[k] = v
-			}
-			node.RTT = cp
+		row := n.rttRow(name)
+		if len(row) > 0 {
+			node.RTT = row
 		}
 		out = append(out, node)
 	}
 	return out
 }
 
-// Build selects a root with overlay.PickRoot and runs BuildTree, returning the tree
-// and the constraints (with Root filled) so the caller can pass both straight to
-// overlay.Validate. It errors when no node can root the tree.
-func (n *Network) Build(cons overlay.Constraints) (*overlay.Topology, overlay.Constraints, error) {
+// rttRow returns name's measured latencies with any injected degradation applied on
+// top, as a fresh map so a caller cannot mutate the model by editing a projection.
+func (n *Network) rttRow(name string) map[string]float64 {
+	base, inj := n.rtt[name], n.degraded[name]
+	if len(base) == 0 && len(inj) == 0 {
+		return nil
+	}
+	row := make(map[string]float64, len(base)+len(inj))
+	for k, v := range base {
+		row[k] = v
+	}
+	for k, q := range inj {
+		row[k] = q.rttMs
+	}
+	return row
+}
+
+// Build runs one rebuild against the REAL overlay: it fills in the root and the
+// fencing counters (see nextConstraints), runs BuildTree over prev, and returns the
+// tree together with the constraints actually used, so the caller can pass both
+// straight to overlay.Validate without re-deriving what was asked for.
+//
+// prev is the tree the build should PREFER — the coordinator's working copy, not
+// necessarily the last published one. Passing it is what makes the rebuild
+// stability-preserving; passing nil is the memoryless build, which is right for a
+// first build and for a test isolating attachment from history.
+//
+// It errors when no node can root the tree, and propagates BuildTree's error for an
+// over-constrained fleet — an honest outcome a churn scenario handles by holding the
+// previous tree, exactly as the coordinator does.
+func (n *Network) Build(prev *overlay.Topology, cons overlay.Constraints) (*overlay.Topology, overlay.Constraints, error) {
 	nodes := n.OverlayNodes()
-	root := overlay.PickRoot(nodes)
-	if root == "" {
+	cons, ok := nextConstraints(cons, nodes, prev)
+	if !ok {
 		return nil, cons, fmt.Errorf("simnet: no relay-capable node among %d", len(nodes))
 	}
-	cons.Root = root
-	topo, err := overlay.BuildTree(nodes, cons)
+	topo, err := buildTree(nodes, prev, cons)
 	return topo, cons, err
 }
 

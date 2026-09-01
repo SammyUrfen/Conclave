@@ -9,9 +9,11 @@ import (
 	"github.com/SammyUrfen/conclave/internal/clock"
 )
 
-// vcEpoch is the fixed instant every clock test starts from. A literal, never
-// time.Now(): a test whose expectations shift with the wall clock is not a test,
-// and the whole point of VirtualClock is that nothing here touches real time.
+// vcEpoch is the fixed instant every clock test starts from. A literal, never the
+// wall clock: a test whose expectations shift with real time is not a test, and the
+// whole point of VirtualClock is that nothing here reads a real clock. (The phrasing
+// avoids naming the banned time package call verbatim, because make
+// check-determinism greps for it and cannot tell code from prose.)
 var vcEpoch = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 func TestVirtualClockAdvance(t *testing.T) {

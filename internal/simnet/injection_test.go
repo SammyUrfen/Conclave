@@ -163,7 +163,7 @@ func TestDegradeSteersAttachment(t *testing.T) {
 		if err != nil {
 			t.Fatalf("build: %v", err)
 		}
-		if verr := overlay.Validate(topo, n.OverlayNodes(), c); verr != nil {
+		if verr := validateTopology(topo, n.OverlayNodes(), c); verr != nil {
 			t.Fatalf("validate: %v", verr)
 		}
 		return topo
@@ -174,6 +174,10 @@ func TestDegradeSteersAttachment(t *testing.T) {
 	n.Add(overlay.Node{Name: "r1", UploadKbps: 4000})
 	n.Add(overlay.Node{Name: "r2", UploadKbps: 4000})
 	n.Add(overlay.Node{Name: "leaf", UploadKbps: 0})
+	// Pin r1 and r2 as SIBLINGS under R. Without this, r2 attaches under r1 (the
+	// fewest-children tiebreak) and sits at MaxDepth, which would disqualify it as
+	// an alternate parent and make the assertion below vacuous.
+	n.SetRTT("r2", "R", 1)
 	n.SetRTT("leaf", "r1", 5)
 	n.SetRTT("leaf", "r2", 80)
 

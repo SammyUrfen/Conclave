@@ -82,7 +82,10 @@ func runSimChurn(t *testing.T, seed int64, steps int) []simStep {
 	// Pending churn accumulates across rebuilds that were discarded, exactly as the
 	// coordinator's does: the oracle compares against the last PUBLISHED tree.
 	pendGone, pendJoined, pendPromoted := map[string]bool{}, map[string]bool{}, map[string]bool{}
-	maxDelta := 0
+	// Two statistics, kept apart on purpose: a re-root legitimately moves everyone,
+	// so folding it into the local-repair figure would make the bound look far
+	// looser than it is.
+	maxRepairDelta, reroots, maxRerootDelta := 0, 0, 0
 
 	for step := 0; step < steps; step++ {
 		event := "noop"
@@ -146,7 +149,7 @@ func runSimChurn(t *testing.T, seed int64, steps int) []simStep {
 			continue
 		}
 		nodes := net.OverlayNodes()
-		if verr := overlay.Validate(next, nodes, c); verr != nil {
+		if verr := validateTopology(next, nodes, c); verr != nil {
 			t.Fatalf("seed %d step %d (%s): built tree fails Validate: %v\n%+v", seed, step, event, verr, next.Edges)
 		}
 
@@ -154,7 +157,7 @@ func runSimChurn(t *testing.T, seed int64, steps int) []simStep {
 		if published != nil {
 			delta = len(changedParents(published, next))
 			gone, joined, promoted := sortedKeys(pendGone), sortedKeys(pendJoined), sortedKeys(pendPromoted)
-			rerr := overlay.ValidateLocalRepair(published, next, gone, joined, promoted)
+			rerr := validateRepair(published, next, nodes, c, gone, joined, promoted)
 			switch {
 			case next.Root != published.Root && !pendGone[published.Root]:
 				// A VOLUNTARY re-root (a challenger cleared RootChangeMarginKbps) is
@@ -169,8 +172,13 @@ func runSimChurn(t *testing.T, seed int64, steps int) []simStep {
 				t.Fatalf("seed %d step %d (%s): rebuild churned more than the event justified: %v\n prev: %+v\n next: %+v",
 					seed, step, event, rerr, published.Edges, next.Edges)
 			default:
-				if delta > maxDelta {
-					maxDelta = delta
+				if next.Root != published.Root {
+					reroots++
+					if delta > maxRerootDelta {
+						maxRerootDelta = delta
+					}
+				} else if delta > maxRepairDelta {
+					maxRepairDelta = delta
 				}
 			}
 		}
@@ -182,7 +190,8 @@ func runSimChurn(t *testing.T, seed int64, steps int) []simStep {
 	if published == nil {
 		t.Fatalf("seed %d: the whole run never produced a tree", seed)
 	}
-	t.Logf("seed %d: %d steps, largest bounded edge delta %d", seed, steps, maxDelta)
+	t.Logf("seed %d: %d steps, largest same-root edge delta %d; %d re-roots (largest delta %d)",
+		seed, steps, maxRepairDelta, reroots, maxRerootDelta)
 	return trace
 }
 
@@ -258,7 +267,7 @@ func TestSingleDepartureMovesOnlyItsSubtree(t *testing.T) {
 		if err != nil {
 			t.Fatalf("baseline build: %v", err)
 		}
-		if verr := overlay.Validate(topo, net.OverlayNodes(), c); verr != nil {
+		if verr := validateTopology(topo, net.OverlayNodes(), c); verr != nil {
 			t.Fatalf("baseline validate: %v", verr)
 		}
 		return net, topo
@@ -281,10 +290,11 @@ func TestSingleDepartureMovesOnlyItsSubtree(t *testing.T) {
 				if err != nil {
 					t.Fatalf("rebuild after %s %s: %v", mode, victim, err)
 				}
-				if verr := overlay.Validate(next, net.OverlayNodes(), c); verr != nil {
+				nodes := net.OverlayNodes()
+				if verr := validateTopology(next, nodes, c); verr != nil {
 					t.Fatalf("rebuild fails Validate: %v", verr)
 				}
-				if rerr := overlay.ValidateLocalRepair(prev, next, []string{victim}, nil, nil); rerr != nil {
+				if rerr := validateRepair(prev, next, nodes, c, []string{victim}, nil, nil); rerr != nil {
 					t.Fatalf("rebuild churned more than one departure justifies: %v", rerr)
 				}
 

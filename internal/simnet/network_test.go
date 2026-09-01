@@ -26,7 +26,7 @@ func TestBuildTreeProperty(t *testing.T) {
 		}
 		built++
 		nodes := net.OverlayNodes()
-		if verr := overlay.Validate(topo, nodes, c); verr != nil {
+		if verr := validateTopology(topo, nodes, c); verr != nil {
 			t.Fatalf("seed %d: built tree fails Validate: %v\nnodes=%+v\nedges=%+v", seed, verr, nodes, topo.Edges)
 		}
 		if d := depth(topo, c.Root); d > deepest {
@@ -67,7 +67,7 @@ func TestChurnKeepsInvariants(t *testing.T) {
 		if err != nil {
 			t.Fatalf("step %d (%d nodes): build failed unexpectedly: %v", step, net.Len(), err)
 		}
-		if verr := overlay.Validate(topo, net.OverlayNodes(), c); verr != nil {
+		if verr := validateTopology(topo, net.OverlayNodes(), c); verr != nil {
 			t.Fatalf("step %d: invariant broken after churn: %v\nedges=%+v", step, verr, topo.Edges)
 		}
 	}
@@ -88,7 +88,7 @@ func TestLatencyAttachment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	if verr := overlay.Validate(topo, net.OverlayNodes(), c); verr != nil {
+	if verr := validateTopology(topo, net.OverlayNodes(), c); verr != nil {
 		t.Fatalf("validate: %v", verr)
 	}
 	if p := topo.ParentOf("leaf"); p != "r2" {
