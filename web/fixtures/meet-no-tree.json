@@ -1,0 +1,32 @@
+{
+  "_dev_only": "Hand-written fixture for web/?mock=1 local development and web/tests/convergence.test.html. NOT shipped server behaviour. Represents a freshly-created meet: one member has joined but the coordinator has not published a tree yet, so there is nothing to compare realized parents against — the `no_tree` convergence state (§9.4b), not a fault and not a healthy signal either.",
+  "api_version": 1,
+  "id": "fresh-meet",
+  "epoch": 1,
+  "rev": 1,
+  "coordinator": "alice",
+  "coordinator_id": "p2",
+  "arbiter_is_coordinator": false,
+  "root": "",
+  "at_unix_ms": 1756684800000,
+  "nodes": [
+    {
+      "id": "p2", "name": "alice",
+      "roles": [],
+      "health": "healthy",
+      "parent": "", "backup": "",
+      "children": [],
+      "depth": -1,
+      "upload_kbps": 8000, "nat": "direct",
+      "rtt_server_ms": 12.5, "loss_pct": 0.2, "cpu_pct": 31.0,
+      "fitness_lower_bound": 0.738,
+      "last_beat_seq": 1, "last_beat_unix_ms": 1756684800000
+    }
+  ],
+  "edges": [],
+  "backups": [],
+  "stale_rejected": 0,
+  "convergence": "no_tree",
+  "diverged": [],
+  "provenance": "intended"
+}
