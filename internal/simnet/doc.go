@@ -17,6 +17,12 @@
 //   - Scenario scripts steps at virtual offsets, settles the loops under test between
 //     them, and records a trace.
 //
+// Scenarios drive the REAL internal/coordinator (see control.go's Recorder, Capture,
+// and ReportOf), which is the edge docs/PLAN.md §2.3 grants and which adds no
+// production dependency because production never imports simnet. A lighter model of
+// the loop is kept for the fast property sweeps only; harness_test.go states which
+// scenarios use which, and a differential test pins the two together.
+//
 // # The two non-negotiable rules
 //
 //  1. A scenario replays identically from a seed. Enforced by the clock's

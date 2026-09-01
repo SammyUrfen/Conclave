@@ -11,10 +11,42 @@ import (
 	"github.com/SammyUrfen/conclave/internal/overlay"
 )
 
-// modelCoordinator is a media-free, socket-free stand-in for internal/coordinator,
-// living in _test.go so simnet itself never depends on it (internal/coordinator is
-// owned by WI-3 and does not compile on this branch). It reproduces exactly the
-// three properties the harness has to be able to drive:
+// modelCoordinator is a media-free, socket-free stand-in for internal/coordinator.
+//
+// # Which scenarios use this, which use the real loop, and why
+//
+// simnet imports internal/coordinator (control.go) and control_test.go drives the
+// SHIPPED loop directly. This model is kept for one class of scenario only, and the
+// split is deliberate rather than historical:
+//
+//   - REAL loop (control_test.go): everything whose subject is the coordinator —
+//     the first-build settle, report-order invariance over the shipped code, the
+//     join-order characterization, the epoch/yield fencing and handover scenarios,
+//     and peer fence-refusal counting. If an assertion is about control-plane
+//     BEHAVIOUR, it belongs there.
+//   - MODEL (scenario_test.go, churn_test.go): the fast property sweeps whose
+//     subject is the OVERLAY ALGORITHM or the HARNESS itself — hundreds of seeded
+//     churn steps and 120-permutation straggler sweeps. Those run the graph layer
+//     thousands of times; standing a full control loop with two goroutines and a
+//     barrier round-trip behind each one buys no coverage the real-loop scenarios
+//     do not already give, and costs the sweeps their breadth.
+//
+// The model is NOT a substitute for testing the coordinator, and a model whose
+// divergence from the real thing is untested is a liability. So the two are pinned
+// together by TestModelAgreesWithTheRealCoordinator, which drives both through the
+// same scenario over every arrival permutation and asserts they converge identically.
+// That differential immediately earned itself: it caught that the harness was
+// conflating JOIN arrival with REPORT arrival, which is a distinction the real loop
+// makes and the model cannot.
+//
+// KNOWN AND DELIBERATE ASYMMETRY, stated so nobody over-trusts the agreement: this
+// model learns the whole roster at t0 from the Network, whereas the real coordinator
+// learns it one PeerJoined at a time and rebuilds on each. The two therefore agree on
+// the SETTLED path (a known roster, telemetry arriving in some order) and are not
+// expected to agree on an incremental join sequence. TestJoinOrderIsPathDependent
+// covers that second case against the real loop, where it belongs.
+//
+// It reproduces exactly the three properties the harness has to be able to drive:
 //
 //  1. a SINGLE-GOROUTINE event loop, so Sync is a real quiescence barrier;
 //  2. the FIRST-BUILD SETTLE window on a virtual timer — no tree before either the
@@ -22,7 +54,10 @@ import (
 //  3. the THREE TREES of docs/PLAN.md §5.6a kept distinct: `published` (what the
 //     fleet realized), `working` (published + ratified promotions; BuildTree's prev)
 //     and `next` (this round's output). Conflating them was a critical defect in the
-//     v2 contract, so the model must not conflate them either.
+//     v2 contract, so the model must not conflate them either. This model stages no
+//     promotions, so its `working` never actually diverges from `published`;
+//     runSimChurn in churn_test.go is where ratified promotions are exercised and
+//     where the two genuinely differ.
 //
 // The load-bearing detail is in run(): the sync branch DRAINS the settle timer
 // before acking. A fire and a sync arriving at one parked select are resolved by
