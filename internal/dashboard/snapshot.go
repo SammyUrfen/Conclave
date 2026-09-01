@@ -88,6 +88,17 @@ func (s *Server) snapshotBody(ctx context.Context, meetID string) (meetBody, err
 		body, err := s.readSnapshot(ctx, meetID)
 
 		s.mu.Lock()
+		if clientGone(err) {
+			// A cancellation belongs to ONE caller. Caching it would hand a spurious
+			// failure to every other client of this meet — and to the REST endpoint —
+			// for the next snapshotMinInterval, because one unrelated tab closed. Leave
+			// the cache untouched; a waiter released below simply becomes the next
+			// loader and performs the read itself.
+			ms.snapLoading = nil
+			s.mu.Unlock()
+			close(done)
+			return meetBody{}, err
+		}
 		ms.snap, ms.snapErr, ms.snapAt = body, err, s.clk.Now()
 		ms.snapLoading = nil
 		s.mu.Unlock()
@@ -96,9 +107,10 @@ func (s *Server) snapshotBody(ctx context.Context, meetID string) (meetBody, err
 	}
 }
 
-// readSnapshot performs the actual round-trips. An error is cached alongside a success
-// so that a flood of requests for a NON-EXISTENT meet is bounded too — otherwise the
-// cheapest way to hammer the arbiter would be to ask for ids that are not there.
+// readSnapshot performs the actual round-trips. A REAL error is cached alongside a
+// success so that a flood of requests for a NON-EXISTENT meet is bounded too — otherwise
+// the cheapest way to hammer the arbiter would be to ask for ids that are not there. A
+// caller's own cancellation is the one error that is NOT cached; see snapshotBody.
 func (s *Server) readSnapshot(ctx context.Context, meetID string) (meetBody, error) {
 	meet, err := s.cfg.Meets.GetMeet(ctx, meetID)
 	if err != nil {

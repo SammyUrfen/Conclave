@@ -111,14 +111,30 @@ type stream struct {
 	reason string
 }
 
-// fail records the close code the writer should use and stops the connection. First
-// caller wins, so the real cause is not overwritten by the teardown it triggers.
-func (st *stream) fail(code websocket.StatusCode, reason string) {
+// setClose records the close code the writer should use on its way out. First caller
+// wins, so the real cause is never overwritten by the teardown it triggers.
+//
+// It does NOT cancel, and that is the whole reason it is separate from fail: see there.
+func (st *stream) setClose(code websocket.StatusCode, reason string) {
 	st.mu.Lock()
 	if !st.set {
 		st.set, st.code, st.reason = true, code, reason
 	}
 	st.mu.Unlock()
+}
+
+// fail records a close code AND stops the connection. It is for the READER, whose only
+// way to make the writer stop waiting on the queue is to cancel the shared context.
+//
+// ***The writer must never call this — it must use setClose.*** coder/websocket arms a
+// context.AfterFunc for the duration of every Read that hard-closes the connection on
+// cancellation (conn.go setupReadTimeout), with no close frame. So a writer that
+// cancelled in order to report a code would race its own graceful Close against that
+// hook killing the socket first, and the client would see an abnormal closure (-1)
+// instead of the code the server carefully chose. The writer is already on its way to
+// finish(); it has nothing to wake and nothing to gain by cancelling.
+func (st *stream) fail(code websocket.StatusCode, reason string) {
+	st.setClose(code, reason)
 	st.cancel()
 }
 
@@ -339,16 +355,25 @@ func (s *Server) materialise(ctx context.Context, st *stream, it frameItem) (env
 	}
 	body, err := s.snapshotBody(ctx, st.sub.meetID)
 	if err != nil {
-		if errors.Is(err, arbiter.ErrMeetNotFound) {
+		switch {
+		case clientGone(err):
+			// The reader already tore this connection down; the cancellation IS that
+			// teardown reaching the in-flight read. Do NOT fail() — first-caller-wins
+			// would keep the real code anyway, but synthesising an internal-error code
+			// for a client that has already left is a lie either way, and logging it at
+			// Error turns every ordinary disconnect into a fault line.
+			s.log.Debug("client disconnected during a snapshot",
+				slog.String("meet_id", st.sub.meetID))
+		case errors.Is(err, arbiter.ErrMeetNotFound):
 			// §9.4a: 1001 "going away" means the meet is gone. The client stops and
 			// navigates to the list rather than reconnecting to something that no
 			// longer exists.
-			st.fail(websocket.StatusGoingAway, "meet ended")
-		} else {
+			st.setClose(websocket.StatusGoingAway, "meet ended")
+		default:
 			// 1011 is the code that says "server fault, reconnecting may help".
 			s.log.Error("snapshot for an event stream failed",
 				slog.String("meet_id", st.sub.meetID), slog.Any("error", err))
-			st.fail(websocket.StatusInternalError, "snapshot failed")
+			st.setClose(websocket.StatusInternalError, "snapshot failed")
 		}
 		return envelope{}, false
 	}

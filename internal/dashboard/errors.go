@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -89,12 +90,40 @@ func (s *Server) writeError(w http.ResponseWriter, status int, code, msg string,
 	})
 }
 
+// clientGone reports whether err is the ORDINARY END OF A CLIENT CONNECTION rather than
+// a fault on this side.
+//
+// Every read this package performs runs under the requesting connection's context, so a
+// browser closing a tab, navigating away, or aborting a fetch cancels a snapshot already
+// in flight. That is not a failure of anything: nothing is broken, nobody needs to look,
+// and there is no one left to serve. Reporting it as an internal error produces a log of
+// faults that are not faults — the specific confusion that made a dozen harmless lines
+// read as a dozen defects earlier in this build — and, on the event stream, synthesises
+// an internal-error close code for a client that has already gone.
+//
+// It matches through errors.Is, never on message text, so a wrapped cancellation from
+// any depth is recognised and an unrelated error that happens to mention "context" is
+// not. It is deliberately NARROW: only context.Canceled. context.DeadlineExceeded stays
+// a genuine error because a deadline being exceeded means something was too slow, which
+// is exactly the kind of thing an operator should see — and a predicate that swallowed
+// both would be the blanket downgrade this split exists to avoid.
+func clientGone(err error) bool {
+	return errors.Is(err, context.Canceled)
+}
+
 // writeInternal is the deliberate narrowing at the boundary: the caller gets a stable
 // code and a message that says nothing, while the actual error goes to the log. There
 // is no authentication on this surface, so an error string is a free read of the
 // server's internals to anyone who can reach it.
 func (s *Server) writeInternal(w http.ResponseWriter, what string, err error) {
-	s.log.Error("dashboard request failed", slog.String("op", what), slog.Any("error", err))
+	if clientGone(err) {
+		// The response below still goes out, because net/http requires the handler to
+		// finish writing something; it lands on a closed socket and is discarded.
+		s.log.Debug("client disconnected before the response was ready",
+			slog.String("op", what))
+	} else {
+		s.log.Error("dashboard request failed", slog.String("op", what), slog.Any("error", err))
+	}
 	s.writeError(w, http.StatusInternalServerError, codeInternal,
 		"the server could not complete the request; see the server log", nil)
 }
