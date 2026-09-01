@@ -1,0 +1,36 @@
+{
+  "_dev_only": "This file is a hand-written fixture for local UI development (web/?mock=1). It is NOT shipped server behaviour and does not represent a real arbiter response.",
+  "api_version": 1,
+  "meets": [
+    {
+      "id": "standup",
+      "created_at_unix_ms": 1756684800000,
+      "members": 5,
+      "epoch": 3,
+      "rev": 11,
+      "coordinator": "alice",
+      "relays": ["alice", "bob"],
+      "depth": 2
+    },
+    {
+      "id": "retro",
+      "created_at_unix_ms": 1756680000000,
+      "members": 1,
+      "epoch": 1,
+      "rev": 1,
+      "coordinator": "eve",
+      "relays": [],
+      "depth": 0
+    },
+    {
+      "id": "m-7fa3k2qd",
+      "created_at_unix_ms": 1756675000000,
+      "members": 0,
+      "epoch": 0,
+      "rev": 0,
+      "coordinator": "",
+      "relays": [],
+      "depth": -1
+    }
+  ]
+}
