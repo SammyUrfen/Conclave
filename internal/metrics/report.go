@@ -48,6 +48,31 @@ type Report struct {
 	// LossPct and CPUPct are headroom signals Phase 5's hysteresis will act on.
 	LossPct float64 `json:"loss_pct,omitempty"`
 	CPUPct  float64 `json:"cpu_pct,omitempty"`
+	// Coordinatable declares whether this peer is WILLING to be elected coordinator
+	// (the -coordinatable flag; a laptop on battery says false). It is a hard
+	// disqualifier in arbiter.Score — not a penalty — because an unwilling peer is
+	// not a worse candidate, it is not a candidate.
+	//
+	// Deliberately NOT omitempty: the key is emitted even when false, because a
+	// peer that declines must look different on the wire from one that never had
+	// the field. cmd/peer emits it explicitly for the same reason, even though its
+	// flag defaults to true.
+	//
+	// FAILS CLOSED, and the silence is the hazard. Absent decodes to false, so a
+	// peer running an older build is treated as unwilling rather than silently
+	// conscripted — the right direction. But the failure is quiet: if NO peer ever
+	// sets it, every candidate scores a hard 0, no peer is ever elected, and the
+	// meet simply stays on the arbiter forever with nothing logged. A bool cannot
+	// distinguish the three situations that matter ("willing", "declined", "has not
+	// spoken"), and it must not try to: the consumer already holds the missing bit,
+	// namely whether a report arrived AT ALL. So the rule is
+	//
+	//	eligible == reported && Coordinatable
+	//
+	// (arbiter gates exactly this way), and a control plane that finds itself with
+	// reports in hand and no volunteers among them should say so out loud rather
+	// than sit silent — that is a configuration fact, not a transient one.
+	Coordinatable bool `json:"coordinatable"`
 }
 
 // The liveness family. HeartbeatInterval sets the cadence; everything else is
@@ -134,6 +159,23 @@ func ValidateLivenessBudget(interval, socketDetection time.Duration) error {
 	}
 	return nil
 }
+
+// RebuildWindow bounds how long a freshly promoted coordinator waits for peers to
+// report in before it publishes its first tree. 3 s is about three heartbeats plus a
+// metrics tick — enough for every peer present to have spoken at least once, so the
+// first tree of a new term is built on measurements rather than on defaults.
+//
+// It lives HERE, not in arbiter where it was first written, and the move is the point
+// rather than a tidy-up: it is declared as part of the election contract but consumed
+// only by the coordinator, and coordinator -> arbiter is forbidden by the dependency
+// graph. Left in arbiter it would force a second copy with nothing enforcing that the
+// two agree. metrics is the correct home and not a stretch of this package's charter:
+// RebuildWindow is literally "how long until every peer has reported at least once",
+// a metrics-plane cadence sitting beside DefaultInterval, HeartbeatInterval,
+// DegradedAfter and GoneAfter — and both arbiter and coordinator already import this
+// package. It explicitly does NOT belong in policy, whose charter is untrusted input
+// at the process boundary; a control-loop timing constant is neither.
+const RebuildWindow = 3 * time.Second
 
 // Heartbeat is the peer's liveness beat and its report of REALIZED topology state —
 // what it has actually connected, as opposed to what the coordinator believes it
