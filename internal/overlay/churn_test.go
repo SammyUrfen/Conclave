@@ -129,7 +129,7 @@ func runChurn(t *testing.T, seed int64, steps int, withRTT bool) []churnStep {
 			MaxDepth: 2, StreamKbps: 2000, Epoch: 1,
 			StickinessMs: DefaultStickinessMs,
 		}
-		cons.Root = PickRoot(nodes, working)
+		cons.Root = PickRoot(nodes, working, cons.StreamKbps)
 		if cons.Root == "" {
 			trace = append(trace, churnStep{Event: event})
 			continue
@@ -148,14 +148,19 @@ func runChurn(t *testing.T, seed int64, steps int, withRTT bool) []churnStep {
 		if err := Validate(next, nodes, cons); err != nil {
 			t.Fatalf("seed %d step %d (%s): built tree fails Validate: %v\n%+v", seed, step, event, err, next)
 		}
-		if published != nil && !withRTT {
-			// The churn oracle is only sound over a fleet with no measured RTT: it
-			// cannot see latency, so it cannot tell a legitimate rank-2 move onto a
-			// materially closer parent from gratuitous churn. That is the production
-			// shape (§13.2), and the RTT-rich runs below assert Validate instead.
+		if published != nil {
+			// RULING D collapsed the interim split: the oracle now sees nodes and
+			// Constraints, so it can evaluate rank 2 and justify a move onto a
+			// materially closer parent. Every fleet asserts BOTH oracles — leaving the
+			// RTT-rich fleets, where rank 2 actually fires, checked by the weaker one
+			// was exactly backwards.
 			prev := published
-			gone, joined, promoted := keys(pendingGone), keys(pendingJoined), keys(pendingPromoted)
-			err := ValidateLocalRepair(prev, next, gone, joined, promoted)
+			ch := Churn{
+				Gone:     keys(pendingGone),
+				Joined:   keys(pendingJoined),
+				Promoted: keys(pendingPromoted),
+			}
+			err := ValidateLocalRepair(prev, next, nodes, cons, ch)
 			switch {
 			case next.Root != prev.Root && !pendingGone[prev.Root]:
 				// A VOLUNTARY re-root (a challenger cleared RootChangeMarginKbps) is
@@ -183,34 +188,30 @@ func runChurn(t *testing.T, seed int64, steps int, withRTT bool) []churnStep {
 
 // TestChurnKeepsBothOraclesGreen is the property run: every tree legal, every
 // transition minimal, over long deterministic churn sequences of joins, departures
-// and self-promotions.
+// and self-promotions — over BOTH fleet shapes.
+//
+// The rtt=true half is the one that matters most and the one the interim split could
+// not check: it is where minimum-RTT attachment and the stickiness margin actually
+// fire, so it is where a churn bug would hide.
 func TestChurnKeepsBothOraclesGreen(t *testing.T) {
-	for _, seed := range []int64{1, 7, 42, 1337} {
-		t.Run(fmt.Sprintf("seed%d", seed), func(t *testing.T) {
-			trace := runChurn(t, seed, 200, false)
-			built := 0
-			for _, s := range trace {
-				if s.Topo != nil {
-					built++
+	for _, tc := range []struct {
+		name string
+		rtt  bool
+	}{{"no-measured-rtt", false}, {"measured-rtt", true}} {
+		for _, seed := range []int64{1, 7, 42, 1337} {
+			t.Run(fmt.Sprintf("%s/seed%d", tc.name, seed), func(t *testing.T) {
+				trace := runChurn(t, seed, 200, tc.rtt)
+				built := 0
+				for _, s := range trace {
+					if s.Topo != nil {
+						built++
+					}
 				}
-			}
-			if built < 50 {
-				t.Fatalf("only %d of %d steps produced a tree; the property is barely exercised", built, len(trace))
-			}
-		})
-	}
-}
-
-// TestChurnWithMeasuredRTT runs the same churn over a fleet WITH pairwise latency,
-// where minimum-RTT attachment and the stickiness margin are actually exercised. It
-// asserts Validate only, for the reason stated in runChurn: the churn oracle is
-// blind to latency and would report a legitimate move onto a materially closer
-// parent as gratuitous.
-func TestChurnWithMeasuredRTT(t *testing.T) {
-	for _, seed := range []int64{2, 5, 99} {
-		t.Run(fmt.Sprintf("seed%d", seed), func(t *testing.T) {
-			runChurn(t, seed, 200, true)
-		})
+				if built < 50 {
+					t.Fatalf("only %d of %d steps produced a tree; the property is barely exercised", built, len(trace))
+				}
+			})
+		}
 	}
 }
 

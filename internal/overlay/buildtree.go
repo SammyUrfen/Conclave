@@ -41,6 +41,23 @@ type Node struct {
 	RTT map[string]float64
 	// NAT bounds the node's role: NATRelayed forces it to a leaf.
 	NAT NATType
+	// Impaired marks a node the control plane has classified as SUSTAINED-DEGRADED —
+	// its degradation dwell timer fired after a full dwell of bad telemetry, so this
+	// is an evidence-backed decision, not one bad sample.
+	//
+	// An impaired node KEEPS its existing children when there is nowhere better for
+	// them (evicting them is the interruption we are trying to avoid), but it is
+	// disqualified from taking NEW ones, disqualified as root, disqualified as a
+	// backup parent, and — critically — it LOSES INCUMBENCY PROTECTION over the
+	// children it has (rank 1 below). That last clause is the whole point: it is what
+	// makes a sustained-degradation event produce a materially different tree instead
+	// of a byte-identical one. Without it the dwell timer, its three constants, and
+	// its flag are inert machinery that reads as a working safety property.
+	Impaired bool
+	// LossPct is the node's measured uplink packet loss, 0–100. It DERATES the node's
+	// usable upload, because retransmits and repair traffic genuinely consume the
+	// budget a relay would otherwise spend on children. See effectiveUploadKbps.
+	LossPct float64
 	// Provisional marks a node whose telemetry is an ASSUMED DEFAULT, not a
 	// measurement — a peer that has joined but whose first metrics report has not
 	// arrived. It is set by the coordinator's projection, which supplies the assumed
@@ -209,8 +226,8 @@ func BuildTree(nodes []Node, prev *Topology, c Constraints) (*Topology, error) {
 	// with peers to serve is unsatisfiable (nobody could attach to it), so reject it
 	// early with a clear reason rather than failing per-node below.
 	if len(nodes) > 1 && capacityOf(root, c) == 0 {
-		return nil, fmt.Errorf("build tree: root %q cannot serve any children (upload %d kbit/s < stream cost %d, or TURN-bound)",
-			root.Name, root.UploadKbps, c.StreamKbps)
+		return nil, fmt.Errorf("build tree: root %q cannot serve any children (%d kbit/s effective of %d advertised < stream cost %d, or TURN-bound)",
+			root.Name, effectiveUploadKbps(root), root.UploadKbps, c.StreamKbps)
 	}
 
 	// capacity/depth/children track the growing tree. attachedOrder gives the
@@ -339,9 +356,26 @@ func bestParent(u Node, byName map[string]Node, c Constraints, depth, children m
 			u.Name, c.MaxDepth, stabilityHint(prev))
 	}
 
-	// Rank 1: incumbency. Only a materially closer parent breaks it.
+	// Rank 0b: the impairment filter, and it is SOFT. Impaired candidates are dropped
+	// only if at least one healthy candidate survives; if every candidate is impaired
+	// they are all re-admitted, because a degraded parent beats no parent. Two passes
+	// over the same set rather than a score, so "degradation is a preference,
+	// disconnection is not" stays a structural fact instead of a weight.
+	healthy := make([]string, 0, len(eligible))
+	for _, name := range eligible {
+		if !byName[name].Impaired {
+			healthy = append(healthy, name)
+		}
+	}
+	if len(healthy) > 0 {
+		eligible = healthy
+	}
+
+	// Rank 1: incumbency. Only a materially closer parent breaks it — and an IMPAIRED
+	// incumbent gets no protection at all. This is the single rank that turns a fired
+	// dwell timer into an actual re-parent.
 	if prev != nil {
-		if incumbent := prev.ParentOf(u.Name); incumbent != "" && contains(eligible, incumbent) {
+		if incumbent := prev.ParentOf(u.Name); incumbent != "" && !byName[incumbent].Impaired && contains(eligible, incumbent) {
 			incumbentRTT := rttTo(u, incumbent)
 			beaten := false
 			for _, q := range eligible {
@@ -366,6 +400,13 @@ func bestParent(u Node, byName map[string]Node, c Constraints, depth, children m
 		if best == "" || better {
 			best, bestRTT, bestChildren = name, rtt, children[name]
 		}
+	}
+	if best == "" {
+		// Unreachable while rank 0b re-admits impaired candidates, and asserted rather
+		// than assumed: returning "" here would emit an edge with an empty parent, and
+		// a malformed tree is far worse than a loud failure.
+		return "", fmt.Errorf("build tree: cannot attach %q — every candidate was filtered out (internal invariant violated%s)",
+			u.Name, stabilityHint(prev))
 	}
 	return best, nil
 }
@@ -400,39 +441,57 @@ func contains(names []string, name string) bool {
 	return false
 }
 
-// PickRoot chooses the tree's root. Three rules, in order:
+// PickRoot chooses the tree's root.
 //
-//  1. NEVER a provisional node, and never a node that cannot parent (TURN-bound, or
-//     no upload budget at all). Rooting on an assumed default is how the root flaps
-//     on telemetry ARRIVAL ORDER rather than on telemetry CONTENT — nondeterminism
-//     the deterministic-simulation contract exists to eliminate.
-//  2. KEEP THE INCUMBENT. If prev is non-nil and prev.Root is present,
-//     non-provisional and still able to parent, it is retained unless some eligible
-//     challenger advertises at least RootChangeMarginKbps more upload than it.
+// ELIGIBILITY. A node is eligible iff ALL of: not Provisional, not Impaired, not
+// NATRelayed, and it can serve AT LEAST ONE child — effectiveUploadKbps(n)/streamKbps ≥ 1.
+//
+// streamKbps is why this parameter exists, and it closes the half of the live root-flap
+// defect that the Provisional flag alone cannot. Provisional closes "rooted a guess" in
+// every arrival order. But a node reporting a REAL 1200 kbit/s against a 2000 kbit/s
+// stream cost genuinely cannot parent anyone, and without streamKbps this function could
+// not see that: it returned the unfit node and BuildTree then failed with "root cannot
+// serve any children". That is an honest failure over real telemetry rather than an
+// arrival-order artifact — but suppressed is not closed, and one scalar closes it.
+//
+// Three rules, in order:
+//
+//  1. Only ELIGIBLE nodes are considered.
+//  2. KEEP THE INCUMBENT. If prev is non-nil and prev.Root is present and STILL ELIGIBLE
+//     (the same test — an incumbent that has become unfit is not defended), it is
+//     retained unless some eligible challenger advertises at least RootChangeMarginKbps
+//     more upload.
 //  3. Otherwise: highest-upload eligible node, ties broken by name.
 //
-// Returns "" when no eligible node exists, which the caller treats as "not ready /
-// unbuildable" rather than as an error. A lone node is returned as-is (a one-node
-// tree is trivially valid) EVEN IF provisional — there is nothing to be wrong about.
+// Returns "" when no eligible node exists — a genuinely unrootable fleet, which the
+// caller reports as unbuildable and which no retry can rescue, because dropping the
+// stability preference does not create upload capacity.
 //
 // Root churn is the single most expensive thing this control plane can do: with a
-// stability-preserving builder, a changed root invalidates every parent choice in
-// the tree at once, which is the exact opposite of the "move one subtree, not the
-// world" property the design exists to provide. Hence a stickiness rule of its own,
-// stronger than the per-node one.
+// stability-preserving builder, a changed root invalidates every parent choice in the
+// tree at once, the exact opposite of the "move one subtree, not the world" property the
+// design exists to provide. Hence a stickiness rule of its own, stronger than the
+// per-node one.
 //
-// Note "able to parent" is judged here as UploadKbps > 0, because PickRoot is not
-// given the per-stream cost. BuildTree remains the authority and will still reject
-// a root whose budget cannot cover one child at the actual StreamKbps; what this
-// rule removes is the far more common case — a peer projected at the assumed
-// default of zero being handed the root because its frame happened to arrive first.
-func PickRoot(nodes []Node, prev *Topology) string {
+// MaxDepth is deliberately not a parameter: the root sits at depth 0 and the depth bound
+// constrains its descendants, not its own eligibility. Passing the whole Constraints was
+// rejected for a sharper reason — Constraints.Root is the very thing PickRoot computes,
+// so it is a self-referential parameter that invites a caller to pass a stale root and
+// quietly get it back. A scalar cannot be misused that way.
+//
+// A lone node is returned as-is (a one-node tree is trivially valid) even if ineligible;
+// callers that build real meets never reach that path, and it exists for simnet and unit
+// tests.
+func PickRoot(nodes []Node, prev *Topology, streamKbps int) string {
 	if len(nodes) == 1 {
 		return nodes[0].Name
 	}
 
 	eligible := func(n Node) bool {
-		return !n.Provisional && n.NAT != NATRelayed && n.UploadKbps > 0
+		if n.Provisional || n.Impaired || n.NAT == NATRelayed || streamKbps <= 0 {
+			return false
+		}
+		return effectiveUploadKbps(n)/streamKbps >= 1
 	}
 
 	// Rule 3's answer, computed first because rule 2 needs the best challenger.
@@ -464,6 +523,30 @@ func PickRoot(nodes []Node, prev *Topology) string {
 	return best
 }
 
+// MaxLossDeratePct caps how much measured loss may shrink a node's advertised upload.
+//
+// 50%: a link losing half its packets cannot usefully relay anything, so there is
+// nothing below this worth discriminating, and the Impaired flag — a discrete decision
+// the control plane makes only after a DWELL — is the right instrument for the rest.
+// Named, rather than inlined, so a maintainer does not "fix" the cap: an UNCAPPED derate
+// would let a single bad sample halve a relay's capacity and re-parent its children
+// instantly, which is exactly the thrash the dwell exists to prevent.
+const MaxLossDeratePct = 50.0
+
+// effectiveUploadKbps is the budget a node can actually spend on children: its advertised
+// upload derated by measured loss, capped at MaxLossDeratePct. Negative or absent loss
+// derates nothing.
+func effectiveUploadKbps(n Node) int {
+	loss := n.LossPct
+	if loss <= 0 {
+		return n.UploadKbps
+	}
+	if loss > MaxLossDeratePct {
+		loss = MaxLossDeratePct
+	}
+	return int(float64(n.UploadKbps) * (1 - loss/100))
+}
+
 // capacityOf is how many children a node may serve: its upload budget divided by
 // the per-stream cost, or 0 if it is TURN-bound (forced leaf). Computed on demand
 // because it depends only on immutable node fields plus the constraints.
@@ -474,5 +557,5 @@ func capacityOf(n Node, c Constraints) int {
 	if c.StreamKbps <= 0 {
 		return 0
 	}
-	return n.UploadKbps / c.StreamKbps
+	return effectiveUploadKbps(n) / c.StreamKbps
 }
