@@ -169,7 +169,7 @@ func newDriver(t *testing.T) *driver {
 		MaxDepth: 2, StreamKbps: 2000, Clock: clk,
 		// Liveness out of the way: these tests are about ordering and guards, and a
 		// fleet that never beats would otherwise be reaped by the backstop mid-test.
-		DegradedAfter: time.Hour, GoneAfter: time.Hour,
+		DegradedAfter: hourAway, GoneAfter: hourAway,
 	}, nil, pub)
 	// Run would own these; here the test goroutine does.
 	c.wake = clk.NewTimer(time.Hour)
@@ -191,6 +191,9 @@ func (d *driver) rev() uint64 {
 	}
 	return rs.published.Rev
 }
+
+// hourAway pushes a threshold out of the way for tests that are not about liveness.
+const hourAway = time.Hour
 
 // guard bounds a wait in REAL time so a wedged loop fails the test instead of hanging
 // it with no stack. It never affects a decision — only whether a deadlock is reported.
