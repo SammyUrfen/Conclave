@@ -1,0 +1,121 @@
+/* layout.css — page structure. The body itself must never scroll horizontally; any wide
+ * content (tables, the event log, the subnet SVG) scrolls inside its own container instead
+ * (task brief). Responsive down to 480px.
+ */
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 1.5;
+  /* Belt-and-suspenders against the one failure mode this rule exists to prevent. */
+  overflow-x: hidden;
+  width: 100%;
+}
+
+.mock-banner {
+  background: var(--caution);
+  color: var(--bg);
+  text-align: center;
+  padding: var(--space-1) var(--space-2);
+  font-size: 12px;
+  font-weight: bold;
+}
+
+.version-banner {
+  background: var(--crit);
+  color: var(--bg);
+  text-align: center;
+  padding: var(--space-2);
+  font-weight: bold;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.server-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface);
+  border-bottom: var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 50;
+}
+
+.view-root {
+  padding: var(--space-3);
+  max-width: 1400px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+.meet-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr);
+  gap: var(--space-3);
+  align-items: start;
+  margin-top: var(--space-3);
+}
+
+.subnet-col, .detail-col {
+  min-width: 0; /* allow children's own overflow-x containers to actually constrain width */
+}
+
+.event-col {
+  margin-top: var(--space-4);
+  min-width: 0;
+}
+
+.meet-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.meet-toolbar h2 {
+  margin: 0;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* --- Wide-content scroll containers (never let these widen the page) --- */
+.table-scroll,
+.subnet-scroll,
+.event-log-scroll,
+.detail-table {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+@media (max-width: 900px) {
+  .meet-columns {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 480px) {
+  .server-bar {
+    padding: var(--space-2);
+    gap: var(--space-2);
+  }
+  .view-root {
+    padding: var(--space-2);
+  }
+  .server-field {
+    flex-basis: 100%;
+  }
+  .server-input {
+    width: 100%;
+  }
+}

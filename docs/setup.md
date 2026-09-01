@@ -1,6 +1,6 @@
 # conclave — Setup
 
-Get from a clean machine to a building, testing, self-verifying checkout. Everything here is Phase 0 reality — no future flags or binaries are described except where a section is explicitly labelled **Planned**.
+Get from a clean machine to a building, testing, self-verifying checkout. Everything here reflects the tree at **Phase 6 complete**. Once you are building, [`usage.md`](./usage.md) is the flag reference and [`DESIGN.md`](./DESIGN.md) explains the system.
 
 Written for **Fedora Linux + zsh** (the owner's daily driver), but nothing is Fedora-specific except the one `dnf` line, which is clearly marked.
 
@@ -75,10 +75,10 @@ make build
 
 Compiles both binaries into `./bin/`:
 
-| Binary | What it is (Phase 0) |
+| Binary | What it is |
 |---|---|
-| `./bin/server` | Central bootstrap/signaling/arbiter. Today it serves `GET /healthz` only. |
-| `./bin/peer` | A participant node. Today it probes the server's `/healthz` and logs the outcome. |
+| `./bin/server` | The **arbiter**: meet rendezvous, the WebSocket signaling relay, epoch minting and election arbitration, and the `/api` dashboard surface. Optionally hosts the coordinator (`-coordinate`). Never in the media path. |
+| `./bin/peer` | A **participant**: health probe, mesh call, static tree, or a fully managed peer that reports telemetry, realises the pushed tree, and fails over to a backup parent on its own. |
 
 `./bin/` is git-ignored — never commit build artifacts.
 
@@ -89,7 +89,13 @@ make run-server                          # listens on :9000
 make run-server ARGS="-addr :9000 -log-level debug -log-format json"
 ```
 
-`make run-server` is `go run ./cmd/server` — pass flags through the `ARGS="..."` variable. Server flags: `-addr` (default `:9000`), `-log-level` (default `info`), `-log-format` (default `text`).
+`make run-server` is `go run ./cmd/server` — pass flags through the `ARGS="..."` variable. The
+three you will use immediately are `-addr` (default `:9000`), `-log-level` (default `info`) and
+`-log-format` (default `text`); `-coordinate` turns on the coordinator and `-elect` turns on
+election arbitration. [`usage.md`](./usage.md) has the full surface, and the server logs its
+**effective** configuration at startup in two lines (`arbiter starting`, `coordinator enabled`)
+— read those rather than trusting the flags you typed, because several knobs resolve to package
+defaults when a flag is zero.
 
 Verify it's alive from another terminal:
 
@@ -112,7 +118,7 @@ make run-peer                                    # probes http://localhost:9000
 make run-peer ARGS="-server http://localhost:9000 -timeout 3s"
 ```
 
-Peer flags: `-server` (default `http://localhost:9000`), `-log-level`, `-log-format`, `-timeout` (default `5s`). The peer exits **0** when the server is healthy and **1** when it can't reach it — a clean way to script "is the server up?".
+Probe-mode peer flags: `-server` (default `http://localhost:9000`), `-log-level`, `-log-format`, `-timeout` (default `5s`). The peer exits **0** when the server is healthy and **1** when it can't reach it — a clean way to script "is the server up?". Everything else the peer can do lives behind `-call`; see [`usage.md`](./usage.md).
 
 ### Test
 
@@ -184,14 +190,16 @@ If you haven't installed `goimports` yet (§4), set `"go.formatTool": "gofmt"` f
 
 ## 6. Verify your setup
 
-A quick checklist that mirrors the **`make check`** gate (`check` = `fmt` + `vet` + `test`). If all of these pass, you're ready to build on Phase 1.
+A quick checklist that mirrors the **`make check`** gate — `check` = `fmt` + `vet` + **`check-determinism`** + `test -race`. If all of these pass, you have the same green CI enforces.
 
 - [ ] `go version` → **go1.26 or newer**
 - [ ] `gcc --version` (or `clang --version`) succeeds — race detector will link
 - [ ] `go build ./...` → exits 0, no output
 - [ ] `make build` → produces `./bin/server` and `./bin/peer`
-- [ ] `make check` → runs **fmt + vet + test**; the `test` stage is `go test -race ./...` and must be green
+- [ ] `make check` → runs **fmt + vet + check-determinism + test**; the `test` stage is `go test -race ./...` and must be green
+- [ ] `make check-determinism` on its own → **silent**, exit 0 (it only prints when it finds a control-plane package reaching for the wall clock)
 - [ ] **Manual smoke test:** `make run-server` in one terminal; in another, `curl localhost:9000/healthz` returns `{"status":"ok","service":"conclave-server"}` and `make run-peer` exits **0**. Kill the server with `Ctrl-C` and confirm it logs `server stopped cleanly`.
+- [ ] **Dashboard smoke test:** `make run-server ARGS="-coordinate"`, then `curl -sS localhost:9000/api/meets` → `{"api_version":1,"demo_enabled":false,"meets":[],"ended":[]}`. Open `web/index.html` in a browser and type `localhost:9000` in the server field — no build step, no npm, nothing to install.
 
 Optional, once §4 tools are installed:
 
@@ -202,6 +210,8 @@ Optional, once §4 tools are installed:
 
 ## Notes & limitations
 
-- This document covers **Phase 0** only. Media (WebRTC via `pion/webrtc`) and signaling (`coder/websocket`) dependencies are **Planned (Phase 1+)** and not yet imported — `go.mod` currently has zero third-party requires, so `make tidy` should be a no-op today.
-- A green `make check` proves the code builds, vets clean, and passes race-tested unit tests. It does **not** prove any distributed behavior — there is no multi-peer, WebRTC, or election path to exercise yet.
-- The source of truth for what's built and what's next is **`docs/ROADMAP.md`**. Read it before starting work on any phase.
+- **Third-party dependencies are real and pinned.** `go.mod` declares **five direct requires** — `github.com/pion/webrtc/v4`, `pion/rtp`, `pion/rtcp`, `pion/interceptor` (media), and `github.com/coder/websocket` (signaling) — plus their transitive set. `make tidy` is **not** a no-op; run it whenever imports move. *(An earlier revision of this file claimed `go.mod` had zero third-party requires. That stopped being true in Phase 1.)*
+- **Both invocations are green:** `go test ./...` and `go test -race ./...` each report 13/13 packages `ok`. The gate *specifies* `-race` because a data race in this codebase is a design violation, not because the suite needs it to pass. Expect a large time difference — `internal/media` runs real pion, ICE and DTLS, and takes ~16 s plain against ~82 s instrumented; everything else is a virtual clock and is essentially free either way.
+- **A green `make check` proves a lot more than it used to, and still not everything.** It proves the code builds, vets clean, keeps the control plane free of the wall clock, and passes 372 race-tested test functions — including deterministic simulation of churn, failover and coordinator handover, and real-pion integration tests of the media plane. It does **not** prove any *live* multi-process behaviour: Phases 5 and 6 have no recorded live run (`DESIGN.md` §9.5).
+- **Nothing here sets up a deployment.** For running the arbiter anywhere other than your own shell — including the `ws://` vs `wss://` decision, which the browser makes for you — see `deploy/README.md`.
+- **The source of truth for what is built** is `docs/ROADMAP.md`'s status table; the source of truth for *how it works* is `docs/DESIGN.md`. `docs/PLAN.md` is the frozen Phase 5–6 contract and is historical — where it and the code disagree, the code wins.

@@ -33,10 +33,11 @@ type Client struct {
 
 // Dial connects to the signaling server for the given room. serverURL may be an
 // http(s):// or ws(s):// base URL, or a bare host:port; the scheme is normalized
-// to ws/wss and /ws?room=<room> is appended. The passed ctx bounds only the
+// to ws/wss and /ws?room=<room> is appended. name is the peer's stable label for
+// topology resolution (may be empty in mesh mode). The passed ctx bounds only the
 // handshake — the connection's lifetime is controlled by Close.
-func Dial(ctx context.Context, log *slog.Logger, serverURL, room string) (*Client, error) {
-	wsURL, err := wsURLFor(serverURL, room)
+func Dial(ctx context.Context, log *slog.Logger, serverURL, room, name string) (*Client, error) {
+	wsURL, err := wsURLFor(serverURL, room, name)
 	if err != nil {
 		return nil, err
 	}
@@ -112,6 +113,28 @@ func (c *Client) writePump(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case msg := <-c.out:
+			// HAZARD, latent — read this before adding a graceful close code.
+			//
+			// coder/websocket arms a context.AfterFunc for the duration of every
+			// frame write, and that hook does not abort the write: it calls the
+			// connection's internal close, tearing the TCP socket down with NO close
+			// frame. So a write whose context is CANCELLED does not fail politely,
+			// it destroys the connection — and writeClose then swallows the
+			// resulting net.ErrClosed and reports success.
+			//
+			// That is harmless here TODAY only because this package never sends a
+			// graceful close code: every teardown path ends in CloseNow, so there is
+			// no close frame for a cancellation to steal. The trap springs the moment
+			// someone adds one — say, mirroring the dashboard's 1013 subscriber cap —
+			// because the close path would cancel this very ctx to wake the writer,
+			// killing the socket a moment before the code could go out. The peer
+			// would see an abrupt EOF instead of the reason it was disconnected.
+			//
+			// If you add a close code, strip cancellation from the write context
+			// (context.WithoutCancel; see dashboard.socketCtx) and keep only the
+			// deadline. The timeout is what bounds a stuck send; cancellation was
+			// buying nothing else. Reads keep their cancellation — a reader has no
+			// close frame to protect.
 			writeCtx, cancel := context.WithTimeout(ctx, writeTimeout)
 			err := wsjson.Write(writeCtx, c.conn, msg)
 			cancel()
@@ -127,7 +150,7 @@ func (c *Client) writePump(ctx context.Context) {
 // for the /ws endpoint. It accepts http(s), ws(s), or a bare host:port, and
 // rejects hostless or unknown-scheme values (the same fail-loud discipline as
 // the peer's healthURLFor).
-func wsURLFor(server, room string) (string, error) {
+func wsURLFor(server, room, name string) (string, error) {
 	s := strings.TrimSpace(server)
 	if s == "" {
 		return "", errors.New("empty signaling server URL")
@@ -154,6 +177,9 @@ func wsURLFor(server, room string) (string, error) {
 	q := u.Query()
 	if room != "" {
 		q.Set("room", room)
+	}
+	if name != "" {
+		q.Set("name", name)
 	}
 	u.RawQuery = q.Encode()
 	return u.String(), nil

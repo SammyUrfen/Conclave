@@ -1,0 +1,439 @@
+package media
+
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/pion/webrtc/v4"
+
+	"github.com/SammyUrfen/conclave/internal/metrics"
+	"github.com/SammyUrfen/conclave/internal/overlay"
+	"github.com/SammyUrfen/conclave/internal/signaling"
+)
+
+// meetFixture is a live room on a real Hub with a set of managed Routers plus one
+// extra client standing in for the coordinator, which is the only way to exercise
+// applyTopology end to end: a pushed topology is the input the whole diff-and-apply
+// path exists to consume.
+type meetFixture struct {
+	srv     *httptest.Server
+	routers map[string]*Router
+	clients map[string]*signaling.Client
+	coord   *signaling.Client
+	wg      *sync.WaitGroup
+	cancel  context.CancelFunc
+	log     *slog.Logger
+
+	mu      sync.Mutex
+	ids     map[string]string // peer name → server-assigned id, learned from the roster
+	coordID string            // the coordinator client's own server-assigned id
+}
+
+func newMeetFixture(t *testing.T, ctx context.Context, room string, cfgs map[string]RouterConfig) *meetFixture {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	if os.Getenv("MESH_DEBUG") == "" {
+		logger = discardLog()
+	}
+
+	hub := signaling.NewHub(logger)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /ws", hub.ServeWS)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	runCtx, cancel := context.WithCancel(ctx)
+	f := &meetFixture{srv: srv, routers: map[string]*Router{}, wg: &sync.WaitGroup{},
+		cancel: cancel, log: logger, ids: map[string]string{},
+		clients: map[string]*signaling.Client{}}
+
+	// The coordinator joins first so it observes every peer-joined and can address
+	// the whole meet by name.
+	coord, err := signaling.Dial(runCtx, logger, srv.URL, room, "coord")
+	if err != nil {
+		t.Fatalf("coord dial: %v", err)
+	}
+	t.Cleanup(func() { _ = coord.Close() })
+	f.coord = coord
+
+	// The coordinator's own frame stream is where name↔id comes from; it joined
+	// first, so every peer arrives as a peer-joined it can see.
+	f.wg.Add(1)
+	go func() {
+		defer f.wg.Done()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case msg, ok := <-coord.Incoming():
+				if !ok {
+					return
+				}
+				switch msg.Type {
+				case signaling.TypeJoined:
+					f.mu.Lock()
+					f.coordID = msg.To
+					for _, p := range msg.Peers {
+						f.ids[p.Name] = p.ID
+					}
+					f.mu.Unlock()
+				case signaling.TypePeerJoined:
+					f.mu.Lock()
+					f.ids[msg.Name] = msg.From
+					f.mu.Unlock()
+				}
+			}
+		}
+	}()
+
+	names := make([]string, 0, len(cfgs))
+	for name := range cfgs {
+		names = append(names, name)
+	}
+	sortStrings(names)
+	for _, name := range names {
+		client, err := signaling.Dial(runCtx, logger, srv.URL, room, name)
+		if err != nil {
+			t.Fatalf("%s dial: %v", name, err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
+		cfg := cfgs[name]
+		cfg.SelfName = name
+		cfg.Managed = true
+		cfg.Clock = scaledClock{factor: 4}
+		r := NewRouter(logger, client, cfg)
+		f.routers[name] = r
+		f.clients[name] = client
+		f.wg.Add(1)
+		go func() {
+			defer f.wg.Done()
+			_ = r.Run(runCtx)
+		}()
+	}
+	t.Cleanup(func() {
+		cancel()
+		done := make(chan struct{})
+		go func() { f.wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Error("routers did not shut down cleanly — a goroutine leaked")
+		}
+	})
+	return f
+}
+
+// idOf resolves a peer name to the id the server assigned it, by reading the
+// coordinator client's own roster stream.
+func (f *meetFixture) idOf(t *testing.T, name string) string {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		f.mu.Lock()
+		id := f.ids[name]
+		f.mu.Unlock()
+		if id != "" {
+			return id
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("never learned an id for %q", name)
+	return ""
+}
+
+// announce fences every peer on this fixture's coordinator client at epoch, the way
+// cmd/peer does when an arbiter TypeCoordinator frame arrives. Without it the fence
+// (§6.5) correctly rejects every push, because a peer that has not been told who is
+// in charge obeys nobody.
+func (f *meetFixture) announce(t *testing.T, epoch uint64) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		f.mu.Lock()
+		id := f.coordID
+		f.mu.Unlock()
+		if id != "" {
+			// Every Router must have processed its own TypeJoined first, since that
+			// RESETS the fence — adopting before it would be wiped.
+			for name, r := range f.routers {
+				if !f.joined(r) {
+					t.Fatalf("%s had not joined before the announcement", name)
+				}
+				r.AdoptCoordinator(epoch, id)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("never learned the coordinator client's own id")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// joined waits (bounded) for a Router to have processed its own joined frame.
+func (f *meetFixture) joined(r *Router) bool {
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		id := r.selfID
+		r.mu.Unlock()
+		if id != "" {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
+// push sends topo to every named peer, the way the coordinator does.
+func (f *meetFixture) push(t *testing.T, topo *overlay.Topology) {
+	t.Helper()
+	payload, err := json.Marshal(topo)
+	if err != nil {
+		t.Fatalf("marshal topology: %v", err)
+	}
+	for name := range f.routers {
+		id := f.idOf(t, name)
+		if err := f.coord.Send(signaling.Message{
+			Type: signaling.TypeTopology, To: id, Payload: payload,
+		}); err != nil {
+			t.Fatalf("push topology to %s: %v", name, err)
+		}
+	}
+}
+
+// TestRouterAppliesTopologyDiff drives one meet through a re-shape that touches
+// every bucket of the §7.4 diff at once:
+//
+//	a→b→c   becomes   a→b, a→c
+//
+//	  * c RE-PARENTS from b to a (§7.3) — asynchronously, make-before-break;
+//	  * the surviving a↔b edge INVERTS its offerer role (C11), because b stops
+//	    being a relay and the tie-break no longer names it;
+//	  * b DROPS its session to c.
+//
+// Discrimination. The re-parent assertion fails against the blocking design in the
+// contract's v1: waiting for `connected` inside applyTopology starves the very
+// offer/answer frames the Run goroutine must deliver, so c never attaches to a. The
+// inversion assertion fails against any diff that compares only neighbour SETS: the
+// a↔b session survives such a diff untouched, keeping a baked in as the answerer it
+// may no longer be.
+func TestRouterAppliesTopologyDiff(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// b and c both send: after the re-shape c must RECEIVE something over its new
+	// edge, and a relay never sends media of its own, so a fixture with a single
+	// sender would starve the peer whose promotion is under test.
+	f := newMeetFixture(t, ctx, "diff", map[string]RouterConfig{
+		"a": {},
+		"b": {SendMedia: true},
+		"c": {SendMedia: true},
+	})
+
+	var phaseMu sync.Mutex
+	var sawOverlap bool
+	f.routers["c"].reparentHook = func(phase string, oldParentOpen bool) {
+		phaseMu.Lock()
+		if phase == "connected" && oldParentOpen {
+			sawOverlap = true
+		}
+		phaseMu.Unlock()
+	}
+
+	f.announce(t, 1)
+	topo1 := tree("a", [2]string{"a", "b"}, [2]string{"b", "c"})
+	f.push(t, topo1)
+
+	waitFor(t, "the chain a→b→c to converge", 30*time.Second, func() bool {
+		return allConnected(f.routers["a"].Stats(), 1) &&
+			allConnected(f.routers["b"].Stats(), 2) &&
+			allConnected(f.routers["c"].Stats(), 1) &&
+			receivedAny(f.routers["a"].Stats())
+	})
+
+	// Under the chain both a and b are relays, so the name tie-break gives the
+	// offer to b: a's live session is the ANSWERER on that edge.
+	if got := f.offererToward(t, "a", "b"); got {
+		t.Fatalf("under a→b→c, a should be the answerer toward b (both are relays, b > a)")
+	}
+
+	topo2 := tree("a", [2]string{"a", "b"}, [2]string{"a", "c"})
+	topo2.Rev = 2
+	f.push(t, topo2)
+
+	waitFor(t, "the star a→{b,c} to converge", 30*time.Second, func() bool {
+		return allConnected(f.routers["a"].Stats(), 2) &&
+			allConnected(f.routers["b"].Stats(), 1) &&
+			allConnected(f.routers["c"].Stats(), 1)
+	})
+
+	// C11: b is a leaf now, so a must be the offerer on the surviving edge — which
+	// is only true if the diff noticed the role inversion and re-created it.
+	if got := f.offererToward(t, "a", "b"); !got {
+		t.Error("a is still the answerer toward b after b stopped being a relay: " +
+			"the inverted edge was not re-created, so a can never publish its forwarded m-lines")
+	}
+	// And media still reaches the root over the re-parented edge.
+	waitFor(t, "a to receive c's media over the new edge", 30*time.Second, func() bool {
+		return f.routers["a"].Stats().Received[f.idOf(t, "c")]
+	})
+
+	phaseMu.Lock()
+	defer phaseMu.Unlock()
+	if !sawOverlap {
+		t.Error("the new parent connected only after the old session was gone: " +
+			"make-before-break did not happen, so the media gap is a full ICE+DTLS round")
+	}
+}
+
+// TestRouterPromotesBackupParent pins §7.5: when the parent edge fails, the peer
+// promotes its precomputed backup ITSELF, without waiting for a coordinator, and
+// reports the outcome only once media has actually arrived over the new edge.
+//
+// Discrimination: the reported outcome is OK only if a remote track landed inside
+// ReparentMediaTimeout, so a version that ratified on `connected` alone (which
+// proves reachability of the backup, not of the root) would report OK for a
+// backup that forwards nothing — and this test's fixture gives the backup real
+// media to forward, so the two are distinguishable.
+func TestRouterPromotesBackupParent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	reports := make(chan metrics.Reparented, 4)
+	f := newMeetFixture(t, ctx, "backup", map[string]RouterConfig{
+		"a": {},
+		"b": {},
+		// d hangs off the root and SENDS. It is what makes the ratification rule
+		// meaningful: a promotion reports OK only once media has actually arrived
+		// over the new edge, so the backup parent must have something real to
+		// forward. An earlier version of this fixture had none and only "passed"
+		// because mis-attributed forwarding looped c's own media back to it.
+		"d": {SendMedia: true},
+		// DisableBackup is left at its zero value on purpose: promotion must be ON
+		// for a caller that says nothing about it (§15.13).
+		"c": {SendMedia: true, OnReparented: func(r metrics.Reparented) {
+			select {
+			case reports <- r:
+			default:
+			}
+		}},
+	})
+
+	f.announce(t, 1)
+	topo := tree("a", [2]string{"a", "b"}, [2]string{"a", "d"}, [2]string{"b", "c"})
+	topo.Backups = []overlay.Backup{{Node: "c", Parent: "a"}}
+	f.push(t, topo)
+
+	waitFor(t, "the tree to converge", 40*time.Second, func() bool {
+		return allConnected(f.routers["a"].Stats(), 2) &&
+			allConnected(f.routers["b"].Stats(), 2) &&
+			allConnected(f.routers["c"].Stats(), 1) &&
+			receivedAny(f.routers["a"].Stats())
+	})
+
+	// Simulate the parent edge dying. Posting the state event is exactly what pion's
+	// OnState callback does; driving it directly keeps the test off pion's ~25s ICE
+	// failure timer while exercising the identical code path.
+	f.routers["c"].postEvent(routerEvent{
+		kind: evPeerState, peerName: "b", state: webrtc.PeerConnectionStateFailed,
+	})
+
+	select {
+	case rep := <-reports:
+		if !rep.OK {
+			t.Fatalf("backup promotion reported failure: %+v", rep)
+		}
+		if rep.From != "b" || rep.To != "a" {
+			t.Errorf("Reparented{From:%q,To:%q}, want b→a", rep.From, rep.To)
+		}
+		if rep.Name != "c" {
+			t.Errorf("Reparented.Name = %q, want c", rep.Name)
+		}
+		if rep.Epoch != topo.Epoch || rep.Rev != topo.Rev {
+			t.Errorf("Reparented stamped (%d,%d), want the acting topology's (%d,%d)",
+				rep.Epoch, rep.Rev, topo.Epoch, topo.Rev)
+		}
+	case <-time.After(40 * time.Second):
+		t.Fatal("no Reparented report: the peer never promoted its backup parent")
+	}
+
+	// The backup edge is live and the old one is gone.
+	if got := len(f.routers["c"].Stats().Peers); got != 1 {
+		t.Errorf("c holds %d sessions after promotion, want 1 (the backup only)", got)
+	}
+	// §5.6 step 3: the local backup is cleared on promotion, so a SECOND failure
+	// reports failure at once instead of re-attempting the parent it already has.
+	if got := f.routers["c"].currentTopo().BackupOf("c"); got != "" {
+		t.Errorf("local backup is still %q after promoting it; a retry would re-target the current parent", got)
+	}
+
+	// ---- the promotion window ----
+	//
+	// c is now attached to a by a warrant the TREE does not describe, and it stays
+	// that way until the coordinator ratifies. Any unrelated push arriving first
+	// makes a see c as a live neighbour the tree does not name — a stranger — and
+	// drop it. c would then lose the parent it just failed over to, for a reason
+	// that has nothing to do with it, inside the exact window failover exists to
+	// survive.
+	//
+	// The interleaving is constructed, not hoped for. b is taken off the wire first,
+	// so its peer-left removes it from every roster: that is what stops c from
+	// obediently re-parenting BACK to its dead primary when the push still names b as
+	// its parent, which would mask the thing under test.
+	if err := f.clients["b"].Close(); err != nil {
+		t.Fatalf("close b: %v", err)
+	}
+	waitFor(t, "b to leave every roster", 30*time.Second, func() bool {
+		return f.routers["a"].idForName("b") == "" && f.routers["c"].idForName("b") == ""
+	})
+
+	aID := f.idOf(t, "a")
+	before := f.routers["c"].Stats().Tracks[aID]
+
+	unrelated := tree("a", [2]string{"a", "b"}, [2]string{"a", "d"}, [2]string{"b", "c"})
+	unrelated.Backups = []overlay.Backup{{Node: "c", Parent: "a"}}
+	unrelated.Rev = 2 // a real push: same shape, later revision, nothing about c
+	f.push(t, unrelated)
+
+	// The promoted edge must still be there afterwards, and still carrying.
+	stableFor(t, "c to keep its promoted parent across an unrelated push", 3*time.Second, func() bool {
+		return len(f.routers["c"].Stats().Peers) == 1
+	})
+	if st := f.routers["c"].connectionStateByName("a"); st != webrtc.PeerConnectionStateConnected {
+		t.Fatalf("c's promoted edge is %s after an unrelated push, want connected", st)
+	}
+	waitFor(t, "media to keep flowing over the promoted edge", 30*time.Second, func() bool {
+		return f.routers["c"].Stats().Tracks[aID] >= before
+	})
+}
+
+// offererToward reports the baked-in offerer role of holder's live session toward
+// peer, which is the state C11 is about.
+func (f *meetFixture) offererToward(t *testing.T, holder, peer string) bool {
+	t.Helper()
+	r := f.routers[holder]
+	id := f.idOf(t, peer)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	link := r.peers[id]
+	if link == nil || link.session == nil {
+		t.Fatalf("%s has no live session toward %s", holder, peer)
+	}
+	return link.session.Offerer()
+}
+
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j] < s[j-1]; j-- {
+			s[j], s[j-1] = s[j-1], s[j]
+		}
+	}
+}

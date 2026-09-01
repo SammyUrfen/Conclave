@@ -1,0 +1,140 @@
+<!doctype html>
+<!--
+  convergence.test.html — DEV-ONLY verification harness, not shipped app surface.
+
+  Not linked from index.html and not exercised by the real dashboard. Drives the REAL
+  state.js store (`openMeetDetail`) and the REAL meetDetail.js `render` function against
+  three fixture-shaped snapshot bodies — web/fixtures/meet-standup.json (convergence:
+  "converged"), meet-diverged.json ("diverged"), and meet-no-tree.json ("no_tree") — and
+  asserts on the ACTUAL RENDERED epoch-bar item: its CSS class AND its text.
+
+  Why the class matters as much as the text: the reported bug was `converged` (a boolean,
+  now removed) reading vacuously true when there was no tree to compare at all — a green
+  "everything's fine" signal on a meet that never built. §9.4b replaced it with a
+  three-value string enum specifically so "no tree" gets its OWN rendering rather than
+  falling into whichever of the other two a bare emptiness check produced. A test that
+  only checked `diverged` and `converged` would not catch a regression back to that: this
+  one drives all three states through the real render path and requires each to produce a
+  DIFFERENT class, which is what "no_tree quietly renders as converged" cannot survive.
+
+  Run it: open this file in a browser (any static server, e.g. `python3 -m http.server`
+  from web/), or drive it headlessly and read `window.__testResult` after `load`.
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>convergence test</title>
+</head>
+<body>
+<pre id="result">running…</pre>
+<div id="container" style="display:none"></div>
+<script type="module">
+import { store, openMeetDetail, closeMeetDetail } from '../js/state.js';
+import * as meetDetail from '../js/views/meetDetail.js';
+
+class FakeWebSocket {
+  constructor(url) {
+    this.url = url;
+    this.readyState = 0;
+    this._listeners = {};
+  }
+  addEventListener(type, fn) {
+    (this._listeners[type] ||= []).push(fn);
+  }
+  removeEventListener(type, fn) {
+    if (this._listeners[type]) this._listeners[type] = this._listeners[type].filter((f) => f !== fn);
+  }
+  send() {}
+  close() {
+    this.readyState = 3;
+    this._emit('close', { code: 1000 });
+  }
+  _emit(type, ev) {
+    for (const fn of (this._listeners[type] || [])) fn(ev);
+  }
+  open() {
+    this.readyState = 1;
+    this._emit('open', {});
+  }
+  message(obj) {
+    this._emit('message', { data: JSON.stringify(obj) });
+  }
+}
+FakeWebSocket.OPEN = 1;
+
+const originalWS = window.WebSocket;
+let lastSocket = null;
+window.WebSocket = function (url) {
+  lastSocket = new FakeWebSocket(url);
+  return lastSocket;
+};
+
+const container = document.getElementById('container');
+const actions = {};
+store.subscribe(() => meetDetail.render(container, store.getState(), actions));
+
+async function loadFixture(name) {
+  const res = await fetch(`../fixtures/${name}`);
+  if (!res.ok) throw new Error(`fixture ${name} failed to load: HTTP ${res.status}`);
+  return res.json();
+}
+
+function convergenceNode() {
+  const bar = container.querySelector('.epoch-bar');
+  // epoch, rev, coordinator, THEN the convergence item — positional, matching
+  // meetDetail.js's renderEpochBar return order exactly.
+  return bar ? bar.children[3] : null;
+}
+
+async function renderFixture(meetId, fixtureName) {
+  openMeetDetail(meetId);
+  lastSocket.open();
+  const body = await loadFixture(fixtureName);
+  lastSocket.message({
+    api_version: 1, seq: 1, at_unix_ms: Date.now(), meet_id: meetId,
+    epoch: body.epoch, rev: body.rev, kind: 'snapshot', data: body,
+  });
+  const node = convergenceNode();
+  const result = { class: node ? node.className : null, text: node ? node.textContent : null };
+  closeMeetDetail();
+  return result;
+}
+
+const steps = [];
+function record(name, cond, extra) {
+  steps.push({ name, pass: !!cond, ...extra });
+}
+
+const converged = await renderFixture('standup', 'meet-standup.json');
+record('converged renders muted, text "converged"',
+  converged.class === 'epoch-item fg-muted' && converged.text === 'converged', converged);
+
+const diverged = await renderFixture('standup-diverged', 'meet-diverged.json');
+record('diverged renders text-warn, names the diverged peer',
+  diverged.class === 'epoch-item text-warn' && diverged.text === 'diverged: dave', diverged);
+
+const noTree = await renderFixture('fresh-meet', 'meet-no-tree.json');
+// THE regression check: against the unfixed code (`meet.converged === false ||
+// diverged.length > 0`), a no_tree snapshot has `diverged.length === 0` and no
+// `converged` field at all (removed from the wire), so the condition is false and it
+// falls through to the "converged" branch — same class, same text, as the first case
+// above. This assertion is what must fail on that code.
+record('no_tree renders text-caution, text "no tree" — DISTINCT from converged',
+  noTree.class === 'epoch-item text-caution' && noTree.text === 'no tree'
+    && noTree.class !== converged.class,
+  noTree);
+
+// All three classes pairwise distinct — the literal "visibly distinct" requirement.
+const classes = [converged.class, diverged.class, noTree.class];
+record('all three states use pairwise-distinct CSS classes',
+  new Set(classes).size === 3, { classes });
+
+window.WebSocket = originalWS;
+
+const allPass = steps.every((s) => s.pass);
+window.__testResult = { allPass, steps };
+document.getElementById('result').textContent = JSON.stringify(window.__testResult, null, 2);
+document.title = allPass ? 'PASS — convergence test' : 'FAIL — convergence test';
+</script>
+</body>
+</html>

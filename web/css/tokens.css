@@ -1,0 +1,34 @@
+/* tokens.css — the Dracula-derived design tokens from docs/design-system.md §2.1/§2.3.
+ *
+ * Token names are frozen by that doc; do not rename them. This file defines them exactly
+ * once, on :root, because the dashboard is DARK ONLY (§2.4: "a light variant is out of
+ * scope for Phase 7... the only supported theme is dark, and tokens are defined once for
+ * it"). There is deliberately no `prefers-color-scheme` or `[data-theme="light"]` block.
+ */
+
+:root {
+  /* Canvas / surface / text — §2.1 */
+  --bg: #282a36;
+  --surface: #44475a;
+  --fg: #f8f8f2;
+  --fg-muted: #6272a4;
+
+  /* Role accents — §2.1 / §2.3 */
+  --accent-primary: #bd93f9;   /* coordinator */
+  --accent-secondary: #ff79c6; /* relay / attention */
+  --edge: #8be9fd;             /* default overlay edge */
+  --ok: #50fa7b;               /* healthy */
+  --warn: #ffb86c;             /* degraded */
+  --crit: #ff5555;             /* failover / dead / hard error */
+  --caution: #f1fa8c;          /* near-threshold, hysteresis-pending */
+
+  /* Auxiliary tokens — not frozen by design-system.md, but named here rather than left as
+     bare literals, per this project's own "named constants with a justifying comment" rule. */
+  --font-mono: "Fira Code", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --radius: 6px;
+  --border: 1px solid var(--fg-muted);
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 16px;
+  --space-4: 24px;
+}

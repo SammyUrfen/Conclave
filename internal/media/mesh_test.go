@@ -50,7 +50,7 @@ func TestMeshThreePeersFullyConnect(t *testing.T) {
 	routers := make([]*Router, N)
 	var wg sync.WaitGroup
 	for i := range routers {
-		client, err := signaling.Dial(ctx, logger, srv.URL, "mesh")
+		client, err := signaling.Dial(ctx, logger, srv.URL, "mesh", "")
 		if err != nil {
 			t.Fatalf("peer %d dial: %v", i, err)
 		}

@@ -14,14 +14,73 @@
 // A Router adapts a *signaling.Client into per-peer Transports, demultiplexing
 // the single inbound signaling stream (joined/peer-joined/peer-left plus routed
 // offer/answer/candidate) into one Session per remote peer, and meters aggregate
-// upload across all of them. For Phase 2 that is a full mesh — every peer holds a
-// PeerConnection to every other — which is what makes the O(N) upload cost visible.
+// upload across all of them. With no topology it runs a full mesh — every peer
+// holds a PeerConnection to every other — which is what makes the O(N) upload cost
+// visible.
+//
+// Given a Topology it instead runs in tree mode: a peer connects only to its
+// topology neighbours, and a relay (a peer with children) becomes the novel core —
+// a tiny, tree-shaped SFU. The forwarder reads RTP off each source's
+// *webrtc.TrackRemote and fans it, without re-encoding, into a per-downstream
+// TrackLocalStaticRTP, plumbing keyframe requests (PLI) back upstream to the
+// original sender with the SSRC translated. That is what lets a *participant* relay
+// others' media, so the sender's upload stays O(1) and the relay bears the fan-out.
+//
+// From Phase 5 the tree CHANGES underneath all of this. A pushed topology is
+// diffed against what is live and only the difference is applied, which brings in
+// three things that are easy to get wrong and are documented where they live:
+//
+//   - Negotiation is serialized (session.go). Tracks are added and removed
+//     mid-call now, so at most one offer is outstanding per session; pion's own
+//     signaling state is the primary guard, because pion re-fires
+//     negotiation-needed itself on the return to stable.
+//   - A parent change is an ASYNCHRONOUS state machine (reparent.go), never a
+//     blocking sequence. Nothing on the Router's Run goroutine, and nothing in a
+//     pion callback, may wait on I/O — those goroutines are what FEED the
+//     negotiation a wait would be waiting for.
+//   - Make-before-break means two upstreams briefly feed the same downstream leg,
+//     so each leg's outgoing RTP is rewritten (rewrite.go) to stay one continuous
+//     sequence/timestamp series across the switch. A keyframe does not repair a
+//     broken transport ordering; it repairs reference state, one layer up.
+//
+// A pushed tree is also AUTHORIZED before it is applied: overlay.Fence answers "may
+// I act on this" (the sender is the coordinator the arbiter named, at exactly the
+// epoch this peer was told is current, with a strictly newer revision), which is a
+// different question from Topology.Supersedes' "is this newer". Only the arbiter's
+// announcement — carried up to the host by OnCoordinator and back down through
+// AdoptCoordinator, so this package never learns the arbiter's types — may raise a
+// peer's epoch.
+//
+// A source is identified by the peer that ORIGINATED it, never by the neighbour
+// that handed it over. One edge therefore carries as many forwarded tracks as there
+// are participants behind it — which is every edge more than one hop from a sender —
+// and each relay forwards, toward each neighbour, exactly what is not already on
+// that neighbour's side of the cut.
+//
+// One edge deliberately sits outside the tree: the child that promoted this peer as
+// its backup parent. It is accepted on the coordinator's own backup assignment, and
+// it is held — exempt from the diff's ordinary "close what the tree does not name" —
+// until the coordinator rules on the promotion, one way or the other.
+//
+// Because the Router owns the peer's one signaling stream, it is also the seam the
+// control plane reaches its host through: OnCoordinator carries the arbiter's
+// announcement (which tells a peer it has the coordinator job) and OnControlFrame
+// carries the membership, metrics, heartbeat and reparent frames it needs to do it.
+// Both run on the Run goroutine, so a host queues and returns.
+//
+// Ratifying a re-parent needs evidence that the new edge carries media, but a peer
+// that subscribes to nothing has no such evidence to offer and never will — for it,
+// connecting IS the whole observable outcome. And a move that cannot be VERIFIED is
+// not a move that failed: the leg stays up and the report says "unverified", because
+// destroying a live path on an unobservable condition guarantees the outage it was
+// trying to avoid.
+//
+// The Router also reports its REALIZED overlay position (Realized) — the parent it
+// is actually attached to and the children it is actually serving, in topology
+// names — which is the ground truth a newly promoted coordinator rebuilds the
+// previous tree from, instead of inheriting its predecessor's beliefs.
 //
 // Media sources (PlayIVF, SendSynthetic) feed an outbound track; sinks
 // (RecordVP8, DrainAndCount) consume a remote track. Codecs are pinned to VP8 in
 // the MediaEngine so both ends agree without depending on default ordering.
-//
-// Phase 3 grows this into the novel core: reading RTP off a *webrtc.TrackRemote
-// and forwarding it into per-downstream TrackLocalStaticRTP (with RTCP/PLI
-// plumbing) so a *participant* relays others' media — a tiny, tree-shaped SFU.
 package media

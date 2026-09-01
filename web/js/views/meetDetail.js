@@ -1,0 +1,205 @@
+// meetDetail.js — composes the Subnet, Node detail, Event log, Build-state banner, and
+// Epoch/rev panels for one meet (§9.5). This is the view that owns the live WebSocket.
+
+import { el, setChildren } from '../dom.js';
+import { fmtId, fmtDepth, fmtKbps, fmtMs, fmtPct, fmtFitnessLowerBound, fmtUnixMs, str } from '../format.js';
+import * as subnetTree from './subnetTree.js';
+import * as eventLog from './eventLog.js';
+import * as demoControls from './demoControls.js';
+
+const FATAL_MESSAGE = {
+  meet_deleted: 'This meet was deleted on the server.',
+  meet_not_found: 'This meet no longer exists.',
+  policy_violation: 'The server rejected this connection (origin policy). It will not retry — check -allowed-origins.',
+  bad_server_url: 'The configured server address is invalid.',
+  // §9.4a v2.6: a refused WS origin never opens a socket, so it surfaces as a plain close
+  // with no server-chosen code — the api.js EventSocket tells never-connected apart from
+  // connected-then-lost and reports this reason only for the former. It will not retry
+  // (retrying an origin the server will not accept cannot help), so this is an actionable
+  // config error, not a transient network fault.
+  origin_rejected: 'The server rejected this page\'s origin. It will not retry — add this origin to the server\'s -allowed-origins flag.',
+};
+
+/** Reasons for which retrying is impossible, so "Back to meets" (implying "try again elsewhere on
+ * this server") is withheld rather than offered as if it could help. */
+const NO_RETRY_REASONS = new Set(['policy_violation', 'origin_rejected']);
+
+export function render(container, state, actions) {
+  const { meetId, meet, meetSocketStatus, meetFatal, buildState, events, flashNode, selectedNodeName } = state;
+
+  const nodes = [
+    el('div', { class: 'meet-toolbar' },
+      el('button', { class: 'btn btn-sm btn-ghost', onclick: actions.onBack }, '← meets'),
+      el('h2', null, `Meet: ${meetId}`),
+      el('button', { class: 'btn btn-sm', onclick: actions.onResync }, 'Resync'),
+    ),
+  ];
+
+  if (meetFatal) {
+    const base = FATAL_MESSAGE[meetFatal.reason] || `Connection stopped: ${meetFatal.reason}`;
+    // Include the actual origin the browser sent — the exact value an operator needs to
+    // paste into -allowed-origins, not a description of where to find it.
+    const originSuffix = meetFatal.reason === 'origin_rejected' && meetFatal.detail && meetFatal.detail.origin
+      ? ` This page's origin: ${meetFatal.detail.origin}`
+      : '';
+    nodes.push(el('div', { class: 'error-banner', role: 'alert' },
+      base + originSuffix,
+      NO_RETRY_REASONS.has(meetFatal.reason) ? null : el('button', { class: 'btn btn-sm', onclick: actions.onBack }, 'Back to meets'),
+    ));
+  }
+
+  if (!meet && !meetFatal) {
+    nodes.push(el('div', { class: 'empty-state' }, connectingLabel(meetSocketStatus)));
+  }
+
+  if (meet) {
+    nodes.push(renderEpochBar(meet, meetSocketStatus));
+    nodes.push(renderBuildBanner(buildState));
+
+    const subnetContainer = el('div', { class: 'subnet-container' });
+    const detailContainer = el('div', { class: 'node-detail-container' });
+    const demoContainer = el('div', { class: 'demo-container' });
+
+    nodes.push(
+      el('div', { class: 'meet-columns' },
+        el('div', { class: 'subnet-col' }, subnetContainer),
+        el('div', { class: 'detail-col' }, detailContainer, demoContainer),
+      ),
+    );
+
+    const eventContainer = el('div', { class: 'event-log-container' });
+    nodes.push(el('div', { class: 'event-col' }, el('h3', null, 'Events'), eventContainer));
+
+    setChildren(container, nodes);
+
+    subnetTree.render(subnetContainer, meet, flashNode, actions.onSelectNode);
+    renderNodeDetail(detailContainer, meet, selectedNodeName);
+    demoControls.render(demoContainer, state, actions);
+    eventLog.render(eventContainer, events);
+    return;
+  }
+
+  setChildren(container, nodes);
+}
+
+function connectingLabel(status) {
+  if (status === 'connecting') return 'Connecting to the meet stream…';
+  if (status === 'reconnecting') return 'Reconnecting…';
+  return 'Waiting for the meet stream…';
+}
+
+function renderEpochBar(meet, wsStatus) {
+  // §6.8/§9.4/§15.14: stale_rejected legitimately reads 0 — either nothing has ever been
+  // refused, or (§15.14) a peer whose fence just reset on rejoin — so 0 stays in the
+  // neutral colour rather than a warning colour; it is honest data, not a missing-wiring
+  // artifact. This field is snapshot-only: it is the coordinator's meet-wide sum and only
+  // ever arrives on a `snapshot` frame, never synthesized from the per-peer `total` on a
+  // `stale_rejected` delta (see state.js applyDelta) — so between snapshots it can lag the
+  // true total by however many refusals have not yet triggered a resync.
+  const staleRejected = typeof meet.stale_rejected === 'number' ? meet.stale_rejected : 0;
+  // Coordinator is "" for BOTH "vacant" and "the arbiter itself is coordinating" — the
+  // two are distinguished by arbiter_is_coordinator, never by testing the name for "".
+  // (arbiter.Meet.Coordinator's own doc comment says this explicitly; getting it backwards
+  // would render an arbiter-coordinated meet as leaderless, which it is not.)
+  const coordName = str(meet.coordinator);
+  const coordLabel = meet.arbiter_is_coordinator
+    ? el('span', { class: 'pill pill-muted', title: 'The arbiter itself is hosting the coordinator role for this meet (no peer coordinator).' }, 'the arbiter')
+    : (coordName || '(vacant)'); // §6.8 ReasonVacated: no coordinator, not a missing field
+  // §9.4b: Convergence/Diverged expose the gap between the coordinator's INTENDED tree
+  // and what peers REALIZED from their own heartbeats — convergence lag, a failed apply,
+  // or a fenced-out peer, invisible if the UI only ever shows the number it fetched last.
+  //
+  // `convergence` is a THREE-VALUE ENUM (not the removed `converged` boolean) precisely
+  // because "no tree published yet" is a real third outcome, not a degenerate case of
+  // either the other two — a bare `diverged.length === 0` check cannot tell "everyone
+  // agrees" apart from "there was nothing to agree ON", and folding the latter into
+  // "converged" is the exact bug this enum replaced a boolean to fix (an operator seeing
+  // a green signal on a meet that never built a tree at all). All three states get a
+  // VISIBLY DISTINCT rendering so that mistake cannot recur by omission.
+  const diverged = Array.isArray(meet.diverged) ? meet.diverged : [];
+  const convergence = str(meet.convergence);
+  let convergedNode;
+  if (convergence === 'diverged' || diverged.length > 0) {
+    convergedNode = el('span', { class: 'epoch-item text-warn', title: 'Realized parent differs from the published tree for these peers.' }, `diverged: ${diverged.length ? diverged.join(', ') : '(unspecified)'}`);
+  } else if (convergence === 'no_tree') {
+    // Deliberately says only THAT there is no tree, never WHY — the build-state banner
+    // (settling vs unbuildable, §5.9) and the event log already answer why; duplicating
+    // a reason here would be a second, driftable source of truth for the same fact.
+    // `--caution`, not `--ok`/green and not `--warn`: this is an absence of information,
+    // not a fault and not a healthy signal either.
+    convergedNode = el('span', { class: 'epoch-item text-caution', title: 'No tree has been published for this meet yet — see the event log for why.' }, 'no tree');
+  } else if (convergence === 'converged') {
+    convergedNode = el('span', { class: 'epoch-item fg-muted' }, 'converged');
+  } else {
+    // §9.4a: an enum value this build does not recognise (a future addition, or a
+    // missing/malformed field on an old server) renders verbatim in a neutral style —
+    // never silently assumed to be "converged", which is the very failure mode a string
+    // enum replaced a nullable/derived boolean to avoid.
+    convergedNode = el('span', { class: 'epoch-item fg-muted' }, convergence || '(convergence unknown)');
+  }
+  return el('div', { class: 'epoch-bar tabular-nums' },
+    el('span', { class: 'epoch-item' }, 'epoch ', el('strong', null, fmtId(meet.epoch))),
+    el('span', { class: 'epoch-item' }, 'rev ', el('strong', null, fmtId(meet.rev))),
+    el('span', { class: 'epoch-item' }, 'coordinator ', el('strong', null, coordLabel)),
+    convergedNode,
+    el('span', { class: `epoch-item ${staleRejected > 0 ? 'text-warn' : 'fg-muted'}` }, `stale rejected: ${staleRejected}`),
+    el('span', { class: `epoch-item ws-inline status-dot ${wsStatus === 'live' ? 'dot-ok' : wsStatus === 'stale' ? 'dot-warn' : 'dot-muted'}` }),
+    el('span', { class: 'epoch-item fg-muted' }, wsStatus),
+  );
+}
+
+// §9.5 "Build state": three distinct renderings that must never be confused.
+function renderBuildBanner(bs) {
+  if (!bs || bs.kind === 'built') return el('div', { hidden: 'true' });
+  if (bs.kind === 'settling') {
+    return el('div', { class: 'build-banner banner-settling' },
+      `settling — waiting for telemetry from ${bs.waiting && bs.waiting.length ? bs.waiting.join(', ') : 'the newest peers'}`);
+  }
+  if (bs.kind === 'relaxed') {
+    return el('div', { class: 'build-banner banner-relaxed', title: bs.reason || '' },
+      'rebuilt from scratch — stability preference dropped', bs.reason ? el('span', { class: 'fg-muted' }, ` (${bs.reason})`) : null);
+  }
+  if (bs.kind === 'unbuildable') {
+    return el('div', { class: 'build-banner banner-unbuildable', role: 'alert' },
+      `unbuildable: ${bs.reason || 'no reason given'}`);
+  }
+  return el('div', { class: 'build-banner' }, `build state: ${bs.kind}`); // unknown value ⇒ neutral render
+}
+
+function renderNodeDetail(container, meet, selectedName) {
+  const nodesList = Array.isArray(meet.nodes) ? meet.nodes : [];
+  const node = selectedName ? nodesList.find((n) => n.name === selectedName) : null;
+
+  if (!node) {
+    setChildren(container, el('div', { class: 'node-detail empty-state' }, 'Click a node in the subnet to see its telemetry.'));
+    return;
+  }
+
+  const roles = Array.isArray(node.roles) ? node.roles : [];
+  const rows = [
+    ['role(s)', roles.length ? roles.join(', ') : 'leaf'],
+    ['health', str(node.health, 'unknown')],
+    ['parent', str(node.parent) || '(root)'],
+    ['backup', node.backup === '' ? 'no backup (root child)' : (str(node.backup) || '—')],
+    ['children', Array.isArray(node.children) && node.children.length ? node.children.join(', ') : 'none'],
+    ['depth', fmtDepth(node.depth)],
+    ['upload', fmtKbps(node.upload_kbps)],
+    ['nat', str(node.nat, 'unknown')],
+    ['rtt to server', fmtMs(node.rtt_server_ms)],
+    ['loss', fmtPct(node.loss_pct)],
+    ['cpu', fmtPct(node.cpu_pct)],
+    // §9.4a: named "lower bound" because UptimeSec is unreachable server-side — the value
+    // can read up to 0.15 short of the arbiter's real fitness score. Label + "≥" prefix
+    // (from fmtFitnessLowerBound) both carry that, deliberately, instead of a tooltip.
+    ['fitness (lower bound)', fmtFitnessLowerBound(node.fitness_lower_bound)],
+    ['last heartbeat seq', fmtId(node.last_beat_seq)],
+    ['last heartbeat at', fmtUnixMs(node.last_beat_unix_ms)],
+  ];
+
+  setChildren(container, el('div', { class: 'node-detail tabular-nums' },
+    el('h3', null, str(node.name, '(unnamed)')),
+    el('table', { class: 'detail-table' },
+      rows.map(([k, v]) => el('tr', null, el('td', { class: 'detail-key' }, k), el('td', { class: 'detail-val' }, v))),
+    ),
+  ));
+}

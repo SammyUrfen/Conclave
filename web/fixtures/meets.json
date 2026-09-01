@@ -1,0 +1,64 @@
+{
+  "_dev_only": "This file is a hand-written fixture for local UI development (web/?mock=1). It is NOT shipped server behaviour and does not represent a real arbiter response.",
+  "api_version": 1,
+  "demo_enabled": true,
+  "meets": [
+    {
+      "id": "standup",
+      "created_at_unix_ms": 1756684800000,
+      "members": 5,
+      "epoch": 3,
+      "coordinator": "alice",
+      "coordinator_id": "p2",
+      "arbiter_is_coordinator": false,
+      "relays": [
+        "alice",
+        "bob"
+      ],
+      "depth": 2,
+      "provenance": "realized"
+    },
+    {
+      "id": "retro",
+      "created_at_unix_ms": 1756680000000,
+      "members": 1,
+      "epoch": 1,
+      "coordinator": "",
+      "coordinator_id": "_server",
+      "arbiter_is_coordinator": true,
+      "relays": [],
+      "depth": 0,
+      "provenance": "realized"
+    },
+    {
+      "id": "m-7fa3k2qd",
+      "created_at_unix_ms": 1756675000000,
+      "members": 0,
+      "epoch": 0,
+      "coordinator": "",
+      "coordinator_id": "",
+      "arbiter_is_coordinator": false,
+      "relays": [],
+      "depth": -1,
+      "provenance": "realized"
+    }
+  ],
+  "ended": [
+    {
+      "id": "m-9xk2p4qr",
+      "created_at_unix_ms": 1756671600000,
+      "ended_at_unix_ms": 1756684500000,
+      "peak_members": 6,
+      "final_epoch": 4,
+      "elections": 2
+    },
+    {
+      "id": "planning-sync-old",
+      "created_at_unix_ms": 1756660000000,
+      "ended_at_unix_ms": 1756668000000,
+      "peak_members": 2,
+      "final_epoch": 1,
+      "elections": 0
+    }
+  ]
+}

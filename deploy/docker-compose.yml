@@ -1,0 +1,67 @@
+# Local wss:// stack: the arbiter behind Caddy as the TLS terminator.
+#
+# WHY THIS EXISTS. The static frontend is served from https://sammyurfen.github.io.
+# A page on an https:// origin may open ws://localhost (W3C Secure Contexts exempts
+# loopback from mixed-content blocking, §9.9) — but it may NOT open ws:// to any other
+# host, not even 192.168.x.x on your own LAN. So the moment the arbiter is not on the
+# viewer's own machine, it needs wss://, and that needs a terminator in front of it.
+# This compose file is that terminator, locally, so the hosted path can be rehearsed
+# before it is deployed.
+#
+#   docker compose -f deploy/docker-compose.yml up --build
+#
+# then open https://sammyurfen.github.io/conclave/ and point the server field at
+# wss://localhost. Caddy issues a locally-trusted certificate for localhost on its own;
+# the first run prints the root it wants you to trust.
+
+services:
+  arbiter:
+    build:
+      # The build context is the REPO ROOT, not deploy/: the Dockerfile copies go.mod
+      # and the whole source tree, none of which is reachable from here.
+      context: ..
+      dockerfile: deploy/Dockerfile
+    # Not published to the host: Caddy is the only way in, which is the point of
+    # putting it there. Expose 9000 directly only when debugging without TLS.
+    expose:
+      - "9000"
+    command:
+      - "-addr"
+      - ":9000"
+      - "-coordinate"
+      - "-dashboard"
+      # -public-url is what makes the join block correct. The server cannot know that
+      # something terminates TLS in front of it, so without this it would hand every
+      # participant an http:// / ws:// command that fails behind Caddy (§9.4a).
+      - "-public-url"
+      - "https://localhost"
+      # The Pages origin plus local development. One list, used for BOTH the REST CORS
+      # headers and the WebSocket upgrade check — internal/policy exists so these
+      # cannot drift (§2.4, §9.8).
+      - "-allowed-origins"
+      - "https://sammyurfen.github.io,http://localhost:*,http://127.0.0.1:*"
+      - "-log-format"
+      - "json"
+      # NOT set: -demo. It registers routes that let an unauthenticated caller
+      # terminate a participant's connection and force a control-plane transition.
+      # Add it for a live demo session and remove it afterwards.
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Named volumes so the locally-trusted CA and the issued certificate survive a
+      # restart. Without them every `up` mints a new root and your browser re-warns.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - arbiter
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

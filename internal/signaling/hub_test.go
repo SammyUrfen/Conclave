@@ -32,7 +32,7 @@ func TestHubRelaysBetweenPeers(t *testing.T) {
 	connA := dial(ctx, t, wsURL)
 	defer connA.CloseNow()
 
-	joinedA := readMsg(ctx, t, connA)
+	joinedA := readNext(ctx, t, connA)
 	if joinedA.Type != TypeJoined {
 		t.Fatalf("A first frame = %q, want %q", joinedA.Type, TypeJoined)
 	}
@@ -48,13 +48,13 @@ func TestHubRelaysBetweenPeers(t *testing.T) {
 	connB := dial(ctx, t, wsURL)
 	defer connB.CloseNow()
 
-	joinedB := readMsg(ctx, t, connB)
-	if joinedB.Type != TypeJoined || len(joinedB.Peers) != 1 || joinedB.Peers[0] != idA {
+	joinedB := readNext(ctx, t, connB)
+	if joinedB.Type != TypeJoined || len(joinedB.Peers) != 1 || joinedB.Peers[0].ID != idA {
 		t.Fatalf("B joined = %+v, want joined with peers=[%q]", joinedB, idA)
 	}
 	idB := joinedB.To
 
-	peerJoined := readMsg(ctx, t, connA)
+	peerJoined := readNext(ctx, t, connA)
 	if peerJoined.Type != TypePeerJoined || peerJoined.From != idB {
 		t.Fatalf("A peer-joined = %+v, want %q from %q", peerJoined, TypePeerJoined, idB)
 	}
@@ -65,7 +65,7 @@ func TestHubRelaysBetweenPeers(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("A write offer: %v", err)
 	}
-	offer := readMsg(ctx, t, connB)
+	offer := readNext(ctx, t, connB)
 	if offer.Type != TypeOffer {
 		t.Fatalf("B got %q, want %q", offer.Type, TypeOffer)
 	}
@@ -82,7 +82,7 @@ func TestHubRelaysBetweenPeers(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("A write candidate: %v", err)
 	}
-	cand := readMsg(ctx, t, connB)
+	cand := readNext(ctx, t, connB)
 	if cand.From != idA {
 		t.Errorf("spoofed From leaked: got %q, want %q", cand.From, idA)
 	}
@@ -91,7 +91,7 @@ func TestHubRelaysBetweenPeers(t *testing.T) {
 	if err := connB.Close(websocket.StatusNormalClosure, "bye"); err != nil {
 		t.Fatalf("B close: %v", err)
 	}
-	left := readMsg(ctx, t, connA)
+	left := readNext(ctx, t, connA)
 	if left.Type != TypePeerLeft || left.From != idB {
 		t.Fatalf("A peer-left = %+v, want %q from %q", left, TypePeerLeft, idB)
 	}
@@ -109,7 +109,7 @@ func TestHubRelayToUnknownPeerErrors(t *testing.T) {
 	conn := dial(ctx, t, wsURL)
 	defer conn.CloseNow()
 
-	joined := readMsg(ctx, t, conn)
+	joined := readNext(ctx, t, conn)
 	if joined.Type != TypeJoined {
 		t.Fatalf("first frame = %q, want %q", joined.Type, TypeJoined)
 	}
@@ -119,12 +119,49 @@ func TestHubRelayToUnknownPeerErrors(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("write offer: %v", err)
 	}
-	got := readMsg(ctx, t, conn)
+	got := readNext(ctx, t, conn)
 	if got.Type != TypeError {
 		t.Fatalf("got %q, want %q", got.Type, TypeError)
 	}
 	if !strings.Contains(got.Error, "nobody") {
 		t.Errorf("error message %q does not mention the unknown peer", got.Error)
+	}
+}
+
+// TestHubRejectsDuplicateName proves the fail-loud name-uniqueness rule: a second
+// peer claiming a live name is rejected with an error frame (not admitted into an
+// ambiguous roster that would strand a tree child), while a distinct name still
+// joins fine.
+func TestHubRejectsDuplicateName(t *testing.T) {
+	srv, wsURL := newTestServer(t)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// First "leaf" joins cleanly.
+	connA := dial(ctx, t, wsURL+"&name=leaf")
+	defer connA.CloseNow()
+	if m := readNext(ctx, t, connA); m.Type != TypeJoined {
+		t.Fatalf("A first frame = %q, want %q", m.Type, TypeJoined)
+	}
+
+	// Second "leaf" must be rejected with an error naming the clash.
+	connB := dial(ctx, t, wsURL+"&name=leaf")
+	defer connB.CloseNow()
+	m := readNext(ctx, t, connB)
+	if m.Type != TypeError {
+		t.Fatalf("duplicate-name peer got %q, want %q", m.Type, TypeError)
+	}
+	if !strings.Contains(m.Error, "leaf") {
+		t.Errorf("error %q does not mention the duplicate name", m.Error)
+	}
+
+	// A distinct name still joins.
+	connC := dial(ctx, t, wsURL+"&name=relay")
+	defer connC.CloseNow()
+	if m := readNext(ctx, t, connC); m.Type != TypeJoined {
+		t.Fatalf("distinct-name peer got %q, want %q", m.Type, TypeJoined)
 	}
 }
 
@@ -147,6 +184,19 @@ func dial(ctx context.Context, t *testing.T, wsURL string) *websocket.Conn {
 		t.Fatalf("dial %s: %v", wsURL, err)
 	}
 	return conn
+}
+
+// readNext reads the next frame that is not a membership snapshot. The Hub
+// broadcasts a fresh roster on every membership change (so an elected coordinator
+// peer never has to infer one); these relay tests assert on the delta frames, so
+// filtering the snapshots out keeps their expected sequences readable.
+func readNext(ctx context.Context, t *testing.T, conn *websocket.Conn) Message {
+	t.Helper()
+	for {
+		if msg := readMsg(ctx, t, conn); msg.Type != TypeMembership {
+			return msg
+		}
+	}
 }
 
 // readMsg reads one Message with a short deadline so a missing frame fails the

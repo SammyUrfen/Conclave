@@ -1,0 +1,212 @@
+<!doctype html>
+<!--
+  reconnect-backoff.test.html — DEV-ONLY verification harness, not shipped app surface.
+
+  Not linked from index.html and not exercised by the real dashboard. It exists to drive
+  the REAL api.js EventSocket class — the exact code the browser runs — against a fake
+  WebSocket transport and a fake clock, so the reconnect-backoff ladder can be asserted
+  deterministically instead of by watching a real 30s+ timer in a real browser.
+
+  Why a fake clock rather than real waits: STABLE_RESET_MS is 30s and the full backoff
+  ladder (500,1000,2000,4000,8000,then 15000 steady) sums to well over a minute for one
+  pass. Overriding `Date.now`/`setTimeout`/`clearTimeout` (and neutering `setInterval`,
+  which only drives ping/stale-watch here and is irrelevant to this scenario) lets the
+  whole scenario run in milliseconds of wall-clock time while exercising the exact same
+  `_scheduleReconnect` code path a real dropped connection would.
+
+  `Math.random` is pinned to 0.5 so `jitter(ms)` in api.js (`ms * (0.8 + rand*0.4)`)
+  resolves to exactly `ms` — 0.8 + 0.5*0.4 = 1.0 — which is what makes asserting an exact
+  delay sequence possible instead of a fuzzy range.
+
+  Run it: open this file in a browser (any static server, e.g. `python3 -m http.server`
+  from web/), or drive it headlessly and read `window.__testResult` after `load`.
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>reconnect-backoff test</title>
+</head>
+<body>
+<pre id="result">running…</pre>
+<script type="module">
+import { EventSocket } from '../js/api.js';
+
+// ---------------------------------------------------------------------------------------
+// Fake transport — a controllable stand-in for the browser's WebSocket, with just the
+// surface EventSocket touches: readyState, addEventListener/removeEventListener, send,
+// close, and the WebSocket.OPEN constant used by _send's readyState check.
+// ---------------------------------------------------------------------------------------
+class FakeWebSocket {
+  constructor(url) {
+    this.url = url;
+    this.readyState = 0; // CONNECTING
+    this._listeners = {};
+  }
+  addEventListener(type, fn) {
+    (this._listeners[type] ||= []).push(fn);
+  }
+  removeEventListener(type, fn) {
+    if (this._listeners[type]) this._listeners[type] = this._listeners[type].filter((f) => f !== fn);
+  }
+  send() {}
+  close() {
+    this.readyState = 3; // CLOSED
+    this._emit('close', { code: 1000 });
+  }
+  _emit(type, ev) {
+    for (const fn of (this._listeners[type] || [])) fn(ev);
+  }
+  // Test-only helpers — not part of the real WebSocket surface.
+  open() {
+    this.readyState = 1; // OPEN
+    this._emit('open', {});
+  }
+  fail(code) {
+    this.readyState = 3; // CLOSED
+    this._emit('close', { code });
+  }
+}
+FakeWebSocket.CONNECTING = 0;
+FakeWebSocket.OPEN = 1;
+FakeWebSocket.CLOSING = 2;
+FakeWebSocket.CLOSED = 3;
+
+// ---------------------------------------------------------------------------------------
+// Fake clock — a manually-advanced virtual timeline. `advanceTo` fires every pending
+// timer whose deadline has arrived, in deadline order, allowing a fired callback to
+// schedule a new timer that itself fires within the same advance (real setTimeout
+// semantics) — which is exactly what happens here: a fired reconnect timer calls
+// connect(), which (on failure) schedules the NEXT reconnect timer.
+// ---------------------------------------------------------------------------------------
+let fakeNow = 1_000_000;
+let timers = [];
+let nextTimerId = 1;
+const setTimeoutCalls = []; // every {ms} this test observed passed to setTimeout
+
+window.Date.now = () => fakeNow;
+Math.random = () => 0.5; // pins jitter(ms) === ms exactly (see file header)
+
+window.setTimeout = (fn, ms = 0) => {
+  const id = nextTimerId++;
+  timers.push({ id, fn, at: fakeNow + ms });
+  setTimeoutCalls.push({ ms });
+  return id;
+};
+window.clearTimeout = (id) => {
+  timers = timers.filter((t) => t.id !== id);
+};
+// setInterval only drives ping/stale-watch in EventSocket — irrelevant to backoff timing
+// and, left real, would just accumulate no-op fake timers forever. Neutered, not faked.
+window.setInterval = () => nextTimerId++;
+window.clearInterval = () => {};
+
+function advanceTo(target) {
+  for (;;) {
+    timers.sort((a, b) => a.at - b.at);
+    const next = timers.find((t) => t.at <= target);
+    if (!next) break;
+    timers = timers.filter((t) => t !== next);
+    fakeNow = next.at;
+    next.fn();
+  }
+  fakeNow = Math.max(fakeNow, target);
+}
+function advance(ms) {
+  advanceTo(fakeNow + ms);
+}
+
+const STABLE_RESET_MS = 30000; // must match api.js's own constant (not exported)
+
+// ---------------------------------------------------------------------------------------
+// Scenario 1 — the regression: a connection survives past STABLE_RESET_MS, then every
+// retry against a dead server fails without ever reopening. The backoff ladder must
+// climb (500,1000,2000,4000,8000, then pinned at the 15000 steady state) — NOT reset to
+// 500 on every single failure, which is what the unclamped `connectedAt` bug produced.
+// ---------------------------------------------------------------------------------------
+function scenarioLadderClimbs() {
+  const sockets = [];
+  const originalWS = window.WebSocket;
+  window.WebSocket = function (url) {
+    const ws = new FakeWebSocket(url);
+    sockets.push(ws);
+    return ws;
+  };
+
+  const statuses = [];
+  const sock = new EventSocket('ws://fake-server', 'meet1', {
+    onStatus: (s) => statuses.push(s),
+  });
+
+  const callsBefore = setTimeoutCalls.length;
+
+  sock.connect();
+  sockets[0].open(); // connectedAt = fakeNow (1_000_000)
+
+  // Survive well past STABLE_RESET_MS with no other activity.
+  advance(STABLE_RESET_MS + 1000); // fakeNow = 1_031_000
+
+  // The connection drops. This is the FIRST failure after a genuinely long-lived
+  // connection, so a reset to the fast retry step here is CORRECT, not the bug.
+  sockets[0].fail(1011);
+
+  // Now retry five more times, each one failing immediately (no 'open' in between —
+  // the dead-server case). Advancing to each scheduled timer's deadline fires it,
+  // which calls connect() again and creates the next fake socket.
+  for (let i = 0; i < 5; i++) {
+    advance(60000); // far enough to guarantee the pending reconnect timer fires
+    const latest = sockets[sockets.length - 1];
+    latest.fail(1011);
+  }
+
+  window.WebSocket = originalWS;
+
+  const observedDelays = setTimeoutCalls.slice(callsBefore).map((c) => c.ms);
+  // Expected under the FIX: reset once (connection genuinely survived), then climb the
+  // ladder on every failure after that, pinning at the steady 15000ms state.
+  const expected = [500, 1000, 2000, 4000, 8000, 15000];
+  const pass = JSON.stringify(observedDelays) === JSON.stringify(expected);
+  return { name: 'ladder climbs after a long-lived connection drops', pass, observedDelays, expected, sockets: sockets.length, statuses };
+}
+
+// ---------------------------------------------------------------------------------------
+// Scenario 2 — the existing guarantee that must NOT regress: a socket that never opens
+// at all (refused origin, reported as close code 1006 with no prior 'open') must be
+// treated as fatal and must schedule NO reconnect whatsoever.
+// ---------------------------------------------------------------------------------------
+function scenarioOriginRejectedStillNoRetry() {
+  const sockets = [];
+  const originalWS = window.WebSocket;
+  window.WebSocket = function (url) {
+    const ws = new FakeWebSocket(url);
+    sockets.push(ws);
+    return ws;
+  };
+
+  const statuses = [];
+  const fatals = [];
+  const sock = new EventSocket('ws://fake-server', 'meet2', {
+    onStatus: (s) => statuses.push(s),
+    onFatal: (reason, detail) => fatals.push({ reason, detail }),
+  });
+
+  const callsBefore = setTimeoutCalls.length;
+  sock.connect();
+  sockets[0].fail(1006); // never opened — the refused-handshake shape
+  window.WebSocket = originalWS;
+
+  const scheduledAnyTimer = setTimeoutCalls.length > callsBefore;
+  const pass = !scheduledAnyTimer
+    && fatals.length === 1 && fatals[0].reason === 'origin_rejected'
+    && statuses[statuses.length - 1] === 'rejected';
+  return { name: 'origin_rejected still schedules no reconnect', pass, scheduledAnyTimer, fatals, statuses };
+}
+
+const results = [scenarioLadderClimbs(), scenarioOriginRejectedStillNoRetry()];
+const allPass = results.every((r) => r.pass);
+
+window.__testResult = { allPass, results };
+document.getElementById('result').textContent = JSON.stringify(window.__testResult, null, 2);
+document.title = allPass ? 'PASS — reconnect-backoff test' : 'FAIL — reconnect-backoff test';
+</script>
+</body>
+</html>
