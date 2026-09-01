@@ -432,6 +432,12 @@ func (h *Hub) pingLoop(ctx context.Context, c *member) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C():
+			// Same latent hazard as member.writePump: Ping is a control-frame WRITE,
+			// so cancelling pingCtx would hard-close the socket rather than abort the
+			// ping. Safe today because this package only ever tears down with
+			// CloseNow and sends no graceful close code — but a ping racing a close
+			// code would destroy the socket before the code was written. See the full
+			// note in member.go's writePump before adding one.
 			pingCtx, cancel := context.WithTimeout(ctx, h.pingTimeout)
 			err := c.conn.Ping(pingCtx)
 			cancel()
