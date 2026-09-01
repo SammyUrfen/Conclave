@@ -1,0 +1,205 @@
+package arbiter
+
+import (
+	"sort"
+	"time"
+
+	"github.com/SammyUrfen/conclave/internal/metrics"
+)
+
+// Meet is the arbiter-owned description of one meet, and the payload of the
+// dashboard's /api/meets endpoints.
+//
+// It is owned by its producer rather than by the dashboard on purpose: a type
+// defined in the dashboard and returned by the arbiter would invert the dependency
+// and drag the browser-facing surface into the control plane.
+//
+// Rev, Relays, and Depth describe the REALIZED subnet — reconstructed from the
+// heartbeats the arbiter already terminates, not from the coordinator's beliefs. The
+// arbiter may not import the coordinator, and asking the coordinator would
+// reintroduce exactly the circularity Fitness.Live exists to avoid; reporting ground
+// truth is also the more honest thing for a dashboard to draw.
+type Meet struct {
+	ID        string
+	CreatedAt time.Time
+	Members   int
+	// Epoch is the current term. 0 means no coordinator has ever been named here.
+	Epoch uint64
+	// Rev is the newest topology revision any member reports having realized under
+	// the current Epoch. A revision reported under a different epoch is ignored:
+	// revisions are only meaningful within the term that minted them.
+	Rev uint64
+	// Coordinator is the peer name; "" means none yet, or the arbiter itself.
+	// Distinguish the two with ArbiterIsCoord, never by testing this for "".
+	Coordinator string
+	// CoordinatorID is the peer id, or the arbiter's reserved id when it coordinates.
+	CoordinatorID string
+	// Relays are the members reporting at least one realized child, ascending.
+	Relays []string
+	// Depth is the realized hop count from root to the deepest leaf, or -1 when no
+	// tree exists yet.
+	Depth          int
+	ArbiterIsCoord bool
+}
+
+// peerState is everything the arbiter knows about one member. It is owned by the Run
+// goroutine and never escapes it except as a copied value.
+type peerState struct {
+	id   string
+	name string
+	// joinedAt drives Fitness.UptimeSec. Reset on a rejoin, because a peer that
+	// dropped and came back has not proven it stays.
+	joinedAt time.Time
+	// lastSeen is the arbiter's INDEPENDENT liveness evidence: the instant of the
+	// last frame of any kind from this peer. Every frame counts, not just a
+	// heartbeat, because a peer that is reporting telemetry is self-evidently alive
+	// and refusing that evidence would only invent false failovers.
+	lastSeen time.Time
+	// report/reported/coordinatable are the last telemetry declaration. reported
+	// gates coordinatable so a peer that has never spoken is never elected.
+	report        metrics.Report
+	reported      bool
+	coordinatable bool
+	// beat is the last heartbeat, kept for its declared cadence (which sets this
+	// peer's own liveness threshold) and for the realized topology it carries.
+	beat    metrics.Heartbeat
+	hasBeat bool
+}
+
+// interval is the cadence this peer declared, defaulting when it has not spoken. It
+// matters that the threshold is a multiple of the peer's OWN cadence: a peer
+// deliberately beating every 5 s must not be declared gone for doing exactly that.
+func (ps *peerState) interval() time.Duration {
+	if !ps.hasBeat {
+		return 0 // metrics.GoneAfter treats this as "use the default cadence"
+	}
+	return ps.beat.Interval()
+}
+
+// meetState is one meet's authoritative control state. Every field is written only
+// by the arbiter's Run goroutine, which is what makes the epoch counter a
+// single-writer value with no lock to get wrong and no agreement to reach.
+type meetState struct {
+	id        string
+	createdAt time.Time
+	members   map[string]*peerState
+
+	// epoch is the fencing token. Incremented on, and only on, a coordinator change.
+	epoch uint64
+	// coordID/coordName name the sitting PEER coordinator; both are "" when the
+	// arbiter holds the role or when the meet has none. arbiterIsCoord disambiguates.
+	coordID        string
+	coordName      string
+	arbiterIsCoord bool
+
+	// lastAnn is replayed verbatim on a membership change so a joiner adopts the
+	// current authority. Keeping the original frame rather than minting a fresh one
+	// is what makes the re-announcement idempotent at every peer already at that
+	// epoch.
+	lastAnn Announcement
+	hasAnn  bool
+
+	// termStart is when the sitting coordinator took office, for MinTermDuration.
+	termStart time.Time
+
+	// The dwell state for a VOLUNTARY handover: which change has been wanted, at
+	// whom, and since when. A change of wanted reason or target restarts the clock,
+	// which is what "sustained" means.
+	pendingReason Reason
+	pendingTarget string
+	pendingSince  time.Time
+}
+
+func newMeetState(id string, now time.Time) *meetState {
+	return &meetState{id: id, createdAt: now, members: map[string]*peerState{}}
+}
+
+// hasHolder reports whether anyone currently coordinates this meet.
+func (ms *meetState) hasHolder() bool { return ms.arbiterIsCoord || ms.coordID != "" }
+
+// clearHolder vacates the role. It also drops lastAnn: a stored announcement naming
+// a coordinator that no longer exists must never be replayed to a joiner, because
+// the joiner would fence itself to a dead node and reject everything after.
+func (ms *meetState) clearHolder() {
+	ms.coordID, ms.coordName, ms.arbiterIsCoord = "", "", false
+	ms.lastAnn, ms.hasAnn = Announcement{}, false
+}
+
+func (ms *meetState) clearPending() {
+	ms.pendingReason, ms.pendingTarget, ms.pendingSince = "", "", time.Time{}
+}
+
+// snapshot copies this meet out for a caller on another goroutine.
+func (ms *meetState) snapshot(arbiterID string) Meet {
+	relays, depth, rev := ms.realized()
+	m := Meet{
+		ID:             ms.id,
+		CreatedAt:      ms.createdAt,
+		Members:        len(ms.members),
+		Epoch:          ms.epoch,
+		Rev:            rev,
+		Coordinator:    ms.coordName,
+		CoordinatorID:  ms.coordID,
+		Relays:         relays,
+		Depth:          depth,
+		ArbiterIsCoord: ms.arbiterIsCoord,
+	}
+	if ms.arbiterIsCoord {
+		m.CoordinatorID = arbiterID
+	}
+	return m
+}
+
+// realized reconstructs the subnet from the members' last heartbeats.
+//
+// The reconstruction is defensive rather than trusting: heartbeats from different
+// peers are snapshots taken at different instants, so the edge set can be
+// momentarily torn or even cyclic mid-reparent. Every walk is therefore bounded by a
+// visited set, and a parent naming a peer that has not reported is treated as the
+// top of the chain rather than an error — this is a display value, and a torn frame
+// must degrade to a slightly stale number, never to a hang or a panic.
+func (ms *meetState) realized() (relays []string, depth int, rev uint64) {
+	parent := make(map[string]string, len(ms.members))
+	known := make(map[string]bool, len(ms.members))
+	// Iterating the member map is safe here because every result is either sorted
+	// (relays) or an order-independent reduction (a max). Nothing downstream can
+	// observe the iteration order.
+	for _, ps := range ms.members {
+		if !ps.hasBeat {
+			continue
+		}
+		known[ps.name] = true
+		if ps.beat.Parent != "" {
+			parent[ps.name] = ps.beat.Parent
+		}
+		if len(ps.beat.Children) > 0 {
+			relays = append(relays, ps.name)
+		}
+		if ms.epoch != 0 && ps.beat.Epoch == ms.epoch && ps.beat.Rev > rev {
+			rev = ps.beat.Rev
+		}
+	}
+	sort.Strings(relays)
+
+	if len(parent) == 0 {
+		return relays, -1, rev
+	}
+	depth = 0
+	for name := range known {
+		hops := 0
+		seen := map[string]bool{name: true}
+		for cur := name; ; {
+			p, ok := parent[cur]
+			if !ok || !known[p] || seen[p] {
+				break
+			}
+			seen[p] = true
+			hops++
+			cur = p
+		}
+		if hops > depth {
+			depth = hops
+		}
+	}
+	return relays, depth, rev
+}
