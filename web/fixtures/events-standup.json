@@ -16,5 +16,8 @@
   { "api_version": 1, "seq": 16, "at_unix_ms": 1756684826300, "meet_id": "standup", "epoch": 4, "rev": 18, "kind": "member_left", "data": { "id": "p7", "name": "frank" } },
   { "api_version": 1, "seq": 17, "at_unix_ms": 1756684826900, "meet_id": "standup", "epoch": 4, "rev": 18, "kind": "member_joined", "data": { "id": "p7", "name": "frank" } },
   { "api_version": 1, "seq": 18, "at_unix_ms": 1756684827300, "meet_id": "standup", "epoch": 4, "rev": 18, "kind": "stale_rejected", "data": { "name": "frank", "epoch": 0, "rev": 0, "total": 1, "reason": "epoch behind current" } },
-  { "api_version": 1, "seq": 19, "at_unix_ms": 1756684827600, "meet_id": "standup", "epoch": 4, "rev": 18, "kind": "unbuildable", "data": { "reason": "no peer reports enough upload budget to root the tree" } }
+  { "api_version": 1, "seq": 19, "at_unix_ms": 1756684827600, "meet_id": "standup", "epoch": 4, "rev": 18, "kind": "unbuildable", "data": { "reason": "no peer reports enough upload budget to root the tree" } },
+  { "api_version": 1, "seq": 20, "at_unix_ms": 1756684829400, "meet_id": "standup", "epoch": 5, "rev": 18, "kind": "election", "data": { "epoch": 5, "coordinator": "", "prev": "alice", "reason": "demotion" } },
+  { "api_version": 1, "seq": 21, "at_unix_ms": 1756684831200, "meet_id": "standup", "epoch": 6, "rev": 18, "kind": "election", "data": { "epoch": 6, "coordinator": "carol", "prev": "", "reason": "promotion" } },
+  { "api_version": 1, "seq": 22, "at_unix_ms": 1756684833000, "meet_id": "standup", "epoch": 7, "rev": 18, "kind": "election", "data": { "epoch": 7, "coordinator": "", "prev": "carol", "reason": "demotion" } }
 ]

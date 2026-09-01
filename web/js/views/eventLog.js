@@ -1,7 +1,7 @@
 // eventLog.js — §9.5 "Event log": the envelope stream, newest first, colour-coded by kind.
 
 import { el, setChildren } from '../dom.js';
-import { fmtUnixMs, fmtId, str } from '../format.js';
+import { fmtUnixMs, fmtId, str, isArbiterHosting } from '../format.js';
 
 const KIND_CLASS = {
   snapshot: 'kind-neutral',
@@ -73,10 +73,17 @@ function summarize(kind, data) {
     case 'reparent': return `${str(data.name, '?')}: ${str(data.from, '?')} → ${str(data.to, '?')} (self-promoted)`;
     case 'failover': return `${str(data.name, '?')} failed — orphans: ${Array.isArray(data.orphans) ? data.orphans.join(', ') || 'none' : '?'}`;
     case 'election': {
-      // Coordinator is "" when Reason is "vacated" (§6.8) — the epoch still bumps to
-      // fence the old coordinator even though nobody replaces it. Render that plainly
-      // rather than as a blank name after the arrow.
-      const to = data.coordinator ? str(data.coordinator) : '(vacant)';
+      // An empty `coordinator` is ambiguous on its own — vacant, or the arbiter itself
+      // hosting — and this event's own `reason` is what resolves it (isArbiterHosting,
+      // format.js). Rendering it unconditionally as "(vacant)" was the same bug class as
+      // the header's: a demotion TO the arbiter would read as a vacancy that never
+      // happened.
+      const to = data.coordinator ? str(data.coordinator) : (isArbiterHosting(data.coordinator, data.reason) ? 'the arbiter' : '(vacant)');
+      // `prev` has no equivalent disambiguator: it names the OUTGOING coordinator, and
+      // this event's `reason` only explains the CURRENT transition, not whatever the
+      // previous one was. A blank `prev` renders blank rather than guessing "(vacant)"
+      // or "the arbiter" — same principle as `to`, applied honestly where the wire
+      // genuinely does not resolve it.
       return `epoch ${fmtId(data.epoch)}: ${str(data.prev, '?')} → ${to} (${str(data.reason, '?')})`;
     }
     case 'announce_repair': return `${str(data.name, '?')}: peer at epoch ${fmtId(data.peer_epoch)} vs meet epoch ${fmtId(data.meet_epoch)} — ${data.resolved ? 'resolved' : 'repairing'}`;

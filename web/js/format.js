@@ -104,3 +104,29 @@ export function fmtId(v) {
 export function str(v, fallback = '') {
   return typeof v === 'string' ? v : fallback;
 }
+
+/**
+ * True when an empty `election`/`coordinator` name means the ARBITER itself holds the
+ * coordinator role, as opposed to a genuine vacancy — the one ambiguity
+ * arbiter.Meet.Coordinator's own doc comment calls out: "" means EITHER, distinguished
+ * only by a boolean, never by testing the name.
+ *
+ * On a full snapshot/list row that boolean rides the wire directly as
+ * `arbiter_is_coordinator`. The `election` delta's data (internal/dashboard/wire.go
+ * electionData) does not carry it — but it does not need to: internal/arbiter/
+ * announcement.go documents `ReasonVacated` as the ONE reason under which an empty
+ * Coordinator means a genuine vacancy (Coordinator AND CoordinatorID both ""); every
+ * other reason (bootstrap/failover/promotion/demotion/manual) that leaves Coordinator ""
+ * means the arbiter took the role, because those reasons always assign a CoordinatorID —
+ * the arbiter's reserved id when no peer does. So `(coordinator, reason)` alone
+ * determines the boolean, and this one function is the single place that encodes the
+ * rule, shared by state.js (updating the live snapshot) and eventLog.js (narrating the
+ * event) so they cannot read it two different ways.
+ *
+ * @param {string} coordinator - the election/coordinator name, "" for both cases above.
+ * @param {string} reason - the accompanying Reason string (unparsed by peers, but this
+ *   is the dashboard, which the arbiter's own doc comments say may read it).
+ */
+export function isArbiterHosting(coordinator, reason) {
+  return !coordinator && reason !== 'vacated';
+}

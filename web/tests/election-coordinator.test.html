@@ -1,0 +1,162 @@
+<!doctype html>
+<!--
+  election-coordinator.test.html — DEV-ONLY verification harness, not shipped app surface.
+
+  Not linked from index.html and not exercised by the real dashboard. It drives the REAL
+  state.js store (`openMeetDetail`, unexported `applyDelta` included) and the REAL
+  meetDetail.js `render` function — the exact code the browser runs — through a fake
+  WebSocket transport, and asserts on the ACTUAL RENDERED DOM, not on internal state alone.
+  That matters here specifically: the bug this catches is that state.js could update
+  `meet.coordinator` on an `election` delta without updating `meet.arbiter_is_coordinator`,
+  and meetDetail.js's header renders on the SECOND field
+  (arbiter.Meet.Coordinator's own doc comment: "" means EITHER vacant OR arbiter-hosted,
+  distinguished only by arbiter_is_coordinator, never by testing the name for "").
+  A test that only inspected `meet.coordinator` would not have caught it.
+
+  No fake clock is needed (unlike reconnect-backoff.test.html): this scenario only ever
+  delivers three frames on cue and reads the DOM after each, so it runs at real speed in
+  well under a second regardless.
+
+  Run it: open this file in a browser (any static server, e.g. `python3 -m http.server`
+  from web/), or drive it headlessly and read `window.__testResult` after `load`.
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>election-coordinator test</title>
+</head>
+<body>
+<pre id="result">running…</pre>
+<div id="container" style="display:none"></div>
+<script type="module">
+import { store, openMeetDetail, closeMeetDetail } from '../js/state.js';
+import * as meetDetail from '../js/views/meetDetail.js';
+
+// ---------------------------------------------------------------------------------------
+// Fake transport — same shape as reconnect-backoff.test.html's FakeWebSocket, plus a
+// message() helper since this scenario needs to deliver snapshot/delta frames, not just
+// open/close.
+// ---------------------------------------------------------------------------------------
+class FakeWebSocket {
+  constructor(url) {
+    this.url = url;
+    this.readyState = 0; // CONNECTING
+    this._listeners = {};
+  }
+  addEventListener(type, fn) {
+    (this._listeners[type] ||= []).push(fn);
+  }
+  removeEventListener(type, fn) {
+    if (this._listeners[type]) this._listeners[type] = this._listeners[type].filter((f) => f !== fn);
+  }
+  send() {}
+  close() {
+    this.readyState = 3;
+    this._emit('close', { code: 1000 });
+  }
+  _emit(type, ev) {
+    for (const fn of (this._listeners[type] || [])) fn(ev);
+  }
+  open() {
+    this.readyState = 1; // OPEN
+    this._emit('open', {});
+  }
+  message(obj) {
+    this._emit('message', { data: JSON.stringify(obj) });
+  }
+}
+FakeWebSocket.OPEN = 1;
+
+const originalWS = window.WebSocket;
+let lastSocket = null;
+window.WebSocket = function (url) {
+  lastSocket = new FakeWebSocket(url);
+  return lastSocket;
+};
+
+// ---------------------------------------------------------------------------------------
+// Real render wiring, minimal — the same shape main.js uses: re-render into a container
+// on every store change. `actions` is deliberately empty: dom.js's el() skips any prop
+// whose value is null/undefined, so an unset action handler is simply not attached — this
+// scenario never clicks anything, including Resync, which is the whole point.
+// ---------------------------------------------------------------------------------------
+const container = document.getElementById('container');
+const actions = {};
+store.subscribe(() => meetDetail.render(container, store.getState(), actions));
+
+function headerShowsArbiter() {
+  return !!container.querySelector('.pill-muted') &&
+    container.querySelector('.pill-muted').textContent === 'the arbiter';
+}
+function headerCoordinatorText() {
+  const pill = container.querySelector('.pill-muted');
+  if (pill && pill.textContent === 'the arbiter') return 'the arbiter';
+  // meetDetail.js renders the bare peer name (or "(vacant)") as plain text next to the
+  // "coordinator" label — read straight off state rather than re-deriving a selector,
+  // since the point of this assertion is the STATE that fed the render, already proven
+  // rendered by the headerShowsArbiter() check.
+  return store.getState().meet ? store.getState().meet.coordinator : undefined;
+}
+
+const steps = [];
+function record(name, cond, extra) {
+  steps.push({ name, pass: !!cond, ...extra });
+}
+
+openMeetDetail('teststandup');
+lastSocket.open();
+
+const baseNode = {
+  id: 'p2', name: 'alice', roles: ['relay'], health: 'healthy', parent: '', backup: '',
+  children: [], depth: 0, upload_kbps: 1000, nat: 'direct', rtt_server_ms: 10, loss_pct: 0,
+  cpu_pct: 5, fitness_lower_bound: 0.5, last_beat_seq: 1, last_beat_unix_ms: Date.now(),
+};
+
+// Step 1: initial snapshot is ARBITER-hosted (coordinator: "", arbiter_is_coordinator:
+// true) — the starting state the reported bug's "stops saying the arbiter" is measured
+// against.
+lastSocket.message({
+  api_version: 1, seq: 1, at_unix_ms: Date.now(), meet_id: 'teststandup', epoch: 5, rev: 1,
+  kind: 'snapshot',
+  data: {
+    api_version: 1, id: 'teststandup', epoch: 5, rev: 1,
+    coordinator: '', coordinator_id: '_server', arbiter_is_coordinator: true,
+    root: 'alice', at_unix_ms: Date.now(), nodes: [baseNode], edges: [], backups: [],
+    stale_rejected: 0, converged: true, diverged: [], provenance: 'intended',
+  },
+});
+record('snapshot renders "the arbiter"', headerShowsArbiter());
+
+// Step 2 — THE BUG: an `election` delta moves the role AWAY from the arbiter to a real
+// peer. No resync is ever requested. Against the unfixed code, `applyDelta`'s 'election'
+// case set `coordinator` but left `arbiter_is_coordinator` untouched (still true from the
+// snapshot), so the header kept reading "the arbiter" here.
+lastSocket.message({
+  api_version: 1, seq: 2, at_unix_ms: Date.now(), meet_id: 'teststandup', epoch: 6, rev: 1,
+  kind: 'election', data: { epoch: 6, coordinator: 'alice', prev: '', reason: 'promotion' },
+});
+record('election away from the arbiter: header stops saying "the arbiter" (no resync)',
+  !headerShowsArbiter() && headerCoordinatorText() === 'alice',
+  { arbiter_is_coordinator: store.getState().meet.arbiter_is_coordinator, coordinator: store.getState().meet.coordinator });
+
+// Step 3 — the reverse, explicitly requested: the role moves BACK to the arbiter.
+// arbiter_is_coordinator must go true again; a one-directional fix (e.g. one that only
+// ever sets it false) would pass step 2 and fail here.
+lastSocket.message({
+  api_version: 1, seq: 3, at_unix_ms: Date.now(), meet_id: 'teststandup', epoch: 7, rev: 1,
+  kind: 'election', data: { epoch: 7, coordinator: '', prev: 'alice', reason: 'demotion' },
+});
+record('election back to the arbiter: header says "the arbiter" again (no resync)',
+  headerShowsArbiter(),
+  { arbiter_is_coordinator: store.getState().meet.arbiter_is_coordinator, coordinator: store.getState().meet.coordinator });
+
+closeMeetDetail();
+window.WebSocket = originalWS;
+
+const allPass = steps.every((s) => s.pass);
+window.__testResult = { allPass, steps };
+document.getElementById('result').textContent = JSON.stringify(window.__testResult, null, 2);
+document.title = allPass ? 'PASS — election-coordinator test' : 'FAIL — election-coordinator test';
+</script>
+</body>
+</html>
