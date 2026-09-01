@@ -263,7 +263,7 @@ func (s *Server) writeLoop(ctx context.Context, st *stream) {
 			_ = st.conn.Close(websocket.StatusNormalClosure, "server shutting down")
 			return
 		case <-ticker.C():
-			pctx, cancel := context.WithTimeout(ctx, wsPingTimeout)
+			pctx, cancel := context.WithTimeout(socketCtx(ctx), wsPingTimeout)
 			err := st.conn.Ping(pctx)
 			cancel()
 			if err != nil {
@@ -280,6 +280,30 @@ func (s *Server) writeLoop(ctx context.Context, st *stream) {
 	}
 }
 
+// socketCtx strips cancellation from a context that is about to be handed to a
+// coder/websocket WRITE, leaving only the caller's own deadline.
+//
+// This is not a style choice, it is the close-code contract. coder/websocket arms a
+// context.AfterFunc for the duration of every frame write, and that hook does not
+// abort the write — it calls the connection's internal close, which tears the TCP
+// socket down with no close frame at all. So a write whose context is cancelled does
+// not fail politely; it destroys the connection.
+//
+// The connection ctx is cancelled by exactly the thing that wants a close code:
+// st.fail records a code and then cancels so the writer wakes up and sends it. Passing
+// that ctx to the write means a cancellation arriving while a frame is still in flight
+// kills the socket a moment before finish gets to write the frame — and the library
+// reports that stolen close as success, because writeClose swallows net.ErrClosed. The
+// client sees an abrupt EOF and a -1 status instead of the frozen §9.4a code it
+// branches on, so it reconnects in a loop against a server that just said "stop".
+//
+// Dropping cancellation costs nothing here: wsWriteTimeout / wsPingTimeout already
+// bound a stuck send, which is the only thing cancellation was buying. Reads keep
+// their cancellation — the reader has no close frame to protect.
+func socketCtx(ctx context.Context) context.Context {
+	return context.WithoutCancel(ctx)
+}
+
 // writeItem materialises and writes one frame. It reports whether the connection is
 // still usable.
 func (s *Server) writeItem(ctx context.Context, st *stream, it frameItem) bool {
@@ -287,7 +311,7 @@ func (s *Server) writeItem(ctx context.Context, st *stream, it frameItem) bool {
 	if !ok {
 		return false
 	}
-	wctx, cancel := context.WithTimeout(ctx, wsWriteTimeout)
+	wctx, cancel := context.WithTimeout(socketCtx(ctx), wsWriteTimeout)
 	err := wsjson.Write(wctx, st.conn, env)
 	cancel()
 	if err != nil {
