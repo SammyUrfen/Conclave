@@ -302,7 +302,7 @@ agree is *more* code than one implementation, and it only catches drift on the c
 enumerates — which is exactly the wrong shape for a matcher whose dangerous inputs are the
 ones nobody thought of.
 
-**Two duplications ruled on separately, because their natures differ (§15.11).** WI-5 hit
+**Two duplications ruled on separately, because their natures differ (§15.10).** WI-5 hit
 both and correctly declined to resolve either unilaterally:
 
 - **`RebuildWindow` — MOVED.** Declared in `arbiter`, consumed only by `coordinator`, and
@@ -329,7 +329,7 @@ The two get different answers because one has a natural home and the other does 
 somewhere shared" is right only when a *correct* shared home exists; otherwise it manufactures
 a worse coupling than the duplication it removes.
 
-**`DemoControl.Evict` lives in `cmd/server` — CONFIRMED (§15.11).** It is not implementable in
+**`DemoControl.Evict` lives in `cmd/server` — CONFIRMED (§15.10).** It is not implementable in
 `arbiter` (evicting a peer means closing a socket, which needs `signaling`). `DemoControl` is
 a consumer-defined interface in `dashboard`, and `cmd/server` is the only place holding both
 the `*Hub` and the `*Arbiter`. That is the seam pattern working as designed, not a gap:
@@ -560,7 +560,7 @@ still *become* a relay for later newcomers — which is the behaviour we want.
 | 0b | **Impairment filter (SOFT) — the ONLY place impairment is expressed.** Let **`healthyAvailable`** = "at least one candidate surviving rank 0 has `!Impaired`". If `healthyAvailable`, every `p.Impaired` candidate is excluded. If not, impaired candidates are **re-admitted** — degradation is a preference, disconnection is not, and a degraded parent beats no parent. Implement as two passes over the same candidate set, not as a score.<br><br>**This one rank produces BOTH impairment consequences, and both must be understood as coming from here.** (1) An impaired node takes no NEW children. (2) An impaired node **loses the children it has** — because eliminating it from the candidate set means its own incumbents cannot re-select it at rank 1. Consequence (2) is the mechanism by which a fired dwell timer becomes an actual re-parent, i.e. it is the entire answer to C8. | eliminate (soft) |
 | 1 | **Incumbency.** If `prev.ParentOf(u) == P` and `P` survived ranks 0 and 0b, then **`P` wins** — unless some surviving candidate `q` satisfies `rtt(u,q) + c.StickinessMs < rtt(u,P)`. Only a *materially* closer parent breaks incumbency; a merely-less-loaded or alphabetically-earlier parent never does. **Rank 1 carries no impairment clause of its own** — it does not need one, and specifying a no-op step would be worse than silence. See §3.4a. | prefer |
 
-### 3.4a The impaired-incumbent invariant (RULING — §15.12)
+### 3.4a The impaired-incumbent invariant (RULING — §15.11)
 
 v2.2 expressed impairment in **two** ranks: 0b filtered impaired candidates, and rank 1
 carried a matching `!Impaired` void, coupled to the same `healthyAvailable` flag. WI-1 then
@@ -574,7 +574,7 @@ the honest reading is that it applies here, with one real difference: this claus
 to becoming live (weaken 0b from an elimination to a preference and it is load-bearing
 immediately), whereas C8's dwell had none.
 
-**RULING (§15.12): neither keep-and-document nor delete-and-note. Delete the clause, and
+**RULING (§15.11): neither keep-and-document nor delete-and-note. Delete the clause, and
 promote what it stood for into a named, TESTED invariant.**
 
 > **IMPAIRED-INCUMBENT INVARIANT (frozen).** If `prev.ParentOf(u) == P`, `P.Impaired`, and at
@@ -1430,7 +1430,7 @@ package metrics
 //	// is conservatively treated as unwilling rather than silently elected.
 //	Coordinatable bool `json:"coordinatable"`
 //
-// SHAPE CONFIRMED (§15.11). The field had not landed when WI-5 built, so `arbiter` reads the
+// SHAPE CONFIRMED (§15.10). The field had not landed when WI-5 built, so `arbiter` reads the
 // raw `coordinatable` key alongside Report. That interim decode is CORRECT and must be
 // replaced by the typed field once WI-0b lands.
 //
@@ -2300,7 +2300,7 @@ func (a *Arbiter) Metrics(roomID, peerID string, payload []byte)
 // /api/meets LIST endpoint (§9.3). v1 referenced a dashboard.Meet that was never defined
 // and would have inverted the import; this is that type, owned by its producer.
 //
-// PROVENANCE (ruling, §15.11). Every topology-shaped field here is REALIZED — derived from
+// PROVENANCE (ruling, §15.10). Every topology-shaped field here is REALIZED — derived from
 // peers' heartbeats, i.e. what the fleet actually did — never from the coordinator's
 // intent, which the arbiter cannot see (it may not import coordinator). That is the right
 // choice for a summary: it is ground truth, and it is what answers "is this meeting
@@ -2338,7 +2338,7 @@ type EndedMeet struct {
 }
 
 // Sentinel errors. They exist so cmd/server can map failures to the frozen dashboard error
-// codes in §9.4a with errors.Is, rather than matching on message text. RATIFIED (§15.11);
+// codes in §9.4a with errors.Is, rather than matching on message text. RATIFIED (§15.10);
 // the mapping is 1:1 and is part of the contract.
 //
 //	ErrMeetNotFound  -> "meet_not_found"   404
@@ -2428,7 +2428,7 @@ the formula is real; the inputs are not yet.** Do not claim otherwise in a demo.
 | **Manual** | `POST /api/demo/meets/{id}/elect` (demo surface only, §9.6). | immediate |
 | **Vacate** | The coordinator is lost or demoted and NO eligible candidate exists. Announce `ReasonVacated` at a bumped epoch (§6.8). | immediate |
 
-**PRECEDENCE when demotion and promotion both apply: DEMOTION wins (RATIFIED, §15.11).**
+**PRECEDENCE when demotion and promotion both apply: DEMOTION wins (RATIFIED, §15.10).**
 WI-5 chose this and it is right. The two produce the same *action* — replace the incumbent —
 but a different `Reason`, and `Reason` is operator-facing. Demotion states an **absolute**
 fact ("the incumbent fell below the floor"), promotion a **relative** one ("someone is much
@@ -2457,7 +2457,7 @@ const DemoteBelowScore = 0.35
 
 // MinTermDuration is the hard floor on how often the role may move voluntarily.
 //
-// SCOPE (CORRECTED, §15.11): it gates only transitions that COULD FLAP — i.e. voluntary
+// SCOPE (CORRECTED, §15.10): it gates only transitions that COULD FLAP — i.e. voluntary
 // promotion or demotion BETWEEN PEERS. It does NOT gate:
 //   - the failure path: a dead coordinator is replaced instantly, always;
 //   - the -coordinate bootstrap handover from the ARBITER to the first fit peer.
@@ -2473,7 +2473,7 @@ const DemoteBelowScore = 0.35
 // than invisible (a hundred handovers a second).
 const MinTermDuration = 60 * time.Second
 
-// MOVED TO metrics (ruling, §15.11): metrics.RebuildWindow. It is declared in arbiter but
+// MOVED TO metrics (ruling, §15.10): metrics.RebuildWindow. It is declared in arbiter but
 // consumed only by coordinator, and coordinator -> arbiter is forbidden — so leaving it here
 // forces WI-6 to declare a second copy with nothing enforcing agreement. metrics is the
 // correct home rather than a new one: RebuildWindow is literally "how long until every peer
@@ -2517,7 +2517,7 @@ type Announcement struct {
 	CoordinatorID  string `json:"coordinator_id"`   // server-assigned peer id, or signaling.ServerID
 	Prev           string `json:"prev,omitempty"`   // the outgoing coordinator's name
 	Reason         Reason `json:"reason"`
-	// IssuedAt is a time.Time carried as RFC3339 (RATIFIED, §15.11 — v2 froze an
+	// IssuedAt is a time.Time carried as RFC3339 (RATIFIED, §15.10 — v2 froze an
 	// IssuedAtUnixMs int64 and the implementer's choice is better). The *_unix_ms
 	// convention in §9.4a is scoped to DASHBOARD bodies, which are consumed by JavaScript;
 	// this is a Go-to-Go signaling payload where time.Time is the idiomatic type, and the
@@ -2703,7 +2703,7 @@ Not by timing, not by a lock ordering, not by a heuristic.
   Mitigation: on `GoneAfter` of silence *from the arbiter*, a coordinator peer stops its
   own control loop (`Yield`) rather than shouting into the void. Frozen as behaviour.
 
-### 6.8 Announcement repair, and vacancy (RULING — §15.11)
+### 6.8 Announcement repair, and vacancy (RULING — §15.10)
 
 **C6 through packet loss.** §8 routing rule 5 repairs a mis-fenced peer by re-broadcasting on
 every membership change. WI-5 correctly observed that this leaves a hole of the same
@@ -2785,7 +2785,7 @@ The epoch bump is correct here even though no term begins: the epoch is a fencin
 a term counter, and the thing being fenced is the old coordinator. Epochs are a free-running
 `uint64` minted by a single writer; spending one is free.
 
-### 6.9 Meet lifecycle — the DoS bound (RULING — §15.11)
+### 6.9 Meet lifecycle — the DoS bound (RULING — §15.10)
 
 `POST /api/meets` is the **only unauthenticated write surface in the system**, and v2 gave it
 `MaxMeets` with no way for a meet to ever leave the map. That is not a bound; it is a
@@ -3702,7 +3702,7 @@ it: `arbiter.Meet` promised `Rev`/`Relays`/`Depth`, but the arbiter has no topol
 not import `coordinator`, so it derives them from **realized heartbeats** instead. That is a
 different number wearing the same name.
 
-**RULING (§15.11): every topology-shaped number the dashboard shows is labelled by
+**RULING (§15.10): every topology-shaped number the dashboard shows is labelled by
 provenance at the schema level, and the two sources are served by different endpoints.**
 
 | | **REALIZED** | **INTENDED** |
@@ -4478,7 +4478,7 @@ necessary but insufficient: `GoneAfter` depends on a cadence each *peer* declare
 per-node threshold: `max(metrics.GoneAfter(declared), Config.SocketDetection)`, with
 `SocketDetection` wired from `hub.LivenessBudget()`. New `coordinator.Config.SocketDetection`.
 
-### 15.11 v2.3 — WI-5 (`arbiter`) rulings
+### 15.10 v2.3 — WI-5 (`arbiter`) rulings
 
 | # | Finding | Ruling | § |
 |---|---|---|---|
@@ -4496,7 +4496,7 @@ per-node threshold: `max(metrics.GoneAfter(declared), Config.SocketDetection)`, 
 | 4c-iii | Demotion vs promotion precedence. | **Ratified: demotion.** Same action, different `Reason`; `Reason` is operator-facing, and the absolute fact ("below the floor") outranks the relative one ("someone is better"). | 6.2 |
 | 4e | `Sync`, 5 error values, `MeetIDPattern`, `DefaultArbiterID`, `Announcement.IssuedAt`. | **Ratified**, with two conditions: `MeetIDPattern` is **interim** and is deleted for `policy.ValidMeetID` when WI-0b lands; `DefaultArbiterID` is a fallback only. Error sentinels frozen as a 1:1 map to §9.4a's `code` set. `IssuedAt time.Time`/`issued_at` **supersedes** v2's `IssuedAtUnixMs` — the `*_unix_ms` convention is scoped to dashboard bodies, and this is a Go-to-Go signaling payload. | 6.1 |
 
-### 15.12 v2.3 — the impaired-incumbent void (RULING (c))
+### 15.11 v2.3 — the impaired-incumbent void (RULING (c))
 
 WI-1 disclosed that rank 1's `!Impaired` void, added in v2.2, is **redundant by
 construction**: under the coupling rule, whenever it could fire `healthyAvailable` is true, so
@@ -4525,7 +4525,7 @@ reproduces the all-impaired reshuffle (**two** nodes moving, not one), and harde
 unconditional filter fails with `cannot attach … every candidate was filtered out`. Only the
 second expression of it, in rank 1, is removed.
 
-### 15.13 Where I think a reviewer is wrong
+### 15.12 Where I think a reviewer is wrong
 
 - **"`Supersedes` should be deleted."** Not taken. It is genuinely needed for *ordering* —
   the coordinator sequencing its own trees, the dashboard detecting a stale snapshot. The
