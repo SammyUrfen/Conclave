@@ -252,9 +252,34 @@ func (c *Coordinator) settling(rs *roomState, waiting []string, reason string) {
 		Waiting: waiting, Reason: reason})
 }
 
-// sortedPeerIDs gives the room's members a deterministic iteration order. Never a
-// map range: the projection order feeds PickRoot's tie-break and BuildTree's, so map
-// iteration would make the tree depend on Go's hash seed.
+// sortedPeerIDs gives the room's members a deterministic iteration order. Never a map
+// range.
+//
+// CORRECTED, and worth reading before anyone decides this sort is redundant. An earlier
+// version of this comment claimed the order "feeds PickRoot's tie-break and BuildTree's".
+// That is FALSE, and a mutation sweep proved it: overlay.PickRoot computes a maximum
+// under a total order (upload descending, then name), and overlay.processingOrder
+// re-sorts newcomers by the same total order, so BuildTree's output is invariant to the
+// input slice order — GIVEN UNIQUE NAMES. Justifying a sort with a dependency that does
+// not exist is how the next person deletes it.
+//
+// It is still load-bearing, for three real reasons:
+//
+//  1. THE UNIQUE-NAME PROVISO IS ESTABLISHED HERE. project keeps the FIRST record for a
+//     colliding name and drops the rest, so this order decides WHICH peer's telemetry
+//     survives — and with it whether a tree exists at all, since two sockets claiming
+//     one name can advertise wildly different capacities.
+//  2. The fan-out in publishTree follows it, and push order is part of a replayable
+//     trace.
+//  3. realParentOf resolves a name back to a record the same way, so it inherits (1).
+//
+// And it is defence beyond those: this package should not depend on an order-invariance
+// property of overlay that nothing in overlay asserts. Sorting costs nothing at this
+// scale and removes the coupling entirely.
+//
+// Not every caller needs it — unheard and snapshotOf re-sort their own output — but
+// they are cheap to serve from one ordered helper, and having exactly one way to iterate
+// members is worth more than skipping a sort of five strings.
 func (c *Coordinator) sortedPeerIDs(rs *roomState) []string {
 	ids := make([]string, 0, len(rs.nodes))
 	for id := range rs.nodes {
