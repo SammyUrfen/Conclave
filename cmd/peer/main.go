@@ -649,6 +649,15 @@ func (p *peerPlane) selfReport(rep metrics.Report) { p.postSelf(signaling.TypeMe
 
 func (p *peerPlane) selfBeat(hb metrics.Heartbeat) { p.postSelf(signaling.TypeHeartbeat, hb) }
 
+// selfReparented closes the same hole for the third forwarded frame type. A
+// coordinator peer is a peer in the tree like any other: it can lose its own parent
+// and promote its own backup, and §8 rule 2 skips coordID == peerID for reparented
+// exactly as it does for metrics and heartbeats — so without this the one node whose
+// job is to RATIFY a self-promotion is the one node that never hears about its own.
+func (p *peerPlane) selfReparented(rep metrics.Reparented) {
+	p.postSelf(signaling.TypeReparented, rep)
+}
+
 // postSelf queues one locally-originated frame as if the server had delivered it.
 func (p *peerPlane) postSelf(kind signaling.Type, body any) {
 	id := p.selfID()
@@ -1087,17 +1096,6 @@ func runCall(ctx context.Context, logger *slog.Logger, cfg callConfig) error {
 	defer callCancel()
 	var wg sync.WaitGroup
 
-	// The peer reports its OWN backup promotions so the coordinator can ratify them
-	// (or, when OK is false, repair a stranded peer urgently). Queued rather than
-	// sent inline: media invokes the callback from its Run goroutine.
-	reparents := newReparentSender(logger, func(rep metrics.Reparented) error {
-		msg, err := controlFrame(signaling.TypeReparented, rep)
-		if err != nil {
-			return err
-		}
-		return client.Send(msg)
-	})
-
 	// plane hosts the coordinator if the arbiter elects this peer. It is built for
 	// every managed peer and stays idle until then: an election can arrive at any
 	// moment, and constructing the queue lazily would mean dropping the frames that
@@ -1106,6 +1104,22 @@ func runCall(ctx context.Context, logger *slog.Logger, cfg callConfig) error {
 	if cfg.managed {
 		plane = newPeerPlane(logger, cfg.room, cfg.name, clk, client.Send)
 	}
+
+	// The peer reports its OWN backup promotions so the coordinator can ratify them
+	// (or, when OK is false, repair a stranded peer urgently). Queued rather than
+	// sent inline: media invokes the callback from its Run goroutine.
+	reparents := newReparentSender(logger, func(rep metrics.Reparented) error {
+		// Tee, for the same reason as the report and the beat below: the server will
+		// not forward this peer's own frames back to it.
+		if plane != nil {
+			plane.selfReparented(rep)
+		}
+		msg, err := controlFrame(signaling.TypeReparented, rep)
+		if err != nil {
+			return err
+		}
+		return client.Send(msg)
+	})
 
 	// router is captured by the callbacks below before it exists. That is safe, not a
 	// race: NewRouter returns on this goroutine before Run is called on it, and
