@@ -80,6 +80,37 @@ Each phase is a **runnable milestone**. Build order below. Each ships with:
 
 It is **completely fine to stop after Phase 3 or 4.** A working "elected peer SFU with a metrics-driven graph builder and a simulation harness" is already an impressive, unusual portfolio piece. Phases 5–7 are where the difficulty (and the interview stories) really live, but they are optional.
 
+### Status
+
+| Phase | Title | Status |
+|------:|-------|--------|
+| 0 | Repo bootstrap & Go foundations | ✅ done |
+| 1 | Signaling + 2-peer WebRTC call | ✅ done |
+| 2 | Full mesh to ~4 peers (feel the ceiling) | ✅ done |
+| 3 | Static relay tree — the peer SFU ⭐ | ✅ done |
+| 4 | Metrics plane + coordinator computes the tree | ✅ done |
+| 5 | Join/leave handover + backup parents | ✅ done |
+| 6 | Coordinator election + migration | ✅ done |
+| 7 | Simulcast/SVC, TURN fallback, polish & demo | ⬜ **not built** |
+
+**Phase 7's scope moved, and only partly.** The *observability* task ("a small `/debug`
+dashboard … showing the live graph, per-node upload, coordinator identity/epoch, and
+failover events") was **brought forward into Phases 5–6 and reshaped**: it shipped not as
+a `/debug` page rendered by the server but as the arbiter's **`/api` REST + WebSocket
+surface** (`internal/dashboard`) read by a **separate zero-build static frontend** (`web/`)
+published to GitHub Pages (`.github/workflows/pages.yml`), with container/TLS recipes in
+`deploy/`. Splitting them was deliberate: the frontend is not a Go concern, and a page
+served by the arbiter would have to be rebuilt and redeployed with it.
+
+**The rest of Phase 7 was NOT built.** There is no simulcast, no SVC, and no TURN/coturn
+infrastructure. A relay forwards one quality layer to every downstream, and
+`overlay.NATRelayed` is a *modelled* constraint declared by the peer's `-nat turn` flag,
+not a measured NAT classification. Nothing in the repository probes bandwidth, RTT, loss,
+or CPU either — see the limitation box under Phase 6.
+
+The single-doc synthesis of what actually shipped, including every trade-off with its
+rejected alternative, is **[`DESIGN.md`](./DESIGN.md)**.
+
 ---
 
 ## Phase 0 — Repo bootstrap & Go foundations
@@ -213,7 +244,7 @@ It is **completely fine to stop after Phase 3 or 4.** A working "elected peer SF
 
 ---
 
-## Phase 5 — Join/leave handover with backup parents (the churn problem)
+## Phase 5 — Join/leave handover with backup parents (the churn problem) — ✅ done
 
 **Goal / risk retired:** the graph survives peers coming and going *without* everyone's stream freezing. Fast failover.
 
@@ -233,9 +264,19 @@ It is **completely fine to stop after Phase 3 or 4.** A working "elected peer SF
 
 **Where you'll get stuck:** distinguishing transient blips from real failures without either flapping or reacting too slowly; making reconfiguration idempotent so a late/duplicate instruction doesn't corrupt the graph.
 
+### ✅ What shipped
+
+- **Backup parents.** `overlay.assignBackups` computes a warm secondary parent per node under the invariant `B ∉ Subtree(ParentOf(u))` (which also rules out the sibling trap the weaker rule allows) and a hard fan-in cap, `BackupOvershootAllowance = 1`. Backup capacity is *not* reserved; the cap is what makes "a relay may serve at most one child over capacity at the instant of a failover" literally true. The root's direct children get **no** backup by construction — losing the root re-roots the whole subnet.
+- **Peer-local failover, no coordinator round trip.** A child that sees its parent's `PeerConnection` reach `failed` — or sit `disconnected` for `ParentDisconnectGrace = 2s` — promotes its precomputed backup itself. It is **make-before-break** (the old parent stays open and receiving until the new one carries media) and asynchronous: `internal/media/reparent.go` is a state machine over an internal channel, because waiting for `Connected` on the goroutine that also routes the offer/answer would time out every time. `OK: true` requires **media**, not just ICE.
+- **RTP continuity across the switch.** `TrackLocalStaticRTP` passes sequence and timestamp through untouched, so a second upstream on the same leg reads to pion's NACK/jitter interceptors as catastrophic loss. `internal/media/rewrite.go` holds a per-leg `(sequence, timestamp)` offset recomputed only at a `Switch()`, and drops packets until a VP8 keyframe lands.
+- **Diff-and-apply replaced Phase 4's additive apply.** `diffTopology` is a pure diff of *(self, wanted tree, current reality)* — the baseline is **reality**, so a partially realized state converges. Seven buckets applied in a fixed order, legs added before removed. Three things force a full session re-create: the offerer role inverted, *our* relay-ness changed, and the *peer's* relay-ness changed.
+- **Hysteresis.** Three health states (`healthy → degraded → gone`), thresholds derived from the cadence the *peer declares* (`Heartbeat.IntervalMs`) rather than a server constant, floored at the socket-detection window; a `DegradationDwell`; a `RecomputeCooldown`; and a `JoinSettle` that re-arms on every join. A `gone` node is never deleted — a later frame **resurrects** it, because the frame arriving is itself proof the socket is live.
+- **Local repair without a bespoke repair function.** Stickiness (rank 1 of the builder's comparator) makes local repair fall out of the general `BuildTree`: survivors keep their incumbent parent, so only orphans move. One algorithm, one oracle.
+- **Honest consequence, recorded rather than patched:** a stability-preserving builder is **path-dependent by construction**. Over 120 first-report permutations of one fleet the code converges to **9 distinct valid trees with an identical root**. The equality property the contract originally asserted is false and was replaced by three that are true — legality, a churn-bounded edge delta, and determinism given the same event *sequence*. See `DESIGN.md` §5.2.
+
 ---
 
-## Phase 6 — Coordinator election + migration (server as arbiter)
+## Phase 6 — Coordinator election + migration (server as arbiter) — ✅ done
 
 **Goal / risk retired:** the control plane itself survives its owner leaving or weakening. This is the **hardest** part — the coordinator holds authoritative state and now that role must move.
 
@@ -255,9 +296,56 @@ It is **completely fine to stop after Phase 3 or 4.** A working "elected peer SF
 
 **Where you'll get stuck:** this is *the* budget-eater. The ambiguity window (two would-be coordinators), making handover atomic-enough, and testing all the interleavings. Lean hard on `simnet` and deterministic replay.
 
+### ✅ What shipped
+
+- **`internal/arbiter` is the single writer of the epoch.** `ms.epoch++` appears in exactly one place. Its `Run` loop has *no timer at all* — every action it can take needs a live peer, and a live peer is by definition heartbeating — and reads go through a closure executed on that goroutine, which is why no field in the package needs a mutex.
+- **Two counters, two writers.** `Epoch` is the arbiter-minted coordinator *term*; `Rev` is the sitting coordinator's revision within it, resetting to 0 when the epoch advances. This is Raft's `(term, index)` split for the same reason: one counter cannot fence a handover *and* order one coordinator's trees without letting a writer forge the other's authority.
+- **Authorization and ordering are separate functions.** `Topology.Supersedes` answers "which is more recent" and is **never** on the peer's apply path. `overlay.Fence.Accept(from, topo)` answers "may I apply this" and requires `t.Epoch == f.Epoch` — **exact match; a higher epoch is rejected**, because a peer may learn who is in charge only from the arbiter. The zero `Fence` obeys nobody. `AdoptAnnouncement` is the only method that may raise the epoch. (The contract's mandate that `Supersedes` be "the ONE place the fencing comparison is written" was a privilege-escalation bug in the *specification*: as literally written, a peer stamping `MaxUint64−1` on a self-computed tree would have been universally obeyed.)
+- **State handover is rebuild-from-peers, and only that** — see §8 of `ARCHITECTURE.md` for the decision and its rejected alternative.
+- **Three failure modes around the handover, each closed.** A lost announcement is repaired by a verbatim, unicast, uncapped re-announce on any heartbeat whose epoch lags (the condition is indefinite, so the repair must be). A demoted-but-live coordinator is cancelled by the same repair; a *partitioned* one stops its own loop after `GoneAfter` of arbiter silence. No eligible successor ⇒ the arbiter announces a **vacancy at a bumped epoch** and retains the role — the epoch is a fencing token, not a term counter, and bumping is the only way to tell a live-but-demoted coordinator to stop.
+- **The observability surface** (`internal/dashboard` + `web/`) landed here rather than in Phase 7, because a handover you cannot watch is a handover you cannot demo. It is read-mostly and eventually consistent, and it labels **realized** (reconstructed from heartbeats) versus **intended** (the coordinator's last published tree) rather than averaging them — they genuinely disagree during convergence, and that gap is diagnostic.
+
+> ### ⚠️ What Phase 6 does NOT demonstrate live
+>
+> `metrics.Report`'s `CPUPct`, `LossPct` and `RTTServerMs` are **never populated anywhere
+> in production code** — `cmd/peer.sampleReport` fills in only `Name`, `UploadKbps`, `NAT`
+> and `Coordinatable`, all from flags. There is no CPU sampler, no loss counter, and no
+> RTT probe.
+>
+> The consequence is not cosmetic. With those three terms structurally zero, every
+> eligible peer scores between **0.85 and 1.0** in `arbiter.Score` (the only varying term
+> is uptime, worth at most 0.15). So `DemoteBelowScore = 0.35` can never be crossed and
+> `PromoteMarginScore = 0.20` can never be met:
+>
+> **Voluntary promotion and demotion are unreachable in production. Live, the election
+> reduces to bootstrap (a meet with members and no coordinator) and failover (the
+> incumbent is not live), tie-broken by uptime then name.**
+>
+> The same gap makes the degradation machinery inert live — the dwell arms only on
+> `LossPct ≥ 5`, `RTTServerMs ≥ 400` or `CPUPct ≥ 90` — and leaves `BuildTree`'s
+> min-latency rank with no data, so attachment falls through to fewest-children then name.
+> All of it is real, and all of it is exercised **only in `simnet`**, where the values are
+> injected. This is a limitation of what the phase demonstrates, not a bug. Do not demo it
+> as "elects the fittest machine"; it elects on the inputs it has. (`DESIGN.md` §8.1.)
+
 ---
 
-## Phase 7 — Simulcast/SVC, TURN fallback, polish & demo
+## Phase 7 — Simulcast/SVC, TURN fallback, polish & demo — ⬜ not built
+
+> **Read this before the task list below.** One of the four tasks — observability — was
+> pulled forward into Phases 5–6 and reshaped; the other three were not started. Stated
+> plainly:
+>
+> | Phase 7 task | Status |
+> |---|---|
+> | Simulcast / SVC (multi-layer send, per-downstream layer selection) | **not built.** A relay forwards one layer to every downstream. |
+> | Adaptive per-edge layer selection under congestion | **not built.** Depends on simulcast. |
+> | TURN via coturn; detect symmetric NAT and force those peers to leaves | **not built.** `overlay.NATRelayed` exists and is honoured by the builder, but it is a *declared* constraint (`peer -nat turn`), not a detection. No coturn, no TURN credentials in `ICEServers`. |
+> | Observability: a `/debug` dashboard showing the live graph, coordinator identity/epoch, and failover events | **shipped in Phases 5–6, in a different shape** — the arbiter's `/api` REST + WS surface (`internal/dashboard`) plus a separate zero-build static frontend (`web/`) on GitHub Pages, with `deploy/` recipes for `wss://`. Not a server-rendered `/debug` page. |
+> | Demo script (join to 6, kill a relay, kill the coordinator, watch recovery) | **not built** as a script. The behaviours are covered by the automated suite; a live multi-process run of Phases 5–6 has not been recorded (`DESIGN.md` §9.5). |
+>
+> The remaining text is the original plan, kept as the plan.
+
 
 **Goal / risk retired:** address the real scarce resource (upload) and the real network (NAT), then make it demoable.
 

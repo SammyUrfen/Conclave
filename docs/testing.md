@@ -1,27 +1,25 @@
-docs/testing.md
-
 # Testing
 
-> Living doc — kept in sync with the code. Reflects the tree at the end of Phase 4 (coordinator computes the tree + the `simnet` deterministic harness).
+> Living doc — kept in sync with the code. Reflects the tree at **Phase 6 complete**.
+> The strategy narrative also lives in [`DESIGN.md`](./DESIGN.md) §6; this file is the
+> operational version — what to run, how the harness works, and what the coverage
+> honestly does and does not prove.
 
-How conclave is tested, why it's tested that way, and where the coverage honestly stops today. This is also a Go-testing primer: the two tests that exist are the reference implementations of the idiom you'll copy for the rest of the project.
+**The shape of the problem.** Two thirds of the Go in this repository is test code:
+**22,751 test lines against 17,505 non-test lines**, 372 test functions and 297 `t.Run`
+subtests across 69 files. That ratio is not diligence for its own sake. A system whose
+defining behaviours are *temporal* (hysteresis, dwells, timeouts), *concurrent* (one
+control loop, many peer goroutines, pion's own dispatch goroutines) and *distributed* (a
+fence, a handover, an ambiguity window) has almost no behaviour a straightforward unit
+test can reach. Four techniques do the reaching, and the rest of this document is those
+four.
 
----
-
-## Philosophy
-
-**Prefer pure functions; push side effects to the edges.** A pure function's output depends only on its inputs — no I/O, no globals, no clock, no network. That makes it *trivially* testable: feed it a value, assert on the return. The two things worth testing in Phase 0 are pure by design, and that is not an accident:
-
-| Function | Package | Why it's pure |
+| Technique | What it makes testable | Where |
 |---|---|---|
-| `ParseLevel(s string) (slog.Level, error)` | `internal/logging` | `string` in, `(level, error)` out. No reads, no writes. |
-| `healthURLFor(server string) (string, error)` | `cmd/peer` | URL normalization only. The actual HTTP request lives elsewhere. |
-
-Everything that *can't* be pure — opening a socket, reading `os.Stdin`, exiting the process — is deliberately shoved to the program's edge. `main()` is a three-line `run(os.Args[1:]) error` hop precisely so that the logic under it never has to touch `os.Exit`. `logging.New` takes an `io.Writer` instead of hard-coding `os.Stdout`, so a test can point it at a `bytes.Buffer`. The logger is constructed once and injected downward; nothing reads a global. This is the same discipline as separating orchestration from mechanism — the mechanism stays testable, the orchestration stays thin.
-
-This matters more, not less, as the project grows. The overlay `BuildTree` (Phase 4, done) and the Phase 6 election logic are the crown jewels, and they are the *hardest* things to test if they're entangled with pion, cameras, and real sockets. Phase 4 made good on the plan: `overlay` is pure (graph + policy in, tree + decisions out), so `BuildTree`/`Validate` are unit-tested in microseconds and the `simnet` harness drives them under hundreds of seeded fleets and long churn scenarios — **with zero media stack**. The same purity is the foundation the Phase 5–6 logic will be built and tested on.
-
-**Priority order** (the owner's, applied to tests): Correctness > Reliability > UX > Maintainability > Performance. A test exists to catch a *correctness* regression first. We do not write tests for coverage theater, and we do not claim "done" without running them — `make check` is the gate.
+| **The injected clock** (`internal/clock` + `simnet.VirtualClock`) | Every dwell, timeout and cadence, in microseconds of virtual time | all four control-plane packages |
+| **Independent oracles** (`overlay.Validate`, `overlay.ValidateLocalRepair`) | "Is this tree legal?" and "was this change minimal?" without re-deriving the expected tree | asserted from `overlay`, `coordinator` and `simnet` |
+| **Deterministic simulation** (`internal/simnet`) | Whole churn and handover scenarios as a pure function of a seed and an event *sequence* | `simnet`, and `coordinator`'s external tests |
+| **Mutation discipline** | Tests that are green *for the right reason* | a convention, recorded in comments |
 
 ---
 
@@ -29,171 +27,496 @@ This matters more, not less, as the project grows. The overlay `BuildTree` (Phas
 
 | Command | What it does |
 |---|---|
-| `go test ./...` | Run every test in every package. Fast inner loop. |
-| `make test` | `go test -race ./...` — the same, **plus the race detector**. |
-| `go test -run TestParseLevel ./internal/logging` | Run one test (or a regexp of tests) in one package. |
-| `go test -run 'TestParseLevel/mixed' ./internal/logging` | Run one **subtest**. `/` separates test from subtest; spaces in a subtest name become `_`. |
-| `go test -v ./...` | Verbose: print every test and subtest name as it runs (`--- PASS: TestParseLevel/warning_alias`). |
-| `make cover` | `go test -coverprofile=coverage.out` then `go tool cover -func` — a per-function coverage report in the terminal. |
-| `make check` | `fmt` + `vet` + `test`. The pre-commit gate. |
+| `make check` | `fmt` + `vet` + `check-determinism` + `go test -race ./...`. **This is the gate — the project's definition of green.** |
+| `make test` | `go test -race ./...` |
+| `make check-determinism` | Fails the build if a control-plane package reaches for the wall clock. Silent on success. |
+| `make cover` | Coverage profile + a per-function report |
+| `go test ./internal/overlay` | One package, fast inner loop |
+| `go test -run 'TestValidateCatches/depth' ./internal/overlay` | One subtest (`/` separates test from subtest; spaces become `_`) |
+| `go test -v ./internal/simnet` | Names every test and subtest as it runs |
 
-### Why `-race` matters, and why `make test` is the real command
+CI (`.github/workflows/ci.yml`) runs **the same four commands, spelled out** rather than
+delegated to `make check`, so a red job names which one failed in its own step title — and
+so that if CI and `make check` ever disagree about what green means, the definition of done
+has quietly moved. It adds `-count=1` to defeat the test cache and a final `make build`.
 
-conclave is a concurrency project. Even Phase 0 already has a goroutine running `ListenAndServe` and handing its error back over a buffered channel, and from Phase 1 on there will be goroutines per peer connection, per websocket, and per metrics stream. The race detector instruments memory accesses at runtime and reports any two goroutines touching the same location without synchronization, where at least one is a write. It finds the bugs that pass every time on your machine and then corrupt state in the demo.
+### `-race` is not optional here, and one test needs it
 
-Two things to know:
+The control planes are single-goroutine *by design*, and the whole safety argument rests on
+that being true — so a data race in this codebase is a design violation, not merely a bug.
+`-race` also needs a C toolchain (it links ThreadSanitizer through cgo); see
+[`setup.md`](./setup.md).
 
-- **It needs a C compiler.** `-race` links a C runtime (TSan). `gcc` is present on this box, so `make test` works. On a machine without a C toolchain, `-race` fails to build; plain `go test ./...` still runs.
-- **It only catches races that actually execute.** It is a *dynamic* detector, not a proof. A race on a code path no test exercises is invisible. That is one more reason the simnet harness (below) — which can drive thousands of scheduled interleavings deterministically — is on the roadmap: it turns "a race that happens 1-in-10000 in the wild" into "a race the harness reproduces on every run with the same seed."
+> **A real, reproducible quirk, recorded because it will otherwise waste an afternoon.**
+> `go test -race ./...` is **fully green**. Plain `go test ./...` (no `-race`) on this
+> machine **reproducibly fails one test**: `TestPionRemoveTrackDoesNotRenegotiate` in
+> `internal/media`, at `pionbehavior_test.go:85`, 5 failures out of 5 runs — while the same
+> test passes every time under `-race`.
+>
+> That test pins a *library* behaviour with a real-time window (`stableFor(…, 500ms, …)`:
+> pion must **not** fire negotiation-needed within half a second of a `RemoveTrack`).
+> Race instrumentation slows the binary enough to change which side of that window pion's
+> ops goroutine lands on. It is not version drift — `pion/webrtc/v4` is `v4.2.16`, exactly
+> the version the test's comment says the finding was measured against.
+>
+> **The honest claim is therefore narrow: the gate the project defines (`make check`, i.e.
+> `-race`) is green, and every control-plane package is deterministic under it. Do not
+> claim "the suite passes under any invocation."** And this is precisely the class of test
+> the determinism rules exist to keep *out* of the control plane: `internal/media` is
+> deliberately outside `check-determinism` because it runs real pion.
 
-Default to `make test`. Reach for bare `go test` only for a quick single-package loop.
-
-### Coverage
-
-`make cover` prints a function-by-function table. It measures *which lines ran*, which is a floor on confidence, not a ceiling — 100% line coverage of `ParseLevel` still wouldn't prove the error *message* is right. For a browsable HTML view, the stdlib tool does it directly (and `make clean` already knows to delete the output):
+### The wall-clock profile is the argument for the architecture
 
 ```
-go test -coverprofile=coverage.out ./...
-go tool cover -html=coverage.out -o coverage.html
+media 72.993s   ← real pion, real ICE, real DTLS on loopback
+cmd/peer 5.721s   arbiter 2.317s   simnet 1.949s   dashboard 1.703s
+coordinator 1.416s  signaling 1.267s  overlay 1.241s  metrics 1.189s
+clock 1.144s   cmd/server 1.057s   policy 1.037s   logging 1.019s
 ```
+
+Every deterministic control-plane package runs in 1–2 s because it runs on a virtual clock.
+The one package that must touch a real network takes 73 s of the ~93 s total. **That gap is
+the entire reason the control plane was kept pion-free.**
+
+---
+
+## 1. The clock seam and the virtual clock
+
+### `internal/clock` — the seam
+
+`clock.Clock` is `Now()`, `NewTimer(d) Timer`, `NewTicker(d) Ticker`, `After(d)`. Every
+component that measures or waits — `coordinator`, `arbiter`, `signaling`, `metrics`,
+`media`, `dashboard` — takes one on its config struct and defaults to `clock.System()` when
+nil. **Treat it like `*slog.Logger`: an ambient capability injected at construction, not a
+service seam.**
+
+Four alternatives were rejected, and they are the common ones:
+
+| Rejected | Why |
+|---|---|
+| A package-level `var now = time.Now` swapped in tests | A global. Two parallel tests swapping it race, and `-race` will not necessarily catch it. |
+| Carrying the clock on `context.Context` | `context.Value` for a *dependency* is a documented Go anti-pattern — untyped, invisible to the compiler, and it makes every function that might need time take a ctx it otherwise would not. |
+| Passing a clock to every call site | Churns dozens of signatures for a value that is fixed for the object's lifetime. |
+| A consumer-defined clock interface per package | Breaks on `NewTimer`'s **return type**: Go compares *named* types in return position, so `coordinator.Timer` does not satisfy an interface demanding `simnet.Timer` even if the two declarations are character-identical. One leaf package solves it once. (`Timer`/`Ticker` expose their channel through a `C()` **method** rather than `time.Timer`'s `C` **field**, because an interface can declare methods but not fields — which is why "just use `time.Timer`" is not available.) |
+
+### `simnet.VirtualClock` — replayable, not merely fake
+
+`NewVirtualClock(start)` satisfies `clock.Clock`; time moves only when `Advance`/`AdvanceTo`
+is called. `DefaultStart` is a literal date, never `time.Now()`. Three rules make it
+*replayable*:
+
+- **Total order `(deadline, seq)`.** A monotonic sequence number is stamped at `NewTimer`/`NewTicker` and **re-stamped on every `Reset` and every ticker re-arm**, so two timers due at the same virtual instant fire in most-recently-armed order — never in map order, which Go randomises. (There is deliberately no heap: the armed set is a map, and ranging it is legal *only* because the range selects a unique minimum under a total order rather than building an order out of the iteration.)
+- **One deadline per iteration.** `AdvanceTo` picks the single earliest due timer, sets `now` to *that deadline* rather than the target, fires it, runs the barrier, and re-examines the armed set. So a timer re-armed by an earlier handler — which is exactly what a dwell reset is — takes its position from virtual time, not from goroutine scheduling.
+- **Cap-1 channels, non-blocking send.** A test that has not drained a fired timer cannot deadlock `Advance`; it simply misses the tick, exactly like a real `time.Ticker`'s consumer.
+
+Guard rails follow one stated principle — *"a hanging test is strictly worse than a failing
+one: it yields no stack, no seed, and no clue"*: `maxFiresPerAdvance = 100_000` panics
+(a ten-minute virtual meet at a 1 Hz heartbeat is 600 fires, so the bound is generous);
+`Advance` panics on a negative duration and `AdvanceTo` on a rewind; `NewTicker(<=0)` panics,
+matching `time.NewTicker`. `Pending()` exists so a scenario can assert no control loop leaked
+a deadline.
+
+### `Settle` — the barrier that makes assertions safe
+
+Firing a timer is not enough: the goroutine that *receives* it has not necessarily finished
+reacting when `Advance` returns, so a naive assertion races. The fix exploits a property the
+codebase already has — **the coordinator is a single-goroutine event loop.** Round-tripping
+a no-op event through it proves every previously enqueued event has been fully processed,
+because the channel is FIFO with exactly one consumer.
+
+`VirtualClock.SetBarrier(fn)` is invoked *between* consecutive firings; `NewScenario` wires
+it to `Scenario.Settle`, which calls every registered barrier under a `SettleTimeout` (5 s)
+context deadline. In the real-coordinator scenarios the registered barrier **is
+`coordinator.Sync`**.
+
+The subtlety is the load-bearing part, and `AddBarrier` documents it:
+
+> A barrier is only sound if the loop it round-trips through **DRAINS ITS FIRED TIMERS
+> BEFORE ACKING**. A fire and a sync arriving at one parked `select` are resolved by Go's
+> uniform-random choice, so a loop that acks without draining can report quiescent while
+> the reaction the barrier exists to wait for has not happened.
+
+This is not hypothetical — it is a permanently-flaky-test generator, and the flake gets
+blamed on the harness. It is also why the coordinator multiplexes *every* deadline onto
+**one** timer: with a single wake channel, "a deadline is due" and "the wake channel holds a
+value" are the same statement, so draining one drains all, and the barrier is *provably*
+complete rather than complete-in-practice.
+
+### Why the harness itself does not trip the determinism gate
+
+`SettleTimeout = 5 * time.Second` is a **constant expression, not a call**, and `Settle` uses
+`context.WithTimeout(context.Background(), …)` rather than `time.After`. That is deliberate:
+the deadlock guard must run on *real* time (a virtual clock nobody is advancing would never
+expire it) without using any of the wall-clock entry points the gate bans.
+`internal/coordinator/harness_test.go` uses the identical shape (`const guard = 10 * time.Second`
++ `context.WithTimeout` around `Sync`) and says so.
+
+---
+
+## 2. The independent oracles
+
+**The tests never re-derive the expected tree.** That would just re-implement the heuristic
+and prove nothing — a mirror, not an oracle. The rule instead:
+
+> **Construct with one function, verify with an independent one.**
+
+### `overlay.Validate(t, nodes, c)` — is this tree legal?
+
+Re-derives everything from the tree itself and checks ten independent properties: `Epoch ≥ 1`
+and `Rev ≥ 1` (an unstamped tree is unpublishable), `Root` agrees with `Edges` *and* with the
+constraints, is-a-tree (single parent; exactly one parentless node), connectivity by BFS with
+`len(reached) == len(nodes)` (which rules out both cycles and shared children), depth ≤
+`MaxDepth`, topological edge order, degree ≤ capacity-derived-from-upload, TURN-bound nodes
+have no children, closed world, and the full backup legality set — including
+`B ∉ Subtree(ParentOf(node))` ("the backup must survive the failure it insures against"), no
+impaired backup ("insurance written against a degraded relay is not insurance"), the
+*promotion* depth bound (a promotion sinks the promoted node's whole subtree, so bounding the
+backup's own depth is not enough), and the fan-in cap.
+
+Every failure has its own message, all prefixed `validate:`, and each table case in
+`validate_test.go` names the substring it expects **so a case cannot pass by tripping a
+different check**.
+
+### `overlay.ValidateLocalRepair(prev, next, nodes, c, churn)` — was this change minimal?
+
+A **second, separate** oracle over *transitions*. "Was this change minimal?" is a property of
+a *pair* of trees, and folding it into `Validate` would force `Validate` to take a `prev` it
+does not otherwise want.
+
+A parent change `P → Q` is **justified** iff any of four rules holds: `P` is in `Churn.Gone`
+or absent from `next`; `u` is in `Churn.Promoted` — in the **strict form**, `Q` must *equal*
+`prev.BackupOf(u)` whenever that backup is still present and eligible; `P` became ineligible
+in `next` (TURN-bound, out of capacity, past `MaxDepth`, impaired); or the rank-1 rule
+`rtt(u,Q) + StickinessMs < rtt(u,P)`.
+
+Two preconditions are shouted in the source and are worth repeating because getting them
+wrong produced a *numerically wrong* test bound that survived two contract revisions:
+
+- **`prev` MUST be the last *published* tree — the tree peers were actually running — not the coordinator's patched working copy.** An oracle fed the patched copy asserts against the very belief it exists to check; and, decisively, **the published tree is the only artifact that still carries the `Backups` assignment the promotion must be checked against.** Against the patched copy, "did the promoted node land on the backup it was actually assigned?" is not merely weaker — it is impossible, because the patch overwrote the evidence.
+- The oracle takes `nodes` and `Constraints` because minimality is defined relative to the builder's preference ordering, and rank 2 of that ordering is RTT-aware. An oracle that cannot see RTT cannot evaluate rank 2 — that is not a weaker oracle, it is one answering a narrower question than it claims to.
+
+**And the limit it states about itself:** it checks a **necessary** condition, not a
+sufficient one. It asserts every move was *permitted* by the ordering; it does not assert the
+result was optimal, and it deliberately does **not** assert the converse (that a node which
+could have improved did move). Greedy makes no such promise — an eligible closer parent may
+have been filled by an earlier node — so asserting it would fail on correct output.
+
+Both oracles are asserted from `overlay`'s own tests, from `coordinator`'s tests against the
+real loop, and from `simnet`'s churn scenarios **after every rebuild**.
+`TestChurnBoundedEdgeDelta` runs seeds `{1, 7, 42, 1337, 20260901}` × 200 steps with both
+green at every step.
+
+---
+
+## 3. Deterministic simulation — and what it deliberately does not assert
+
+`internal/simnet` is a media-free harness that drives the **real** control plane over a
+virtual clock: the real `overlay.BuildTree`, the real `coordinator.Coordinator`, no sockets,
+no ICE, no codecs. It is the FoundationDB / TigerBeetle deterministic-simulation idea in
+miniature — *scoped to a learning project*, which is the honest framing.
+
+It states **two non-negotiable rules**: a scenario replays identically from a seed (enforced
+by the clock's firing order, the `Network`'s insertion-order iteration, `BuildTree`'s purity,
+and a single seeded `*rand.Rand`); and nothing in it reads the wall clock. Notably it does
+**not** import `testing` — it stays a plain library so the same harness could back a CLI
+replay tool.
+
+`Scenario` is a builder: `At(d, f)`, `Observe(f)`, `AddBarrier(name, fn)`, `ReportOrder(…)`,
+`Settle()`, `Run()`. The `Network` exposes failure injection as **separate verbs rather than
+one parameterised `Fault()`** — `Kill`, `Leave`, `Partition`, `Heal`, `Isolate`, `Rejoin`,
+`Degrade`, `Restore` — because the distinctions between a graceful leave, a vanished machine,
+a live-but-unreachable process and a merely degraded one are exactly what Phases 5 and 6 are
+about.
+
+> **What the harness deliberately does NOT assert**, in its own words: that the same fleet
+> always converges to the same tree — *and it cannot*, because stickiness makes `BuildTree`
+> a function of history, which is precisely the price paid for minimal-disruption rebuilds.
+> The two properties cannot both hold.
+
+An early contract asserted exactly that false property. A reviewer produced a counterexample
+and it is correct; the false equality was replaced by three properties that are true and
+worth the same amount:
+
+1. **Every produced tree is legal and every transition is minimal** — both oracles hold at every step of every scenario, over *every* history rather than a chosen one.
+2. **The edge-set delta between consecutive trees is bounded by the churn that caused the rebuild.** This is the property a user actually *feels*, because each changed edge is one stream interruption.
+3. **Determinism given the same event SEQUENCE** — not the same event *set*. Same seed and the same *ordered* script ⇒ byte-identical trace, over ≥50 repeats.
+
+The bounds table for (2) is worth having on hand, because two of its rows are the honest ones:
+
+| Churn | Bound on nodes whose parent changed |
+|---|---|
+| one join, no re-root | exactly 1 (the joiner) |
+| one leaf departs | 0 |
+| one relay `X` departs, no re-root | ≤ `len(childrenOf_prev(X))` |
+| one self-promotion | exactly 1, and strictly `next.ParentOf(u) == published.BackupOf(u)` |
+| one node becomes `Impaired` | ≤ `len(childrenOf_prev(node))` |
+| an RTT improvement past `StickinessMs` | ≤ 1 per improving node |
+| the relaxed retry ran | **unbounded** — assert `Outcome == OutcomeRelaxed` was published |
+| the root departs | **unbounded** — assert `Reroot == true` was published |
+
+The last two rows are where local repair does not apply at all, and the test asserts the
+coordinator **said so** rather than that it avoided them. *A design that cannot always be
+local must at minimum always be legible about when it was not.*
+
+### Property and permutation tests
+
+- **`TestStragglerPathIsPathDependent`** enumerates all **120** first-report permutations of a counterexample fleet, asserts each tree is `Validate`-clean and holds every node, asserts the root is identical across all 120, **and asserts at least two permutations differ**. It logs `converged to 9 distinct valid trees over the same fleet`. That last assertion is a regression check on the *trade*: if the divergence ever disappears, the stability trade-off has changed and the contract must be revisited.
+- **`TestReportOrderInvarianceSettledPath`** asserts the opposite for the *settled* path — byte-identical trees across all 120 permutations — and fails loudly if the permutation count is not 120, so the enumeration can never silently shrink.
+- **`TestPickRootNeverRootsAGuess`** replays a real 3-peer incident: over every arrival permutation, whatever `PickRoot` returns must `BuildTree` cleanly.
+- **`TestChurnReplayIsDeterministic`** runs two seeds × 120 steps and compares marshalled traces byte-for-byte across replays.
+- **Zero fuzz targets and zero benchmarks** exist in the repository. Recorded rather than hidden.
+
+### Real coordinator vs. model — which is which, and why the model survives
+
+`simnet` drives the **real** `internal/coordinator` in `control_test.go`, and keeps a
+`modelCoordinator` (test-only, in `harness_test.go`) for fast property sweeps. The split is
+documented in the model's own doc comment and is not arbitrary:
+
+| Driven by | Scenarios | Why |
+|---|---|---|
+| **The real loop** (`control_test.go`) | the first-build settle; report-order invariance over the shipped code; the join-order characterization; the epoch/yield fencing and handover scenarios; peer fence-refusal counting | *"If an assertion is about control-plane BEHAVIOUR, it belongs there."* |
+| **The model** (`scenario_test.go`, `churn_test.go`) | hundreds of seeded churn steps; the 120-permutation straggler sweeps | Those run the graph layer thousands of times. Standing up a full control loop with two goroutines and a barrier round-trip behind each one buys no coverage the real-loop scenarios already give, and **costs the sweeps their breadth.** |
+
+The real-loop wiring is worth knowing: `coordinator.Sender` is satisfied by `simnet.Capture`
+(records pushes) and `coordinator.Publisher` by `simnet.Recorder` (records events) —
+scenarios assert against the **published events** rather than internal state, *because the
+contract requires the coordinator to be legible about what it did, not merely correct*.
+`ReportOf` deliberately drops `Node.RTT` (pairwise latency is not measured in production, so
+feeding it to the real loop would test an input the loop cannot receive) and `Node.Impaired`
+(impairment is the coordinator's own conclusion after a dwell, not something a peer declares).
+
+The model earns its continued existence with a **differential test**,
+`TestModelAgreesWithTheRealCoordinator`, which drives both through the same script over all
+120 permutations of a 5-node fleet and compares the marshalled edges. Its comment records the
+payoff: *"That differential immediately earned itself: it caught that the harness was
+conflating JOIN arrival with REPORT arrival."*
+
+**Two limits, both stated in the source rather than discovered later:**
+
+- A **known, deliberate asymmetry**: the model learns the whole roster at `t0`; the real coordinator learns it one `PeerJoined` at a time and rebuilds on each. The two therefore agree on the *settled* path and are **not expected to agree on an incremental join sequence** — `TestJoinOrderIsPathDependent` covers that case against the real loop, where it belongs.
+- **A sweep that runs only against the model cannot discriminate a mutation in the shipped loop.** That is the residual cost of keeping it, and it is why every behavioural assertion moved to the real loop.
+
+---
+
+## 4. The mutation-testing discipline — the most valuable finding in the build
+
+**There is no mutation-testing tool.** No `gremlins`, no `go-mutesting`, no Makefile target,
+nothing in CI. It is a **review practice**, and its findings are recorded as test comments
+and, in one case, as a whole file.
+
+The question adversarial reviewers were asked was not "is this code correct" but:
+
+> **Which line can I delete and keep the suite green?**
+
+The answer, repeatedly, was: quite a few. Eight green-tests-measuring-nothing were found by
+the review fleet, plus a ninth by its own author.
+`internal/coordinator/guards_test.go` exists *solely* because of that audit and opens:
+
+> Guards a mutation audit found undefended: each of these deletes cleanly from the
+> implementation without any other test noticing.
+
+It holds eight such tests. Three cases are worth walking through, because each fails
+differently.
+
+**Case A — a test that could never fire.** `TestStaleRejectedShimIsStillNeeded` is a
+self-removing scaffold: it must fail the moment `metrics.Heartbeat` grows a `stale_rejected`
+field, so the temporary shim reading the raw key can be deleted. It marshalled a
+`metrics.Heartbeat{Name:"a", Seq:1}` and checked for the key — but *"the shipped field is
+tagged `omitempty`, so a zero value omits the key and the test concluded the field did not
+exist — a test passing for the wrong reason, which is the exact class of bug the scaffold was
+built to prevent."* The fix asks the **type**, not an instance: reflect over the struct's JSON
+tags.
+
+**Case B — a discriminator that discriminated only one of two mutations.** A comment claimed
+one test was "the discriminator" for the Sync-drains-first rule. The audit found it true for
+only one mutation:
+
+> **TWO MUTATIONS, TWO TESTS.** *Deleting* the drain is caught by
+> `TestSyncDrainsFiredDeadlinesBeforeAcking`. **Reordering** it — acking before draining — is
+> invisible to that test, because both statements complete before `handle()` returns.
+
+The fix added `TestSyncDrainsBeforeItAcks`, which parks the publisher on its first event to
+freeze the loop *inside* the reaction and then asserts the ack is **not yet closed** — "the
+ordering question asked as a state question, which is the only way to ask it without a race."
+The same file records that the naive end-to-end version does **not** discriminate: on a
+multi-core machine the `Run` goroutine is almost always already awake, so a broken loop
+passes anyway and *"the test reads as coverage while proving nothing."*
+
+**Case C — a comment justifying code with a dependency that does not exist.** A sort in the
+coordinator's node projection was justified with *"the projection order feeds `PickRoot`'s
+tie-break and `BuildTree`'s…"*. The sweep proved that false: `PickRoot` computes a maximum
+under a total order, so `BuildTree`'s output is invariant to input slice order — *given unique
+names*. The comment was rewritten to the three real reasons and a new test,
+`TestDuplicateNameResolutionIsDeterministic`, runs the fleet **20 independent times**, because
+"a projection that ranged the map would have to win a coin flip every time to survive this."
+The finding is not that the code was wrong; it is that **the stated reason was wrong, which is
+how the next person deletes it.**
+
+The habit shows up in three smaller forms you should copy:
+
+- **A `Discrimination:` heading** on a test comment, naming the mutation the test would catch. ~40 files carry one.
+- **Inline vacuity guards** — `t.Fatal("no backups assigned at all; the assertion above is vacuous")`; `"ValidateLocalRepair(nil prev) must fail loud rather than pass vacuously"`; `"both branches parented u to %q; the fixture does not discriminate the coupling"`.
+- **Naming what does *not* discriminate**, so nobody re-derives it: `// Note what does NOT discriminate: r.rp is non-nil either way…`.
+
+**The generalisable lesson, and the one worth taking into any codebase:**
+
+> *A passing test is evidence only if you know which mutation it would have caught. Write the
+> mutation down next to the assertion.*
+
+---
+
+## 5. Library-behaviour pins
+
+Four of this system's designs depend on facts about pion that are **not in its
+documentation** — they were verified against the vendored source. Those facts are pinned by
+tests that assert the *library's* behaviour, not ours, so a pion upgrade that changes them
+fails a test instead of shipping a silent regression. They live in
+`internal/media/pionbehavior_test.go`:
+
+- **`TestPionRemoveTrackDoesNotRenegotiate`** — pion v4.2.16 calls `onNegotiationNeeded` on a `RemoveTrack` but `checkNegotiationNeeded` returns **false**, so the handler never runs; a manual `CreateOffer` at that instant *does* yield a correct `a=recvonly`. That gap is why `Session.RemoveTrack` carries `pendingLocalChange`. The test deliberately uses **raw pion**, bypassing `Session.RemoveTrack`, and its comment is unusually direct: *"if it fails, the fix is to delete `pendingLocalChange`, not to loosen it."* (This is the test discussed in the box above — it is currently red without `-race` and green with it.)
+- **`TestNegotiationRetryResendsTheCommittedOffer`** — pion forbids `SetLocal(offer)` from `have-local-offer`, so the only legal recovery is re-sending the already-applied description. Discriminated by comparing the SDP **`o=` origin line** byte-for-byte (it carries the session version, which `CreateOffer` increments) rather than the whole body, because bodies legitimately differ as ICE candidates accumulate.
+- **`TestNegotiationAnswerTimeoutResends`** — an offer lands and no answer ever comes; without the re-send that edge deadlocks forever.
+
+A fourth is an *implementer obligation* recorded in `negotiation_test.go`: its first subtest
+"must be run before trusting the claim that pion v4 re-fires `OnNegotiationNeeded` on the
+return to `stable`."
+
+These are necessarily wall-clock tests (`waitFor` polls; `stableFor` asserts a condition keeps
+holding for a window). `internal/media` is therefore **not** in `CONTROL_PLANE_DIRS` — which
+is the point of having that list be explicit.
+
+---
+
+## 6. The determinism gate
+
+`make check-determinism` greps four packages — `internal/overlay`, `internal/simnet`,
+`internal/coordinator`, `internal/arbiter`, **including their `_test.go` files** — for every
+entry point into wall-clock time:
+
+```
+time\.(Now|Since|Until|Sleep|After|AfterFunc|Tick|NewTimer|NewTicker)\(
+```
+
+and exits 1 on any hit. It is currently **silent: zero matches, no exceptions, no `//nolint`,
+no skip list.** The Makefile's own comment explains why the list is exhaustive rather than
+representative:
+
+> `WALL_CLOCK_CALLS` is every entry point into package time that reads or waits on real time.
+> The list is deliberately exhaustive: a guard that catches `time.Now` but misses
+> `time.NewTicker` is worse than no guard, because it reads as coverage.
+
+It is a **build gate and not a review note** for a specific reason: reaching for the wall clock
+in a control-plane package breaks replayability *silently*, and the failure mode is invisible
+in a diff.
+
+Repo-wide, the only non-test wall-clock calls outside `internal/clock` are three in
+`internal/media`, which is deliberately outside the gate because it runs real pion.
+
+---
+
+## 7. Specialized harnesses — four, each with a different clock
+
+Each package's harness makes a different assertion about *its own* design, which is why they
+are not one shared fake.
+
+| Harness | Package | Clock | The assertion it encodes |
+|---|---|---|---|
+| `simnet/harness_test.go` | `simnet` | `simnet.VirtualClock` | `modelCoordinator` keeps `published`/`working`/`next` distinct, because conflating them was a critical defect in the contract and the model must not conflate them either |
+| `coordinator/harness_test.go` | `coordinator_test` (**external**) | the real `simnet.VirtualClock` | Lives in the external package for one structural reason: an internal white-box file importing `simnet` would be an import cycle. Every assertion is made after a `Sync`, so it observes a quiesced loop |
+| `arbiter/harness_test.go` | `arbiter_test` (external) | a `fakeClock` whose `NewTimer`/`NewTicker`/`After` **panic** | The arbiter is specified to be purely event-driven, so arming a timer is a design regression — panicking turns that into a failing test instead of a review note |
+| `dashboard/harness_test.go` | `dashboard` (internal) | `fixedClock` returning dead timers | The dashboard's temporal behaviour is caching intervals, not deadlines |
+| `media/fakeclock_test.go` | `media` | a minimal `fakeClock`; `NewTicker` panics | *"the media layer arms no tickers."* Deliberately much simpler than simnet's — no ordering discriminator, no event queue — because **`media` may not import `simnet`** |
+
+`coordinator/harness_test.go` also **deliberately duplicates** `simnet.Capture`/`Recorder` as
+local fakes, with the reason spelled out: the simnet versions are documented as never blocking
+and never failing, and two tests need the opposite — one needs a `Sender` that *wedges*
+(`TestSenderStallCannotStallTheLoop`), another needs one that wedges *and announces its entry*
+(`TestAmbiguityWindowStalePushIsNeitherSentNorAccepted`). "One local pair that can do
+everything beats three that each do part."
+
+`internal/dashboard/zz_seamcheck_test.go` is a different animal entirely: **no runtime test at
+all**, just four `var _ Iface = (*Impl)(nil)` declarations. It is a *compile-time* seam check —
+it fails to **build** the moment a producer stops satisfying a consumer-defined interface,
+which is the failure `cmd/server` would otherwise hit at wiring time. It lives in a `_test.go`
+file so it links into no binary and adds no production import edge.
+
+---
+
+## Test inventory
+
+69 test files, **372 top-level `func Test`**, 297 `t.Run` subtests, **0 benchmarks, 0 fuzz
+targets, 0 examples**.
+
+| Package | Test files | `func Test` | `t.Run` | Src / test LOC |
+|---|---:|---:|---:|---:|
+| `internal/coordinator` | 10 | 87 | 7 | 2,544 / 3,714 |
+| `internal/dashboard` | 8 | 52 | 28 | 2,319 / 2,889 |
+| `internal/overlay` | 8 | 41 | 21 | 1,678 / 2,892 |
+| `internal/simnet` | 7 | 41 | 26 | 1,240 / 2,700 |
+| `internal/media` | 13 | 38 | 24 | 3,973 / 3,514 |
+| `internal/arbiter` | 6 | 31 | 82 | 1,690 / 2,421 |
+| `cmd/server` | 3 | 23 | 25 | 1,252 / 1,139 |
+| `internal/signaling` | 4 | 18 | 29 | 1,113 / 1,208 |
+| `cmd/peer` | 1 | 17 | 17 | 870 / 1,157 |
+| `internal/metrics` | 3 | 12 | 21 | 380 / 606 |
+| `internal/policy` | 4 | 9 | 10 | 267 / 346 |
+| `internal/clock` | 1 | 2 | 6 | 106 / 117 |
+| `internal/logging` | 1 | 1 | 1 | 73 / 48 |
+
+Read the **ratios**, not the totals. `overlay` — the package holding the algorithm and its two
+oracles — carries **1.7× more test than source**; `simnet` carries **2.2×**; `coordinator`
+**1.5×**. `media`, the one package that cannot be tested deterministically, is the only place
+the ratio drops below 1:1.
 
 ---
 
 ## The idiom: table-driven tests + `t.Run` subtests
 
-Both existing tests are written the same way on purpose. This is *the* Go testing pattern; learn it once here and reuse it everywhere.
-
-A table-driven test is: **a slice of anonymous structs, one struct per case, looped over with `t.Run` turning each row into its own named subtest.** Worked example, `TestParseLevel` in `internal/logging/logging_test.go`:
+Still the default shape for anything with a fixed set of cases, and still worth learning from
+`internal/logging/logging_test.go` or `internal/overlay/validate_test.go`:
 
 ```go
-func TestParseLevel(t *testing.T) {
-	tests := []struct {
-		name    string
-		in      string
-		want    slog.Level
-		wantErr bool
-	}{
-		{name: "debug", in: "debug", want: slog.LevelDebug},
-		{name: "warning alias", in: "warning", want: slog.LevelWarn},
-		{name: "mixed case", in: "InFo", want: slog.LevelInfo},
-		{name: "surrounding whitespace", in: "  debug  ", want: slog.LevelDebug},
-		{name: "empty is an error", in: "", wantErr: true},
-		{name: "garbage is an error", in: "loud", wantErr: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := ParseLevel(tt.in)
-			if tt.wantErr {
-				if err == nil {
-					t.Fatalf("ParseLevel(%q): expected an error, got nil (level=%v)", tt.in, got)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("ParseLevel(%q): unexpected error: %v", tt.in, err)
-			}
-			if got != tt.want {
-				t.Errorf("ParseLevel(%q) = %v, want %v", tt.in, got, tt.want)
-			}
-		})
-	}
+tests := []struct {
+    name    string
+    in      string
+    want    slog.Level
+    wantErr bool
+}{
+    {name: "warning alias", in: "warning", want: slog.LevelWarn},
+    {name: "garbage is an error", in: "loud", wantErr: true},
+}
+for _, tt := range tests {
+    t.Run(tt.name, func(t *testing.T) { /* … */ })
 }
 ```
 
-`TestHealthURLFor` in `cmd/peer/main_test.go` is structurally identical — the same `{name, in, want, wantErr}` struct, the same loop, the same `t.Run` — over the URL-normalization cases (`bare host:port gets http`, `trailing slash trimmed`, `scheme only is error`, …). That sameness is the point: once you recognize the shape, every new test is a shape you already know.
-
-### Why this shape
-
-| Element | What it buys you |
+| Element | What it buys |
 |---|---|
-| **Slice of anonymous structs** | The test *is* a data table. Adding a case — a new alias, a new malformed URL — is **one line**, not a copy-pasted function. |
-| **`name` field** | A human label per row. `-v` prints it; failures name it. |
-| **`t.Run(tt.name, …)`** | Each row is an isolated **subtest** (`TestParseLevel/mixed_case`). One row failing doesn't stop the others, and the failure line tells you *exactly which case* broke. You can rerun just that one with `-run TestParseLevel/mixed_case`. |
-| **`want` / `wantErr`** | Expected value and expected-error-ness live *next to* the input, so a case reads as one self-contained fact. |
+| Slice of anonymous structs | The test *is* a data table. Adding a case is one line, not a copy-pasted function. |
+| `name` field | A human label per row; `-v` prints it and failures name it. |
+| `t.Run(tt.name, …)` | Each row is an isolated subtest (`TestParseLevel/warning_alias`). One row failing doesn't stop the others, and you can re-run just that row with `-run`. |
+| `want` / `wantErr` next to the input | A case reads as one self-contained fact. |
 
-### `t.Fatalf` vs `t.Errorf` — a real distinction, used deliberately
+`t.Fatalf` stops the subtest immediately (use it when continuing is pointless — a returned
+error makes `got` meaningless); `t.Errorf` records and continues (use it for the final value
+comparison, so one run reports every mismatch). `t.Fatal*` must be called from the test's own
+goroutine, never a spawned one.
 
-Both mark the test failed. The difference is what happens next:
-
-- **`t.Fatalf`** logs and **stops this subtest immediately** (it calls `runtime.Goexit`). Use it when continuing is pointless or unsafe — if `ParseLevel` returned an error you didn't expect, `got` is meaningless, so there's no reason to go on and compare it. Both tests use `Fatalf` for the two error-handling branches (expected an error but got none; got an error but wanted none).
-- **`t.Errorf`** logs, **marks failed, and keeps going.** Use it for the final value comparison, so a single run can report *all* the value mismatches at once instead of dying on the first. Both tests use `Errorf` for the closing `got != want` check.
-
-Rule of thumb: `Fatalf` when the *rest of the subtest can't run correctly*, `Errorf` when you just want to record a wrong value and move on. `t.Fatal*` must be called from the test's own goroutine, never from a spawned one — relevant once tests start goroutines.
-
----
-
-## What is actually covered today (honest)
-
-Beyond the pure unit tests, Phase 1 adds two **integration** tests. They use real loopback sockets — and, for media, real pion `PeerConnection`s — but no external network, no server process, and no cameras, and both run under `-race`. They're deterministic and fast (tens of milliseconds to connect).
-
-| Unit under test | Package | Automated test? | Notes |
-|---|---|---|---|
-| `ParseLevel` | `internal/logging` | ✅ `TestParseLevel` | Pure. Aliases, case, whitespace, empty, garbage. |
-| `healthURLFor` | `cmd/peer` | ✅ `TestHealthURLFor` | Pure. Scheme prepend, trailing slash, hostless/`:port` rejection. |
-| `wsURLFor` | `internal/signaling` | ✅ `TestWSURLFor` | Pure. ws/wss normalization, room query, bad-scheme/hostless rejection. |
-| Signaling hub (join/roster/relay/spoof/leave) | `internal/signaling` | ✅ `TestHubRelaysBetweenPeers`, `TestHubRelayToUnknownPeerErrors` | **Integration:** two real ws clients over `httptest`. Proves server-stamped identity and routing. |
-| Media session (connect + forward a track) | `internal/media` | ✅ `TestSessionConnectsAndForwardsTrack` | **Integration:** two pion sessions, in-memory signaling, real loopback ICE+DTLS, synthetic VP8. Proves single-offerer negotiation + the media path. |
-| Full mesh (N-peer, bidirectional media, clean shutdown) | `internal/media` | ✅ `TestMeshThreePeersFullyConnect` | **Integration:** 3 peers over the *real* signaling Hub (`httptest`), all sending. Asserts full-mesh formation (each peer `connected` to both others), **media flowing both ways** (each receives a track from every other), and that a ctx-cancel joins every Router goroutine (WaitGroup returns — a leak would hang the test). Under `-race`. |
-| Topology queries + loader | `internal/overlay` | ✅ `TestTopology`, `TestLoadTopology` | Pure. Parent/Children/Neighbors/IsRelay/Nodes + the offerer rule, and fail-loud file validation (empty/self-parent/two-parents/bad-json). |
-| `BuildTree` + `Validate` + `PickRoot` | `internal/overlay` | ✅ `TestBuildTree`, `TestBuildTreeDeterministic`, `TestValidateCatches` | Pure, table-driven: star, capacity-forced depth-2, TURN-forced-leaf, RTT tiebreak, over-constrained error, unknown/TURN root. Determinism across 50 runs (guards against map-order dependence). `Validate` is exercised as an independent oracle *and* proven to reject broken trees. |
-| Relay PLI SSRC translation | `internal/media` | ✅ `TestForwarderTranslatesPLISSRC` | **Deterministic unit** on the #1 SFU footgun: an upstream keyframe request carries the *source* SSRC (not a downstream one), `SenderSSRC=0`, the throttle drops an immediate second request, and a source with no media (ssrc 0) emits none. No timing. |
-| Tree relay (forward through a peer) | `internal/media` | ✅ `TestRelayForwardsThroughTree` | **Integration:** 3 peers over the real Hub with a hardcoded tree (relay → leaf-b, leaf-d). Proves a leaf receives another leaf's media **forwarded by the relay** — the proof is *topological*: leaf-d holds a track while having no session to leaf-b, so the bytes transited the relay. Also asserts an upstream PLI fired and that shutdown joins every forwarder goroutine. Under `-race`. |
-| Coordinator (fan-in → compute → push) | `internal/coordinator` | ✅ `TestCoordinatorComputesTree`, `…AntiThrash`, `…LeaveRecomputes`, `…SkipsUnnamed` | **Async, `-race`:** drives the single-goroutine event loop through a fake `Sender`. Proves it elects the highest-upload root, pushes each leaf its tree, does **not** re-root on a subsequent metric (anti-thrash) but *does* use the stored value at the next join, recomputes on leave, and skips a nameless peer. |
-| Metrics reporter | `internal/metrics` | ✅ `TestReporterEmitsImmediatelyThenTicks`, `…SurvivesSendError`, `…DefaultsInterval` | Emits once immediately then ticks; a send error is logged, never fatal (best-effort telemetry); a zero interval falls back to the default. |
-| `overlay.BuildTree` under churn (the crown jewel) | `internal/simnet` | ✅ `TestBuildTreeProperty`, `TestChurnKeepsInvariants`, `TestLatencyAttachment`, `TestScenarioDeterministic` | **Deterministic simulation:** 300 seeded random fleets each either error honestly or pass `Validate`; 200 churn steps (join/leave) never break an invariant; injected latency steers attachment; a seed replays the exact same tree. No pion, no clock — the FoundationDB/TigerBeetle idea in miniature. |
-| `logging.New` | `internal/logging` | ❌ | Low risk, currently untested. |
-| `healthzHandler` / `newMux` / `run()` | `cmd/*` | ❌ (manual only) | Verified by hand + the live `-call` demo (both peers `connected`; `ffprobe` confirms decodable VP8 output). |
-| `media.Router` demux + lifecycle | `internal/media` | ✅ `TestMeshThreePeersFullyConnect` (mesh) | The Router's per-peer demux and `joined`/`peer-joined` handling are now exercised by the 3-peer mesh test; `peer-left` churn under load still awaits a `simnet`-style Phase-4 test. |
-
-**What this coverage does *not* prove:** that the healthz JSON body is exactly `{"status":"ok","service":"conclave-server"}` or that `POST /healthz` really 405s (still manual — the `httptest` handler test below is the next add), that graceful shutdown drains in-flight requests, or that the `Router`'s lifecycle demux is correct under *churn* (rapid `peer-left`/rejoin storms — the mesh test covers steady-state join + teardown, not chaos). The *hard* core — single-offerer negotiation, the media path, N-peer full-mesh formation, and now **tree forwarding (a leaf's media relayed through a third peer) with SSRC-translated upstream PLI** — **is** pinned by automated `-race` tests. What the relay tests do *not* prove: **keyframe *response*** — our file/synthetic sources have no live encoder, so a forwarded PLI can't actually produce a fresh I-frame; the PLI *plumbing* (right SSRC, throttled, reaches upstream) is proven, but end-to-end "recover on demand" needs a real browser sender (Phase 7). Nor do they cover mid-call child churn (Phase 5) or deep (≥3) trees.
-
-### On integration tests with real sockets (why they're worth it here)
-
-The two new tests deliberately are *not* pure. The signaling hub's whole job is concurrency (goroutines, channels, a mutex-guarded map) and the media session's is a callback-driven state machine over real ICE/DTLS — neither has a meaningful "pure core" to unit-test in isolation, and mocking pion would test the mock, not the code. So they stand up the real thing on loopback and assert observable outcomes (a relayed frame arrives with the right `From`; the receiver's `OnTrack` fires and packets flow), all under `-race` to catch the data races that callback-heavy code invites. The trick that keeps them fast and hermetic is substituting only the *transport*: `httptest` for the server, an in-memory `Transport` for signaling — never the media stack itself.
+**And the addition this project makes to the idiom:** name the mutation. A table case whose
+`name` says what would break if the code were wrong is worth more than three that only say
+what they feed in.
 
 ---
 
-## Forward-looking plan
+## What the coverage does *not* prove
 
-### Next add: a table-driven `httptest` test for `/healthz`
+Stated plainly, because a testing doc that oversells is worse than one that is out of date.
 
-The lowest-hanging, highest-value gap. `net/http/httptest` gives an in-memory server and recorder with no real socket, so the handler can be exercised directly. `newMux(logger)` already returns an `http.Handler` and `healthzHandler` already closes over an injected logger — the code was written to be testable this way. The shape is the same table-driven idiom, with cases like `{name, method, path, wantStatus, wantBody}`:
-
-- `GET /healthz` → `200`, body decodes to `healthResponse{Status:"ok", Service:"conclave-server"}`.
-- `POST /healthz` → `405` (proves the Go 1.22+ method-aware routing, without trusting it by eye).
-- an unknown path → `404`.
-
-Drive it with `httptest.NewRecorder()` + `mux.ServeHTTP(rec, req)` (or `httptest.NewServer` for a full round-trip), assert on `rec.Code` and the decoded body. This pins the wire contract that Phase 1 grows.
-
-### `internal/simnet` — deterministic simulation (built in Phase 4)
-
-The centerpiece of the testing strategy, and the reason the hard logic is kept pure. `internal/simnet` is an **in-memory simulated network**: a fleet of nodes with injectable upload budgets, NAT classes, and pairwise latencies, plus scriptable churn (joins, leaves) via `Add`/`Remove`/`RemoveRandom`. Phase 4 drives the overlay's `BuildTree` against it — hundreds of seeded random fleets and a 200-step churn scenario, each asserted against the independent `overlay.Validate` oracle — **with no pion, no UDP, no cameras.** As the coordinator's control loop, the failover/backup-parent logic, and eventually the Phase 6 election + migration grow, they will run against this same harness (a seeded clock and scripted degradation are the next additions).
-
-This is the [FoundationDB](https://apple.github.io/foundationdb/testing.html) / [TigerBeetle](https://tigerbeetle.com/) **deterministic-simulation** idea, in miniature. The pitch: replace every source of nondeterminism (wall clock, real network, real scheduler) with a seeded, controllable one, so an entire distributed scenario is a *pure function of its seed*. Then:
-
-- A failing run is **reproducible** — same seed, same interleaving, every time. No more "it only fails in CI."
-- You can fast-forward simulated time, so a "30-second sustained-degradation triggers re-optimization" scenario runs in microseconds.
-- You can enumerate nasty orderings on purpose — a stale coordinator acting after a new one is elected — and assert the epoch/term fencing actually rejects the stale actor. That is exactly the class of bug that is near-impossible to hit reliably against real machines and near-trivial to hit against a scheduler you control.
-
-We are **not** building full FoundationDB-grade simulation; the honest framing is "the same idea, scoped to a learning project." But the architectural commitment it demands — pure decision logic, side effects at the edges, injectable clock and transport — is being made *now*, in Phase 0, so it's cheap later instead of a rewrite.
-
-### Rough coverage roadmap
-
-| Phase | Testable surface | Approach |
-|---|---|---|
-| 0 (done) | `ParseLevel`, `healthURLFor` | Table-driven unit tests. |
-| 1 (done) | `wsURLFor`; signaling hub; media session (connect + track) | Table-driven unit + `httptest`/loopback integration under `-race`. |
-| 1 (gap) | `/healthz` handler body/405; `Router` lifecycle demux | `httptest` handler test; `Router` unit test with a fake client. |
-| 3–4 (done) | `BuildTree` (degree-bounded, depth-limited, min-latency) | Pure-function table tests + `simnet` property checks (connected, no cycle, depth/degree bounds, TURN-leaf) against the `Validate` oracle. |
-| 4 (done) | metrics fan-in, overlay under churn | `-race` coordinator test (fake `Sender`) + `simnet` deterministic churn scenarios. |
-| 5–6 | failover, backup parents, **election + migration** | `simnet` with adversarial interleavings; assert epoch/term fencing. |
-
----
-
-## Non-goals (for now)
-
-- **No test of `main()` itself.** It's the three-line `os.Exit` shim; the logic lives in `run`, which is where tests point.
-- ~~No integration test that boots a real pion peer.~~ **Done in Phase 1:** `TestSessionConnectsAndForwardsTrack` stands up two real pion `PeerConnection`s over loopback and asserts a track is forwarded. Full *media-fidelity* checks (decodable output, keyframe timing) remain manual + the live demo; the automated test proves the transport and negotiation, not codec quality.
-- **No benchmarks / performance assertions yet.** Performance is last in the priority order. When latency-per-hop and upload-ceiling claims get made (Phases 3–4), they'll be measured and quoted as numbers, not asserted in unit tests.
-- **Coverage percentage is not a target.** It's a floor-of-confidence signal, read from `make cover`, not a number to game.
+- **Phases 5 and 6 are verified by the automated suite, not by a live run.** Deterministic simulation of the control plane plus real-pion integration tests of the media plane — but the live end-to-end verification (relay kill → backup promotion; coordinator kill → election and migration; a non-zero `stale_rejected` count proving the fence did visible work) is **pending** (`DESIGN.md` §9.5). Any claim about *live* failover or *live* migration must carry that qualification.
+- **Every live run so far has been single-host.** All demos ran multiple processes on one machine over loopback: no cross-machine result, no real NAT traversal, no real packet loss, no real congestion control. The "≈6 Mbit/s at 5 peers" figure is arithmetic on a measured per-stream bitrate, not an observed collapse.
+- **The degradation, impairment and voluntary-election paths are exercised only in `simnet`**, where the inputs are injected — because `CPUPct`, `LossPct` and `RTTServerMs` are never populated in production (`DESIGN.md` §8.1). The logic is tested; the sensors do not exist.
+- **PLI *response* is unproven.** File and synthetic sources have no live encoder, so the keyframe-request *plumbing* (including the upstream SSRC translation) is proven, but a source actually producing a keyframe on demand awaits a browser sender.
+- **A model-only sweep cannot discriminate a mutation in the shipped coordinator loop** (§3).
+- **Two ordering seams are argued but not pinned by a test.** `Publisher.Publish` is called on the coordinator's `Run` goroutine and must not block, but unlike `Sender` there is no dedicated goroutine and no bounded-queue-with-drop in front of it. And `pendingLocalChange` is cleared inside `negotiate`, after `SetLocalDescription` and before `sendDescription` — sound, but moving the clear earlier would lose a removal arriving in that window and **every existing test would still pass**.
+- **`internal/media` is outside the determinism gate** and holds three wall-clock calls; its tests are ~73 s of the ~93 s suite.
+- **Coverage percentage is not a target.** `make cover` is a floor-of-confidence signal, not a number to game. 100% line coverage of `ParseLevel` still would not prove the error *message* is right.
