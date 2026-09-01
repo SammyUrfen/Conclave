@@ -3,6 +3,7 @@ package overlay
 import (
 	"encoding/json"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -804,4 +805,63 @@ func permutations(in []string) [][]string {
 		}
 	}
 	return out
+}
+
+// TestBuildTreePrevRootOrdering pins the case §3.4(A) leaves undefined, and it is
+// undefined in a way two implementers would resolve differently: after a re-root,
+// the OLD root is present in nodes but appears nowhere in prev.Edges, so it is
+// neither "an incumbent, in prev.Edges order" nor "a newcomer with no entry in
+// prev". Whichever way it is resolved must be pinned, or a later refactor will
+// silently pick the other one.
+//
+// This package resolves it by processing prev.Root FIRST, at the position
+// prev.Edges implicitly gives it (that order is topological precisely BECAUSE it
+// starts at the root). The consequence is the assertion below: the former root is
+// already attached by the time its former children are processed, so their
+// incumbency still has a live candidate and they stay put. Had it been processed
+// with the newcomers — after them — it would not yet be attached, every one of its
+// children would fall through to rank 2 over whatever else was available, and a
+// re-root would scatter the old root's entire subtree for nothing. That is the
+// exact opposite of what the stability-preserving rebuild exists to do.
+func TestBuildTreePrevRootOrdering(t *testing.T) {
+	// "new" arrives with enough upload to clear RootChangeMarginKbps over "old",
+	// so PickRoot hands it the root and the tree must re-root around it.
+	nodes := []Node{
+		{Name: "new", UploadKbps: 20000},
+		{Name: "old", UploadKbps: 6000}, // the previous root: in nodes, not in prev.Edges
+		{Name: "x", UploadKbps: 0},      // old's children in prev…
+		{Name: "y", UploadKbps: 0},
+	}
+	prev := &Topology{Epoch: 1, Rev: 1, Root: "old", Edges: []Edge{
+		{Parent: "old", Child: "x"},
+		{Parent: "old", Child: "y"},
+	}}
+	cons := Constraints{Root: "new", MaxDepth: 3, StreamKbps: 2000, Epoch: 1, Rev: 2, StickinessMs: DefaultStickinessMs}
+
+	// The fixture is only meaningful if the root really did change, and PickRoot is
+	// what decides that in production — so assert it rather than assuming it.
+	if got := PickRoot(nodes, prev); got != "new" {
+		t.Fatalf("fixture drifted: PickRoot = %q, want new (a re-root is the case under test)", got)
+	}
+
+	topo := mustBuild(t, nodes, prev, cons)
+	if err := Validate(topo, nodes, cons); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if got := topo.ParentOf("old"); got != "new" {
+		t.Errorf("old parent = %q, want new (the former root attaches under the new one)", got)
+	}
+	// The load-bearing assertion: the former root's children are NOT scattered.
+	for _, child := range []string{"x", "y"} {
+		if got := topo.ParentOf(child); got != "old" {
+			t.Errorf("%s parent = %q, want old — a re-root must not re-parent the former root's children", child, got)
+		}
+	}
+	// Stated as a churn property too, which is the form the coordinator asserts in:
+	// a re-root is the one legitimately global repair, so the oracle must report it
+	// as such — and report nothing else, since nobody but "old" actually moved.
+	err := ValidateLocalRepair(prev, topo, nil, []string{"new"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "root changed") {
+		t.Errorf("ValidateLocalRepair = %v, want it to flag the re-root (and only that)", err)
+	}
 }
