@@ -347,7 +347,7 @@ func (r *Router) reparentFailed(ctx context.Context, reason string) {
 	r.stopPeerByName(rp.newParent)
 
 	backup := r.backupParent()
-	if r.cfg.Backup && !rp.triedBackup && backup != "" && backup != rp.newParent && backup != rp.oldParent {
+	if !r.cfg.DisableBackup && !rp.triedBackup && backup != "" && backup != rp.newParent && backup != rp.oldParent {
 		rp.cancel()
 		r.rp = nil
 		r.clearLocalBackup()
@@ -375,7 +375,7 @@ func (r *Router) onParentLost(ctx context.Context, parent string) {
 	if r.rp != nil && r.rp.oldParent == parent {
 		return // already moving off this parent
 	}
-	if !r.cfg.Backup {
+	if r.cfg.DisableBackup {
 		r.reportReparent(parent, "", false, "backup promotion disabled")
 		return
 	}

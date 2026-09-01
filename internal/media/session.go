@@ -412,6 +412,11 @@ func (s *Session) negotiate(attempt int) {
 				return
 			}
 			s.log.Debug("re-sent offer", slog.Int("attempt", attempt))
+			// Re-arm: a re-send that is ALSO ignored must keep climbing the same
+			// ladder, or one lost offer buys exactly one retry and the edge wedges
+			// after it. The bound lives in armAnswerDeadline, so the worst case is
+			// NegotiationRetries * NegotiationAnswerTimeout and no more.
+			s.armAnswerDeadline(attempt)
 			return
 		}
 	}
