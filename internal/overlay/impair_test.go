@@ -149,42 +149,82 @@ func TestImpairmentIsASoftFilter(t *testing.T) {
 	}
 }
 
-// TestImpairedIncumbentGetsNoProtection isolates rank 1's impairment clause, which is
-// otherwise INVISIBLE: whenever a healthy candidate exists, rank 0b has already removed
-// the impaired incumbent from the candidate set, so rank 1 never sees it. The clause is
-// observable in exactly one situation — when EVERY candidate is impaired and rank 0b
-// re-admits them all. There, incumbency is still void, so rank 2 picks the best of a bad
-// set rather than defending a parent that has been bad for a full dwell.
+// TestImpairmentCouplingRule is the §3.4 coupling rule, and §12.2 requires BOTH of its
+// branches: one fleet, differing ONLY in whether a single candidate is impaired, must
+// produce two different outcomes.
 //
-// The RTT margin is deliberately NOT cleared here (90 vs 100 is inside
-// DefaultStickinessMs), so the only thing that can move u is the impairment clause.
-func TestImpairedIncumbentGetsNoProtection(t *testing.T) {
-	fleet := func(impaired bool) []Node {
+//	healthyAvailable  ⇒ rank 0b excludes impaired candidates AND rank 1's void fires:
+//	                    the impaired incumbent loses its children to a healthy relay.
+//	no healthy relay  ⇒ rank 0b re-admits impaired candidates AND the void is
+//	                    SUPPRESSED: incumbency is preserved and nobody moves.
+//
+// The second branch is the amendment. The void exists for exactly one purpose — let the
+// dwell move children off an impaired relay ONTO A HEALTHY ONE. With nowhere healthy to
+// go, that premise is absent and all that is left is churn: a stream interruption bought
+// for an RTT delta, in the state where the fleet can least afford it, and repeatedly,
+// because impairment is sustained by definition. When there is nowhere healthy to go,
+// stability is the only value left.
+//
+// The RTT landscape is rigged so the wrong answer is VISIBLE in both directions: H is
+// closer to u than P is, but only by 10 ms — inside DefaultStickinessMs — so incumbency,
+// where it applies, is what keeps u at P, and nothing else can.
+func TestImpairmentCouplingRule(t *testing.T) {
+	// R roots. P is u's impaired incumbent parent. H is the other candidate, and it is
+	// the ONLY thing that differs between the two branches.
+	fleet := func(healthyCandidate bool) []Node {
 		return []Node{
-			{Name: "R", UploadKbps: 8000, Impaired: impaired},
-			{Name: "P", UploadKbps: 8000, Impaired: impaired},
-			{Name: "u", RTT: map[string]float64{"R": 90, "P": 100}},
+			{Name: "R", UploadKbps: 8000, Impaired: true},
+			{Name: "P", UploadKbps: 8000, Impaired: true},
+			{Name: "H", UploadKbps: 8000, Impaired: !healthyCandidate},
+			{Name: "u", RTT: map[string]float64{"R": 95, "P": 100, "H": 90}},
 		}
 	}
 	prev := &Topology{Epoch: 1, Rev: 1, Root: "R", Edges: []Edge{
 		{Parent: "R", Child: "P"},
+		{Parent: "R", Child: "H"},
 		{Parent: "P", Child: "u"},
 	}}
 	cons := Constraints{Root: "R", MaxDepth: 3, StreamKbps: 2000, Epoch: 1, Rev: 2, StickinessMs: DefaultStickinessMs}
 
-	// Control: healthy incumbents keep u, because a 10 ms win is inside the margin.
-	healthy := mustBuild(t, fleet(false), prev, cons)
-	if got := healthy.ParentOf("u"); got != "P" {
-		t.Fatalf("control: u parent = %q, want P (a 10ms win is inside StickinessMs)", got)
-	}
+	t.Run("a healthy candidate exists: the void fires", func(t *testing.T) {
+		nodes := fleet(true)
+		next := mustBuild(t, nodes, prev, cons)
+		if err := Validate(next, nodes, cons); err != nil {
+			t.Fatalf("Validate: %v", err)
+		}
+		if got := next.ParentOf("u"); got != "H" {
+			t.Errorf("u parent = %q, want H: with somewhere healthy to go, an impaired incumbent keeps no protection", got)
+		}
+		if err := ValidateLocalRepair(prev, next, nodes, cons, Churn{Impaired: []string{"P"}}); err != nil {
+			t.Errorf("ValidateLocalRepair: %v", err)
+		}
+	})
 
-	nodes := fleet(true)
-	next := mustBuild(t, nodes, prev, cons)
-	if err := Validate(next, nodes, cons); err != nil {
-		t.Fatalf("Validate: %v", err)
-	}
-	if got := next.ParentOf("u"); got != "R" {
-		t.Errorf("u parent = %q, want R: an impaired incumbent keeps no protection even when every candidate is impaired", got)
+	t.Run("every candidate is impaired: incumbency is preserved", func(t *testing.T) {
+		nodes := fleet(false)
+		next := mustBuild(t, nodes, prev, cons)
+		if err := Validate(next, nodes, cons); err != nil {
+			t.Fatalf("Validate: %v", err)
+		}
+		if got := next.ParentOf("u"); got != "P" {
+			t.Errorf("u parent = %q, want P: with nowhere healthy to go, moving u between impaired parents is pure churn", got)
+		}
+		// Nothing at all may move in this branch — the whole tree is unchanged.
+		if err := ValidateLocalRepair(prev, next, nodes, cons, Churn{Impaired: []string{"P"}}); err != nil {
+			t.Errorf("ValidateLocalRepair: %v", err)
+		}
+		for _, e := range prev.Edges {
+			if got := next.ParentOf(e.Child); got != e.Parent {
+				t.Errorf("%s parent = %q, want %q: an all-impaired fleet must reshuffle nobody", e.Child, got, e.Parent)
+			}
+		}
+	})
+
+	// The two branches must genuinely differ, or the fleet does not exercise the rule.
+	a := mustBuild(t, fleet(true), prev, cons)
+	b := mustBuild(t, fleet(false), prev, cons)
+	if a.ParentOf("u") == b.ParentOf("u") {
+		t.Fatalf("both branches parented u to %q; the fixture does not discriminate the coupling", a.ParentOf("u"))
 	}
 }
 
