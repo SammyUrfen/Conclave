@@ -8,54 +8,65 @@ package coordinator_test
 // the tests here are written to fail if a value is merely plausible rather than real.
 
 import (
-	"encoding/json"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/SammyUrfen/conclave/internal/coordinator"
 	"github.com/SammyUrfen/conclave/internal/metrics"
 )
 
-// beatWithStale renders a heartbeat carrying the frozen `stale_rejected` wire key.
+// beatWithStale renders a heartbeat carrying a refusal count.
 //
-// It splices the key in rather than setting a struct field because metrics.Heartbeat
-// does not carry it yet — see TestStaleRejectedShimIsStillNeeded, which fails the
-// moment it does, so this scaffold cannot outlive its reason.
+// It sets the real metrics.Heartbeat field. It used to splice the `stale_rejected` key
+// into the marshalled JSON, because the field did not exist yet; that scaffold is gone
+// along with the coordinator's second decode of the same payload.
 func beatWithStale(t *testing.T, hb metrics.Heartbeat, stale uint64) []byte {
 	t.Helper()
-	raw, err := json.Marshal(hb)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var m map[string]any
-	if err := json.Unmarshal(raw, &m); err != nil {
-		t.Fatal(err)
-	}
-	m["stale_rejected"] = stale
-	out, err := json.Marshal(m)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return out
+	hb.StaleRejected = stale
+	return mustJSON(t, hb)
 }
 
-// TestStaleRejectedShimIsStillNeeded is a SELF-REMOVING SCAFFOLD. The coordinator reads
-// `stale_rejected` off the raw heartbeat payload because metrics.Heartbeat has no field
-// for it yet. The instant WI-0 adds one, this test fails and names the two lines to
-// delete — so the duplicate reader cannot quietly become a second source of truth that
-// drifts from the first.
-func TestStaleRejectedShimIsStillNeeded(t *testing.T) {
-	raw, err := json.Marshal(metrics.Heartbeat{Name: "a", Seq: 1})
-	if err != nil {
-		t.Fatal(err)
+// TestHeartbeatCarriesTheStaleRejectionCounter is the guard that outlived the scaffold
+// it replaced.
+//
+// The coordinator's whole stale-rejection chain rests on one wire key. If that tag is
+// ever renamed, every heartbeat still decodes cleanly, every peer still counts refusals,
+// and the coordinator silently reads 0 forever — the exact failure §15.14 was written to
+// close, restored by a rename nothing else would notice. So the tag is pinned by name.
+//
+// It asks the TYPE, not a marshalled instance. The scaffold this replaced marshalled a
+// zero-valued Heartbeat and looked for the key, which `omitempty` made unfindable: the
+// test passed by concluding the field did not exist, and so failed to fire on the very
+// merge it was built for. A test that inspects one value cannot answer a question about
+// a field.
+func TestHeartbeatCarriesTheStaleRejectionCounter(t *testing.T) {
+	f, ok := jsonTagField(reflect.TypeOf(metrics.Heartbeat{}), "stale_rejected")
+	if !ok {
+		t.Fatal("metrics.Heartbeat no longer carries a `stale_rejected` json tag; " +
+			"the coordinator's EventStale chain reads 0 without it")
 	}
-	var m map[string]any
-	if err := json.Unmarshal(raw, &m); err != nil {
-		t.Fatal(err)
+	if f.Name != "StaleRejected" {
+		t.Fatalf("the `stale_rejected` tag moved to field %q", f.Name)
 	}
-	if _, ok := m["stale_rejected"]; ok {
-		t.Fatal("metrics.Heartbeat now carries stale_rejected: delete coordinator's staleShim " +
-			"and read hb.StaleRejected directly, then delete this test")
+	if f.Type.Kind() != reflect.Uint64 {
+		t.Fatalf("StaleRejected is %v; the counter is compared as an unsigned total and a "+
+			"signed type would change how a rejoin reset reads", f.Type)
 	}
+}
+
+// jsonTagField finds the struct field whose json tag NAME is want, ignoring options such
+// as omitempty. Asking the type rather than a marshalled instance is the whole point:
+// the value of a field says nothing about whether the field exists.
+func jsonTagField(t reflect.Type, want string) (reflect.StructField, bool) {
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		if name == want {
+			return f, true
+		}
+	}
+	return reflect.StructField{}, false
 }
 
 // TestMemberEventsCarryTheServerStampedID: §9.4 mandates an `id` on member_joined and
