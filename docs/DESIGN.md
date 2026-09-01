@@ -17,7 +17,7 @@
 >
 > **Status.** Phases 0–6 of 7 implemented. Phase 7 (simulcast/SVC, TURN) untouched.
 > 40,256 lines of Go: 17,505 non-test, 22,751 test. Base commit for every number in this
-> document: `7c7038d` on `integration/phase5`.
+> document: `8bacee6` on `integration/phase5`.
 
 ---
 
@@ -472,7 +472,7 @@ peer                     arbiter (cmd/server)                     other peers
 
 **1–2 — dial and identity.** `signaling.Hub.ServeWS` (`internal/signaling/hub.go`) checks the
 `Origin` header against `policy.Origins.AllowUpgrade` **before** the upgrade and returns 403
-on a miss (§7.2 explains why the library's own check is disabled). It validates the room id
+on a miss (§7.3 explains why the library's own check is disabled). It validates the room id
 and the peer name — rejecting, never truncating — and assigns a server-side id (`p1`, `p2`,
 …). The joiner receives `TypeJoined` carrying its new id and the current roster.
 
@@ -1579,12 +1579,18 @@ to the assertion.
 
 ### 6.6 Library-behaviour pins
 
-Four of this system's designs depend on facts about pion that are not in its documentation.
-Those facts are pinned by tests that assert the **library's** behaviour, not ours — so a pion
-upgrade that changes them fails a test instead of shipping a silent regression.
-`TestPionRemoveTrackDoesNotRenegotiate` is the sharpest: it uses raw pion, deliberately
-bypassing `Session.RemoveTrack`, and its comment says *"if it fails, the fix is to delete
-`pendingLocalChange`, not to loosen it."*
+Several of this system's designs depend on facts about pion that are not in its documentation.
+Those facts are pinned by tests that assert the **library's** behaviour, not ours — using raw
+pion and deliberately bypassing our own wrappers — so a pion upgrade that changes them fails a
+test instead of shipping a silent regression.
+`TestPionRenegotiatesARemovalOnceConnected` is the sharpest, and it is also the one that had
+to be **replaced by its own opposite**: an earlier pin asserted that pion never renegotiates a
+`RemoveTrack`, and that turned out to be an artefact of how the test was invoked. §7.2 is the
+whole story, and it is the most useful thing in this document.
+
+The replacement carries the lesson in its shape: it waits for `connected` *before* measuring,
+so it asserts the same thing under `go test` and `go test -race`. A pin whose verdict depends
+on the invocation is not a pin.
 
 ### 6.7 The gate
 
@@ -1595,19 +1601,26 @@ every entry point into wall-clock time and exits 1 on any hit. It is currently *
 matches. Repo-wide, the only non-test wall-clock calls outside `internal/clock` are three in
 `internal/media`, which is deliberately outside the gate because it runs real pion.
 
-`make check` **passes** at `7c7038d`: all 13 packages `ok` under `-race`, no failures and no
-skips. The wall-clock profile is itself the argument for the architecture:
+`make check` **passes**: all 13 packages `ok`, no failures and no skips. The gate *specifies*
+`-race` because the concurrency here is the design — a data race in this codebase is a design
+violation, not merely a bug — but the suite does not *depend* on it: plain `go test ./...` is
+13/13 green as well. That was not always true, and the one test that used to disagree with
+itself across the two invocations is the subject of §7.2.
+
+The wall-clock profile is itself the argument for the architecture:
 
 ```
-media 72.993s   ← real pion, real ICE, real DTLS on loopback
-cmd/peer 5.721s   arbiter 2.317s   simnet 1.949s   dashboard 1.703s
-coordinator 1.416s  signaling 1.267s  overlay 1.241s  metrics 1.189s
-clock 1.144s   cmd/server 1.057s   policy 1.037s   logging 1.019s
+              with -race        without -race
+media           88.4s              13.9s      ← real pion, real ICE, real DTLS on loopback
+cmd/peer         6.5s               0.53s
+everything else  1–2s each          0.1–0.3s each
 ```
 
-Every deterministic control-plane package runs in 1–2 s because it runs on a virtual clock;
-the one package that must touch a real network takes 73 s of the ~93 s total. That gap is the
-entire reason the control plane was kept pion-free.
+Every deterministic control-plane package runs in a fraction of a second because it runs on a
+virtual clock; the one package that must touch a real network dominates the suite either way.
+That gap is the entire reason the control plane was kept pion-free — and, as §7.2 shows, the
+6× dilation `-race` imposes on the media package is not merely slow, it is a *different
+experiment*.
 
 ---
 
@@ -1616,7 +1629,12 @@ entire reason the control plane was kept pion-free.
 `docs/PLAN.md` was frozen before implementation, reviewed adversarially by two independent
 reviewers (12 critical + ~15 major findings), and amended in place with every ruling recorded
 in §15. Even so, it was wrong in places, and the interesting wrongness is not typos — it is
-**assumptions about a library, verified against the vendored source rather than the spec.**
+**claims about a library.** Several were fixed by reading the vendored source instead of the
+spec; one of those fixes then turned out to be wrong itself, because reading the source told
+us what the code does without telling us **which state it does it in** (§7.2). That is the
+sharpest thing in this section: verifying against the implementation is a large improvement
+over trusting documentation, and it is still not the same as measuring the regime you actually
+run in.
 
 ### 7.1 Five places the contract was wrong about real pion
 
@@ -1624,7 +1642,7 @@ Measured against **pion/webrtc v4.2.16**. These are corrections of *fact*, not o
 
 | # | The contract said | Real pion | Consequence if shipped |
 |---|---|---|---|
-| 1 | `RemoveTrack` fires `OnNegotiationNeeded`, so the serializer emits the renegotiating offer. | It calls `onNegotiationNeeded`, but `checkNegotiationNeeded` returns **false** for a removal — the offer said `sendrecv`, the answer said `recvonly`, the transceiver is `recvonly`, so pion concludes nothing changed and the handler never runs. A manual `CreateOffer` at that instant *does* yield a correct `a=recvonly`. | **SILENT, PERMANENT.** The removal never renegotiates and the forwarded track stays in the far end's SDP forever. |
+| 1 | `RemoveTrack` fires `OnNegotiationNeeded`, so the serializer emits the renegotiating offer — **unconditionally**. | **Conditional.** On a *connected, stable* pc pion fires immediately and reliably. When the removal lands while the pc is **not stable** — an offer already in flight, which is the ordinary case during a topology apply — pion's `negotiationNeededOp` aborts on its signaling-state check and the notification is simply **lost**. Nothing re-raises it. *(This row was itself wrong for two revisions — see §7.2.)* | **SILENT, PERMANENT** in the non-stable case: the removal never renegotiates and the departed source's m-line lingers in the far end's SDP as a stale `sendrecv` forever. |
 | 2 | Clear the `negotiating` flag **after** `SetRemoteDescription(answer)`. | `SetRemoteDescription` reaches `stable` *inside* the call and re-fires negotiation-needed from pion's ops goroutine. With our flag still set, our handler early-returns — and pion has now **consumed its own flag**, so it never fires again. | **SILENT, PERMANENT.** The renegotiation is lost forever: no error, no log, a far end whose SDP is permanently stale. |
 | 3 | On a failure, the retry re-enters the full negotiation path. | pion forbids `SetLocal(offer)` from `have-local-offer` (`checkNextSignalingState`). | The retry is illegal from the state it most often runs in. |
 | 4 | A backup promotion just opens a session to the backup. | The backup edge is not in the tree, so `Offers` is meaningless on it and the far end has no reason to expect a connection — it drops the offer as coming from an unknown peer. | **The promotion deadlocks as specified**, in the mechanism the whole phase exists for. |
@@ -1646,16 +1664,18 @@ in a table so nobody "simplifies" it back:
 
 | | removed `renegotiate` | added `pendingLocalChange` |
 |---|---|---|
-| Covers | `AddTrack` — a path where pion **does** re-fire | `RemoveTrack` — a path where pion **provably does not** |
-| Effect | Races pion's trigger ⇒ two offers for one change | Supplies the only trigger ⇒ one offer for one change |
+| Covers | `AddTrack` — a path where pion **does** re-fire | `RemoveTrack` from a **non-stable** pc — a path where pion's notification is dropped |
+| Effect | Races pion's trigger ⇒ two offers for one change | Supplies the missing trigger ⇒ one offer for one change |
 | Without it | Correct | Permanently stale far-end SDP |
 
-The rule generalises, and it is the sentence to remember:
+The rule generalises, and it is the sentence to remember — with the qualifier that §7.2 had to
+put back into it:
 
-> Our bookkeeping supplements pion **exactly where `checkNegotiationNeeded` is known to
-> return false, and nowhere else.** Where pion does fire, adding our own trigger is a race.
-> Where it provably does not, omitting one is a permanent stall. The two look identical in the
-> code and are opposites in effect.
+> Our bookkeeping supplements pion **exactly where its notification is known not to arrive,
+> and nowhere else.** Where pion does fire, adding our own trigger is a race. Where it does
+> not, omitting one is a permanent stall. The two look identical in the code and are opposites
+> in effect — and *which regime you are in is a property of the connection's state, not of the
+> API you called.*
 
 Two further corrections were found during implementation, on top of the five:
 
@@ -1671,7 +1691,86 @@ Two further corrections were found during implementation, on top of the five:
   track lands on a pc that will never offer again. Exhaustion therefore **reports itself**
   through `OnNegotiationFailed` and the owner re-creates the edge.
 
-### 7.2 Two CRITICALs an adversarial review found in the finished system
+### 7.2 The finding that was right for the wrong reason
+
+Item 1 above deserves its own section, because the *second* time it was measured it came out
+differently, and the story is a better lesson than the finding was.
+
+**What the contract recorded.** Verified against the vendored pion source rather than the
+spec — already better practice than most — the contract stated flatly that `pc.RemoveTrack`
+never causes pion to re-fire `OnNegotiationNeeded`, because `checkNegotiationNeeded` concludes
+nothing changed. `pendingLocalChange` was built on that, a test
+(`TestPionRemoveTrackDoesNotRenegotiate`) pinned it, and its comment said *"if it fails, the
+fix is to delete `pendingLocalChange`, not to loosen it."*
+
+**Then that test started failing — but only without `-race`.** Five failures out of five under
+plain `go test`, green every time under `go test -race`. The tempting move at that point is
+obvious and wrong: widen the quiescence window until the flake goes away, or declare the
+package race-only. Instead it was **re-measured**, six runs varying nothing but the delay
+before the removal:
+
+| pc state at the moment of `RemoveTrack` | pion's `OnNegotiationNeeded` |
+|---|---|
+| `new` | fired 251 ms later — **at the instant the pc reached `connected`** |
+| `connecting` | never fired (the pc never connected inside the window) |
+| `connected` (×3) | fired **the same millisecond** |
+
+**The determining variable is connectedness**, and nobody had been varying it. On a connected
+PeerConnection pion v4.2.16 fires for a removal immediately and reliably. The original
+measurement had been taken under `-race`, where DTLS on loopback takes *seconds* — so every
+quiescence window expired while the pc was still `connecting`, and **`-race` had been acting
+as an unrecognised proxy for "not yet connected."** That is the only regime the finding ever
+sampled, and it is the opposite of production, where a relay removes a departed source's track
+from sessions that have been carrying media for minutes.
+
+The timing gap is visible in the suite itself: `internal/media` takes **13.9 s** without
+`-race` and **88.4 s** with it. A 6× slowdown is not a nuisance in a test that is implicitly
+timing a handshake — it is a different experiment.
+
+**The machinery survived, for a reason nobody had identified.** The conditional claim is true
+and load-bearing: when a removal lands while the pc is **not stable** — an offer already in
+flight, which is exactly what happens during a topology apply — pion's `negotiationNeededOp`
+aborts on its signaling-state check and the notification is dropped with nothing to re-raise
+it. `TestRemovalNudgeSurvivesTheAnswer` still fails deterministically with the nudge removed.
+So `pendingLocalChange` was necessary all along; the stated reason for it was false.
+
+And the risk the corrected finding *introduces* was measured too, rather than argued: on a
+connected session two independent sources now want an offer for one removal — pion's trigger
+and ours. Double-offering would reintroduce the precise bug the serializer exists to prevent,
+through its own fix. Measured at **12/12 runs with a delta of exactly one offer**, six with
+`-race` and six without. Whichever trigger arrives first takes `negotiating`; the other returns
+at the guard. The serializer does its job.
+
+**What replaced the pin.** `TestPionRenegotiatesARemovalOnceConnected` now waits for
+`connected` *first* — which is what makes it invocation-independent, passing identically with
+and without `-race` — and then asserts what is actually true. A companion,
+`TestSessionRemoveTrackOffersExactlyOnceWhenConnected`, pins the exactly-one-offer invariant on
+a connected session, and `TestRemovalNudgeSurvivesTheAnswer` covers the unconnected regime.
+One behaviour, two regimes, three tests, and none of them depend on how the suite was invoked.
+
+**The lesson, which is the part worth carrying anywhere.**
+
+> A dependency's behaviour was measured rather than assumed — good. It was recorded in the
+> contract and machinery was built on it — good. But the measurement was taken under a single
+> invocation mode that turned out to be a **proxy for a state variable nobody was tracking**,
+> and that state never occurs in production. The claim was false; the code was right anyway.
+
+Three things fall out of it:
+
+1. **`-race` is not a neutral observer.** It is a 6× time dilation, and any test whose subject
+   is a race between your goroutine and a library's dispatch goroutine is *measuring a
+   different system* under it. A test that passes under one invocation and fails under the
+   other is not flaky — it is reporting that the invocation is an input.
+2. **When a test behaves oddly, the first question is "what is it actually measuring?", not
+   "how do I make it green."** Widening the window here would have preserved a false belief
+   *and* kept the correct code, which is the worst of both: nothing fails, and the next person
+   deletes the machinery on the strength of a comment that was never true.
+3. **Being right for the wrong reason is a real hazard, not a lucky escape.** The comment on
+   `pendingLocalChange` was load-bearing documentation for a flag that looks identical to one
+   the project had just deleted. A wrong justification on correct code is precisely the setup
+   for a confident, well-reasoned regression.
+
+### 7.3 Two CRITICALs an adversarial review found in the finished system
 
 **A. DNS rebinding bypassed the WebSocket origin gate — on both `/ws` and the dashboard
 socket.** `coder/websocket`'s own origin check returns *allow* as soon as the `Origin`
@@ -1706,7 +1805,7 @@ peer's* relay-ness changed — with the reasoning recorded: "reason 2 is invisib
 without this bucket, because a promotion usually flips the role as well, but only when the
 promoted peer sorts above its parent."
 
-### 7.3 Where the code now contradicts the contract
+### 7.4 Where the code now contradicts the contract
 
 Three places, found while writing this document. All three are the **contract** being stale,
 not the code being wrong — but they are worth listing because "the contract said so" is not a
@@ -1867,8 +1966,17 @@ boundary — it stops a confused peer, not a lying one.
   `sendDescription`.** That placement is sound — the committed offer is a full snapshot
   carrying the change, and the retry path re-sends *that exact description* — but **no test
   pins it**. Moving the clear earlier, to before `CreateOffer`, would lose a removal arriving
-  in that window, and every existing test would still pass. It is the ordering in the removal
-  path that is argued but not enforced.
+  in that window, and every existing test would still pass.
+- **`pendingLocalChange` is *set* before `pc.RemoveTrack`, not after** — a second ordering in
+  the same few lines, added for a real reason and **verified only by argument**. On a connected
+  pc, `RemoveTrack` makes pion fire negotiation-needed on its own operations goroutine, which
+  can create and send the entire offer before a set-after line would run; the flag would then
+  be left set for a change already on the wire, and the next answer would spend it on a
+  redundant second renegotiation. Setting it first means any offer the removal provokes clears
+  it. The window is real but small, and **12 runs could not be made to discriminate the two
+  orderings** — so this is reasoned-sound and unverified, and it is recorded here in the same
+  terms as the entry above rather than presented as tested. (What *is* measured is the
+  invariant it protects: exactly one offer per removal, 12/12 runs, with and without `-race`.)
 - **`simnet` still keeps a `modelCoordinator`** for fast property sweeps. It is pinned to the
   real loop by a differential test, and a known asymmetry is documented (the model learns the
   roster at t0; the real loop learns it per `PeerJoined`), but a sweep that runs only against
@@ -1883,7 +1991,9 @@ boundary — it stops a confused peer, not a lying one.
 - **No benchmarks and no fuzz targets** exist in the repository. Performance is last in the
   stated priority order and has not been measured beyond the upload meter.
 - **`internal/media` is outside the determinism gate** and holds three wall-clock calls. Its
-  tests take ~73 s of the ~93 s suite because they run real pion, real ICE, and real DTLS.
+  tests take 88 s under `-race` (14 s without) because they run real pion, real ICE, and real
+  DTLS — and §7.2 records what that 6× dilation did to one measurement before anyone noticed
+  it was an input.
 - **PLI *response* is unproven.** File and synthetic sources have no live encoder, so keyframe
   request *plumbing* (including the upstream SSRC translation) is proven, but a source
   actually producing a keyframe on demand awaits a browser sender.
@@ -1955,14 +2065,15 @@ only package that cannot be tested deterministically, is the one place the ratio
 
 ### 9.3 The gate
 
-`make check` (fmt + vet + check-determinism + `go test -race ./...`) **passes** at `7c7038d`:
-13 packages `ok`, zero failures, zero skips. `check-determinism` reports **zero** wall-clock
-references across `overlay`, `simnet`, `coordinator`, and `arbiter`, test files included.
+`make check` (fmt + vet + check-determinism + `go test -race ./...`) **passes**: 13 packages
+`ok`, zero failures, zero skips. Plain `go test ./...` — no `-race` — is also 13/13 green; the
+gate *specifies* `-race` for the race detector's sake, not because the suite needs it.
+`check-determinism` reports **zero** wall-clock references across `overlay`, `simnet`,
+`coordinator`, and `arbiter`, test files included.
 
 ```
-media 72.993s  cmd/peer 5.721s  arbiter 2.317s  simnet 1.949s  dashboard 1.703s
-coordinator 1.416s  signaling 1.267s  overlay 1.241s  metrics 1.189s  clock 1.144s
-cmd/server 1.057s  policy 1.037s  logging 1.019s
+-race:     media 88.405s  cmd/peer 6.530s  everything else 1–2s each
+no -race:  media 13.926s  cmd/peer 0.526s  everything else 0.1–0.3s each
 ```
 
 ### 9.4 Measured, historically, per phase
@@ -2008,5 +2119,5 @@ cmd/server 1.057s  policy 1.037s  logging 1.019s
 
 ---
 
-*This is a living document. It describes the system at commit `7c7038d`; when the system
+*This is a living document. It describes the system at commit `8bacee6`; when the system
 changes, this changes with it.*
