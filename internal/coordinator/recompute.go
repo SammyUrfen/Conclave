@@ -18,8 +18,29 @@ import (
 // checking the cooldown first would let an ineligible meet burn its window, and
 // checking neither would rebuild on every frame.
 func (c *Coordinator) recompute(rs *roomState, cause string) {
+	if !rs.serving {
+		// Not this node's meet. Not a "settling" verdict either — that would claim a
+		// readiness this node has no standing to report — so it emits nothing at all.
+		return
+	}
 	now := c.cfg.Clock.Now()
 	nodes, waiting := c.project(rs)
+
+	// The rebuild window comes FIRST, ahead of even the minimum-size gate. A bootstrap
+	// term over an empty meet has vacuously heard from everyone and must be able to say
+	// so and close its window; ordering the size gate first would leave the window
+	// armed until a member happened to join.
+	if rs.rebuilding {
+		unheard := c.unheard(rs)
+		if len(unheard) > 0 && now.Before(rs.rebuildUntil) {
+			c.settling(rs, unheard, "rebuilding from peers: waiting for realized topology")
+			return
+		}
+		rs.rebuilding = false
+		rs.rebuildUntil = time.Time{}
+		rs.baseline = c.reconstructBaseline(rs)
+		rs.heard = nil
+	}
 
 	// Rule 2. A meet too small to have a tree builds nothing and does not consume
 	// the settle: a 1-node tree has no edges, carries no media, and would seed the
@@ -73,6 +94,14 @@ func (c *Coordinator) build(rs *roomState, nodes []overlay.Node, cause string) {
 	// §5.6a's middle tree, derived fresh every round so it can never drift from
 	// published.
 	rs.working = deriveWorking(rs.published, live, rs.promotions)
+	if rs.working == nil && rs.baseline != nil {
+		// The first build of a new term: there is no published tree to patch, so the
+		// stickiness baseline is the one reconstructed from the peers' realized state.
+		// Without it BuildTree runs memoryless and re-parents a fleet that has not
+		// changed — a global interruption caused by a handover rather than by anything
+		// that happened to the media.
+		rs.working = rs.baseline
+	}
 
 	root := overlay.PickRoot(nodes, rs.working, c.cfg.StreamKbps)
 	if root == "" {
@@ -134,6 +163,9 @@ func (c *Coordinator) publishTree(rs *roomState, next *overlay.Topology, outcome
 	// Ratifications are consumed by the tree that folds them in; carrying them
 	// forward would re-apply a promotion the fleet has since moved past.
 	rs.promotions = make(map[string]string)
+	// Likewise the reconstructed baseline: it seeds exactly the first tree of a term,
+	// after which `published` is the real thing to be sticky about.
+	rs.baseline = nil
 
 	// A relaxed publish is a SUCCESS, but a rare and expensive one the operator
 	// should see: a meet that goes relaxed repeatedly is telling you the fleet is
@@ -155,7 +187,7 @@ func (c *Coordinator) publishTree(rs *roomState, next *overlay.Topology, outcome
 		if ns.name == "" {
 			continue // unmanaged peer (joined without a name): nothing to push
 		}
-		c.enqueueSend(sendOp{roomID: rs.id, peerID: ns.id, topo: next})
+		c.enqueueSend(sendOp{roomID: rs.id, peerID: ns.id, topo: next, gate: rs.gate})
 	}
 
 	c.publish(rs, Event{Kind: EventTopology, Outcome: outcome, Reason: reason, Topo: next})
@@ -338,4 +370,161 @@ func deriveWorking(published *overlay.Topology, live map[string]bool, promotions
 		Root:  published.Root,
 		Edges: edges,
 	}
+}
+
+// unheard lists the named, live members this coordinator has not received a heartbeat
+// from since the rebuild window opened, ascending. Empty means the fast exit applies —
+// including vacuously, for a meet with no members yet.
+func (c *Coordinator) unheard(rs *roomState) []string {
+	var out []string
+	for _, id := range c.sortedPeerIDs(rs) {
+		ns := rs.nodes[id]
+		if ns.name == "" || ns.health == HealthGone {
+			continue
+		}
+		if !rs.heard[ns.name] {
+			out = append(out, ns.name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// reconstructBaseline rebuilds a stickiness baseline for a new term out of what the
+// peers say they have REALIZED, or returns nil if what they described is not a legal
+// tree.
+//
+// It is built over the REDUCED node set actually heard from, never the full roster.
+// That is the M5 correction and it is the whole reason this is worth doing: validating
+// against the full roster made a single lost or late heartbeat render the
+// reconstruction disconnected, fail Validate, and drop to prev = nil — a GLOBAL
+// re-parent caused by one dropped frame. Reduced, an un-heard-from member is simply
+// absent from prev, which the builder already handles perfectly: absent means
+// "newcomer", and newcomers are attached after incumbents. One lost heartbeat now moves
+// exactly one node instead of all of them.
+//
+// The baseline comes from heartbeats and from nothing else — never from a topology this
+// node holds or was pushed. A new coordinator reconstructs ground truth, not its
+// predecessor's beliefs, and that is what makes a handover after a crash take the same
+// code path as a graceful one.
+func (c *Coordinator) reconstructBaseline(rs *roomState) *overlay.Topology {
+	all, _ := c.project(rs)
+	heardNodes := make([]overlay.Node, 0, len(rs.heard))
+	parents := make(map[string]string, len(rs.heard))
+	for _, n := range all {
+		if !rs.heard[n.Name] {
+			continue
+		}
+		heardNodes = append(heardNodes, n)
+		parents[n.Name] = c.realParentOf(rs, n.Name)
+	}
+	if len(heardNodes) < MinBuildableMembers {
+		return nil // nothing worth being sticky about
+	}
+
+	obs := reconstructObserved(parents, rs.epoch)
+	if obs == nil {
+		c.log.Info("realized state has no unique root; rebuilding without a stickiness baseline",
+			slog.String("room_id", rs.id), slog.Int("heard", len(heardNodes)))
+		return nil
+	}
+
+	// Validate insists on a stamped tree (Epoch and Rev ≥ 1), while the baseline must
+	// carry Rev 0 so BuildTree's "the revision must advance" guard passes against the
+	// term's first tree at Rev 1. Both requirements are right and they simply disagree,
+	// so the oracle sees a stamped copy and the builder gets the real one.
+	check := *obs
+	check.Rev = 1
+	cons := overlay.Constraints{
+		Root: obs.Root, MaxDepth: c.cfg.MaxDepth, StreamKbps: c.cfg.StreamKbps,
+		Epoch: rs.epoch, Rev: 1, StickinessMs: c.cfg.StickinessMs,
+	}
+	if err := overlay.Validate(&check, heardNodes, cons); err != nil {
+		// The residual case the contract admits: a genuinely torn tree, e.g. a
+		// mid-flight re-parent captured half-applied. Falling back to a memoryless
+		// build is expensive but correct; seeding the builder with an illegal baseline
+		// would not be.
+		c.log.Info("realized state is not a legal tree; rebuilding without a stickiness baseline",
+			slog.String("room_id", rs.id), slog.Any("error", err))
+		return nil
+	}
+	c.log.Info("reconstructed a stickiness baseline from peer heartbeats",
+		slog.String("room_id", rs.id), slog.Uint64("epoch", rs.epoch),
+		slog.Int("heard", len(heardNodes)), slog.Int("edges", len(obs.Edges)))
+	return obs
+}
+
+// realParentOf is the upstream neighbour a member last reported having ACTUALLY
+// connected — a different question from who the coordinator told it to connect to, and
+// the ground-truth half that makes rebuild-from-peers possible.
+func (c *Coordinator) realParentOf(rs *roomState, name string) string {
+	for _, id := range c.sortedPeerIDs(rs) {
+		if ns := rs.nodes[id]; ns.name == name {
+			return ns.realParent
+		}
+	}
+	return ""
+}
+
+// reconstructObserved turns a map of node -> realized parent into a topology.
+//
+// The root is the unique node with no parent inside the set; a node whose parent was
+// not heard from counts as parentless, so two of them means the observed state has no
+// single root and cannot be reconstructed at all (nil). Nodes not reachable from the
+// root — a cycle off to the side — are simply not emitted, which makes the result fail
+// Validate rather than pretend to be a tree.
+//
+// Edges are emitted breadth-first from the root with each node's children sorted by
+// name. Two properties fall out, both load-bearing: the order is TOPOLOGICAL, which is
+// the invariant BuildTree replays prev.Edges under; and it is a function of the data
+// rather than of Go's randomised map iteration, so the same realized fleet always
+// reconstructs identically and the first tree of a new term is replayable.
+//
+// Parent is the authority and Children is deliberately ignored. Parent is
+// single-valued, so it cannot disagree with itself; reconciling it against N peers'
+// child lists would need a conflict rule for evidence that adds nothing — a child link
+// is the same edge seen from the other end.
+func reconstructObserved(parents map[string]string, epoch uint64) *overlay.Topology {
+	names := make([]string, 0, len(parents))
+	for name := range parents {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var roots []string
+	children := make(map[string][]string, len(parents))
+	for _, name := range names {
+		p := parents[name]
+		if _, present := parents[p]; p == "" || !present {
+			roots = append(roots, name)
+			continue
+		}
+		children[p] = append(children[p], name)
+	}
+	if len(roots) != 1 {
+		return nil
+	}
+	for p := range children {
+		sort.Strings(children[p])
+	}
+
+	root := roots[0]
+	edges := make([]overlay.Edge, 0, len(parents))
+	queue := []string{root}
+	seen := map[string]bool{root: true}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for _, ch := range children[cur] {
+			if seen[ch] {
+				continue // a cycle: refuse to loop, and let Validate reject the result
+			}
+			seen[ch] = true
+			edges = append(edges, overlay.Edge{Parent: cur, Child: ch})
+			queue = append(queue, ch)
+		}
+	}
+	// Rev 0 on purpose: this is a BASELINE, not a published tree, and BuildTree refuses
+	// a prev whose revision the new tree does not advance past.
+	return &overlay.Topology{Epoch: epoch, Rev: 0, Root: root, Edges: edges}
 }

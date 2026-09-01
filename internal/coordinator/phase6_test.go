@@ -137,6 +137,7 @@ func TestYieldedCoordinatorStillTracksLiveness(t *testing.T) {
 	h.member("room", "p3", "c", 0)
 	h.c.Yield("room", 2)
 	h.sync()
+	h.fp.reset() // the fixture built a tree before the yield; only what follows counts
 
 	alive := map[string]string{"p1": "a", "p3": "c"}
 	for i := uint64(1); i <= metrics.GoneBeats; i++ {
@@ -437,6 +438,11 @@ func TestAmbiguityWindowStalePushIsNeitherSentNorAccepted(t *testing.T) {
 	<-entered // the sender is now provably inside push #1 of the stale tree
 
 	old.c.Yield("room", 2)
+	// Snapshot, not Sync, is the barrier here — and this is precisely why the two
+	// differ. Snapshot rides only the Run goroutine, so it proves the yield has been
+	// APPLIED; Sync would additionally ride the outbound queue, which is wedged behind
+	// the very push this test is holding open, and would block until the release.
+	_ = old.snapshot("room")
 	close(block)
 	old.sync()
 

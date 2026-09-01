@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/SammyUrfen/conclave/internal/clock"
@@ -133,6 +134,24 @@ type roomState struct {
 	epoch uint64
 	rev   uint64 // the last PUBLISHED rev in this epoch; 0 before the first tree
 
+	// serving is whether THIS node is the coordinator for this meet. It defaults to
+	// true, which is the Phase 5 arrangement — the coordinator runs inside the arbiter
+	// process and is simply told which term it serves. Yield clears it; adopting a
+	// strictly higher epoch sets it again.
+	serving bool
+	// gate is the current term's outbound gate. Replaced on every epoch adoption and
+	// ended on Yield, so a push computed under a term that has ended never leaves.
+	gate *term
+
+	// The rebuild window (§6.6). rebuilding is set on adopting a new epoch and holds
+	// every publication until either every present member has been HEARD FROM or
+	// rebuildUntil passes. baseline is the stickiness baseline reconstructed from
+	// those heartbeats, consumed by the first build of the term.
+	rebuilding   bool
+	rebuildUntil time.Time
+	heard        map[string]bool
+	baseline     *overlay.Topology
+
 	published *overlay.Topology
 	working   *overlay.Topology
 
@@ -202,6 +221,7 @@ const (
 	evReparent
 	evRoster
 	evEpoch
+	evYield
 	evSnapshot
 	evSync
 )
@@ -226,8 +246,28 @@ type sendOp struct {
 	roomID string
 	peerID string
 	topo   *overlay.Topology
+	gate   *term         // nil on a barrier marker; otherwise the term that produced this push
 	ack    chan struct{} // non-nil ⇒ this is a barrier marker, not a push
 }
+
+// term is one coordinator term for one meet, reduced to the single fact the OUTBOUND
+// plane needs: is this term still current. Every push carries a pointer to the term
+// that computed it, and the sender drops any push whose term has ended.
+//
+// This is the coordinator's half of the ambiguity window (§6.7). The contract's safety
+// argument is that a fenced peer refuses a stale-epoch push, and that argument holds
+// with or without this gate — but "the peer will reject it anyway" is a poor reason to
+// send it. A push already inside the network call cannot be recalled, so it is
+// delivered (and fenced); everything still queued behind it is dropped here.
+//
+// An atomic rather than a mutex because there is exactly one writer (the Run goroutine,
+// on Yield or on adopting a new epoch), one reader (the sender goroutine), and the
+// value is one bit. A mutex would be a heavier expression of the same thing and would
+// put a lock back into a design whose whole point is not having one.
+type term struct{ ended atomic.Bool }
+
+func (t *term) end()          { t.ended.Store(true) }
+func (t *term) isEnded() bool { return t.ended.Load() }
 
 // New builds a Coordinator that pushes through send and reports through pub. Either
 // may be nil for a coordinator that only computes (pub nil means "publish
@@ -298,6 +338,13 @@ func (c *Coordinator) runSender(stop <-chan struct{}, done chan<- struct{}) {
 				continue
 			}
 			if c.send == nil {
+				continue
+			}
+			if op.gate != nil && op.gate.isEnded() {
+				// This node is no longer the coordinator for that meet, or is now
+				// serving a later term. §6.7.
+				c.log.Debug("dropped a push from an ended term",
+					slog.String("room_id", op.roomID), slog.String("peer_id", op.peerID))
 				continue
 			}
 			if err := c.send.SendTopology(op.roomID, op.peerID, op.topo); err != nil {
@@ -415,6 +462,27 @@ func (c *Coordinator) SetRoster(roomID string, members []Member) {
 	c.enqueue(event{kind: evRoster, roomID: roomID, roster: append([]Member(nil), members...)})
 }
 
+// Yield stops the coordinator from publishing anything further for roomID: it is no
+// longer the coordinator there. Idempotent.
+//
+// newEpoch is the term under which this node was replaced, and it is not decoration —
+// it raises the meet's epoch floor, so the announcement that DEMOTED this node can
+// never also be the one that resumes it. Only a strictly higher SetEpoch does that.
+//
+// What it drops and what it keeps is the whole design of the epoch boundary: this node
+// stops being authoritative about the TREE, which was a belief, so the tree is
+// discarded and every push still queued for the old term is dropped. It does NOT stop
+// being a process watching the meet, so telemetry, health, and membership — all of
+// which came off the wire and are still true — survive. Discarding those would lose
+// real observations and make a re-election pay a full settle for nothing.
+//
+// A yielded coordinator therefore keeps running its health FSM and keeps answering
+// Snapshot: the dashboard still reads it, and a re-elected node starts warm. Only the
+// tree stops.
+func (c *Coordinator) Yield(roomID string, newEpoch uint64) {
+	c.enqueue(event{kind: evYield, roomID: roomID, epoch: newEpoch})
+}
+
 // Sync blocks until every event enqueued before the call has been processed AND
 // every push those events produced has been handed to the Sender. It is the
 // deterministic-testing barrier and the quiescence primitive the dashboard uses
@@ -491,6 +559,8 @@ func (c *Coordinator) handle(ev event) {
 		c.onRoster(ev.roomID, ev.roster)
 	case evEpoch:
 		c.onEpoch(ev.roomID, ev.epoch)
+	case evYield:
+		c.onYield(ev.roomID, ev.epoch)
 	}
 	c.advance()
 }
@@ -564,6 +634,7 @@ const (
 	dlGone deadlineKind = iota
 	dlDegraded
 	dlDwell
+	dlRebuild
 	dlSettle
 	dlCooldown
 )
@@ -601,6 +672,9 @@ func (c *Coordinator) eachDeadline(visit func(deadline)) {
 
 	for _, rid := range roomIDs {
 		rs := c.rooms[rid]
+		if rs.rebuilding {
+			visit(deadline{at: rs.rebuildUntil, kind: dlRebuild, roomID: rid})
+		}
 		if !rs.settleUntil.IsZero() {
 			visit(deadline{at: rs.settleUntil, kind: dlSettle, roomID: rid})
 		}
@@ -673,6 +747,10 @@ func (c *Coordinator) fire(d deadline) {
 		// is what the tree is built from.
 		rs.settleUntil = time.Time{}
 		c.recompute(rs, "join settle expired")
+	case dlRebuild:
+		// The bound the "heard from everyone" fast path lacks: one silent member must
+		// not be able to hold a whole meet dark.
+		c.recompute(rs, "rebuild window expired")
 	case dlCooldown:
 		rs.dirty = false
 		c.recompute(rs, "recompute cooldown expired")
@@ -755,6 +833,8 @@ func (c *Coordinator) room(roomID string) *roomState {
 			id:         roomID,
 			nodes:      make(map[string]*nodeState),
 			epoch:      1,
+			serving:    true,
+			gate:       &term{},
 			promotions: make(map[string]string),
 		}
 		c.rooms[roomID] = rs
@@ -953,10 +1033,22 @@ func (c *Coordinator) onBeat(roomID, peerID string, hb metrics.Heartbeat) {
 	for _, ch := range hb.Children {
 		ns.realChildren = append(ns.realChildren, ch.Name)
 	}
+	if rs.rebuilding && ns.name != "" {
+		// A heartbeat is the ONLY frame carrying realized topology, so the rebuild
+		// window waits on heartbeats specifically — a metrics report says nothing about
+		// the thing being reconstructed. Marking and re-checking here is what gives the
+		// window its fast exit; it is scoped to the window, so this is not a ninth
+		// threshold event.
+		rs.heard[ns.name] = true
+	}
 	if created || resurrected {
 		c.armSettle(rs)
 		c.markUrgentIfUnplaced(rs)
 		c.recompute(rs, "member returned")
+		return
+	}
+	if rs.rebuilding {
+		c.recompute(rs, "rebuild heartbeat")
 		return
 	}
 	// A routine beat is not a threshold event.
@@ -1055,14 +1147,81 @@ func (c *Coordinator) onRoster(roomID string, members []Member) {
 func (c *Coordinator) onEpoch(roomID string, epoch uint64) {
 	rs := c.room(roomID)
 	if epoch <= rs.epoch {
-		// A coordinator never lowers its own term, and re-adopting the same one is a
-		// no-op rather than a reset that would re-stamp trees peers already hold.
+		// A coordinator never raises its own term; re-adopting the current one is a
+		// no-op rather than a reset that would re-stamp trees peers already hold; and
+		// — the case that matters — an announcement this node has already superseded
+		// must never put it back in charge. Authority only moves forward.
 		return
 	}
 	c.log.Info("adopted epoch", slog.String("room_id", roomID),
 		slog.Uint64("epoch", epoch), slog.Uint64("was", rs.epoch))
 	rs.epoch = epoch
-	rs.rev = 0 // the next published tree is rev 1 of the new term
+	rs.serving = true
+
+	// End the previous term's outbound gate and start a fresh one, so anything still
+	// queued from before the handover is dropped rather than delivered under a term
+	// that no longer exists.
+	rs.gate.end()
+	rs.gate = &term{}
+
+	// REBUILD-FROM-PEERS, and only that (§6.6). Snapshot-and-ship is not implemented,
+	// not even as a fast path: a handover route that runs only on GRACEFUL handovers is
+	// a route that is never exercised and is therefore broken on the crash it exists
+	// for. So a new term always starts from the peers' realized state — including when
+	// the "new" coordinator is this same object, which is what keeps the single path
+	// exercised on every handover and in every test.
+	c.abandonTerm(rs)
+	rs.rebuilding = true
+	rs.rebuildUntil = c.cfg.Clock.Now().Add(metrics.RebuildWindow)
+	rs.heard = make(map[string]bool)
+	// Recompute now rather than waiting for an event: a bootstrap term over a meet with
+	// no members has vacuously heard from everyone, so its window must close at once
+	// instead of costing the first tree of every meet a RebuildWindow with nothing to
+	// rebuild from.
+	c.recompute(rs, "adopted a new epoch")
+}
+
+// onYield applies Yield on the Run goroutine. See Yield for what is dropped and why.
+func (c *Coordinator) onYield(roomID string, newEpoch uint64) {
+	rs := c.rooms[roomID]
+	if rs == nil {
+		// Remember the demotion even for a meet this node has not seen yet, because
+		// the alternative is worse: roomState defaults to SERVING (the Phase 5
+		// arrangement), so a frame arriving afterwards would silently start this node
+		// coordinating a meet it was explicitly told it does not own.
+		rs = c.room(roomID)
+	}
+	if newEpoch > rs.epoch {
+		rs.epoch = newEpoch
+	}
+	if !rs.serving {
+		return // idempotent: a re-broadcast announcement naming someone else is normal
+	}
+	c.log.Info("yielded coordination", slog.String("room_id", roomID),
+		slog.Uint64("epoch", rs.epoch))
+	rs.serving = false
+	rs.gate.end()
+	c.abandonTerm(rs)
+}
+
+// abandonTerm discards everything this node BELIEVED as coordinator of roomID and
+// leaves everything it OBSERVED. Called on both ends of a term boundary — Yield and
+// epoch adoption — so the two cannot drift apart.
+//
+// Nothing here touches nodes, their telemetry, their health, or their realized state:
+// that is the line the boundary is cut along.
+func (c *Coordinator) abandonTerm(rs *roomState) {
+	rs.published, rs.working, rs.baseline = nil, nil, nil
+	rs.promotions = make(map[string]string)
+	rs.rev = 0
+	rs.built = false
+	rs.dirty = false
+	rs.urgent = false
+	rs.settleUntil = time.Time{}
+	rs.settlingNow = false
+	rs.rebuilding = false
+	rs.rebuildUntil = time.Time{}
+	rs.heard = nil
 }
 
 // markUrgentIfUnplaced sets the room's cooldown bypass when some named, live member

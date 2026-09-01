@@ -38,5 +38,24 @@
 // a single clock.Timer, which is what lets Sync be a COMPLETE quiescence barrier:
 // draining one wake channel drains every pending reaction.
 //
-// Phase 5 of the roadmap; Phase 6 adds coordinator election and migration on top.
+// # What Phase 6 added
+//
+//   - Term boundaries. SetEpoch adopts a strictly higher arbiter-minted epoch and Yield
+//     surrenders the role; between them they are the only things that move authority,
+//     and neither can move it backwards. A term boundary discards what this node
+//     BELIEVED (the tree) and keeps what it OBSERVED (telemetry, health, membership).
+//   - Rebuild-from-peers, and only that. A new term starts from the realized parent
+//     each peer reports in its heartbeat — never from a predecessor's snapshot — so the
+//     handover path after a crash is byte-for-byte the path after a graceful handover,
+//     and is therefore exercised by every test rather than only by the emergency.
+//   - The outbound term gate: a push computed under a term that has ended is dropped
+//     rather than sent. The fence on the peer would refuse it anyway; that is a reason
+//     it is SAFE, not a reason to send it.
+//
+// This package still never learns who the coordinator is by itself. Authority arrives
+// only through SetEpoch and Yield, which cmd/server and cmd/peer drive from the
+// arbiter's announcements — the same single-writer discipline that makes the epoch a
+// meaningful fencing token in the first place.
+//
+// Phases 5 and 6 of the roadmap.
 package coordinator
