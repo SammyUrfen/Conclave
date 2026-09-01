@@ -3,7 +3,6 @@ package policy
 import (
 	"fmt"
 	"net/url"
-	"path"
 	"strings"
 )
 
@@ -45,11 +44,18 @@ func ParseOrigins(csv string) (Origins, error) {
 	return out, nil
 }
 
-// validatePattern enforces the one wildcard rule: '*' may appear at most once,
-// and only as a trailing PORT wildcard on an otherwise-exact scheme://host —
-// "http://localhost:*", never "http://*.example.com" or a bare "*". Anything else
-// is rejected, because those looser shapes are exactly what makes an allow-list
+// validatePattern enforces the one wildcard rule: '*' may appear at most once, and
+// only as a trailing PORT wildcard on an otherwise-exact scheme://host —
+// "http://localhost:*", never "http://*.example.com" or a bare "*". Anything else is
+// rejected, because those looser shapes are exactly what makes an allow-list
 // silently permissive (docs/PLAN.md §2.4, §9.8).
+//
+// It also rejects the OTHER glob metacharacters ('?', '[', ']', '\\'). They were
+// unpoliced while '*' was, which meant "http://localhost:900?" passed validation and
+// then quietly matched a whole range of ports the operator never wrote, and a '['
+// could form a malformed pattern whose error one caller swallowed as deny and
+// another propagated as deny-everything. Rejecting them here is what lets Match be
+// TOTAL: no accepted pattern has an error case, so a deny is always a real deny.
 func validatePattern(p string) error {
 	scheme, host, ok := strings.Cut(p, "://")
 	if !ok || scheme == "" || host == "" {
@@ -57,6 +63,10 @@ func validatePattern(p string) error {
 	}
 	if strings.Contains(scheme, "*") {
 		return fmt.Errorf("'*' is not allowed in the scheme")
+	}
+	if i := strings.IndexAny(p, "?[]\\"); i >= 0 {
+		return fmt.Errorf("%q is a pattern metacharacter and is not allowed; "+
+			"the only wildcard permitted is a trailing \":*\" port wildcard", p[i:i+1])
 	}
 	switch strings.Count(host, "*") {
 	case 0:
@@ -73,28 +83,45 @@ func validatePattern(p string) error {
 }
 
 // Patterns returns the list in the form coder/websocket's
-// AcceptOptions.OriginPatterns expects. Every entry already IS a valid
-// path.Match pattern against "scheme://host", because ParseOrigins accepted only
-// that shape — this is a defensive copy, not a transformation.
+// AcceptOptions.OriginPatterns expects — a defensive copy, not a transformation.
+//
+// DO NOT USE IT TO GATE AN UPGRADE. websocket.Accept consults OriginPatterns only
+// AFTER returning allow on strings.EqualFold(r.Host, u.Host), so handing it this
+// list admits a strictly larger set than Match does: any origin whose host equals the
+// request's Host, scheme ignored. Host is a client-supplied header, so that shortcut
+// is authorisation granted by the attacker to themselves, and it is precisely what a
+// DNS-rebinding attack manufactures. Every entry point in this process must call
+// AllowUpgrade and pass InsecureSkipVerify, so that this package is the only matcher.
+// Kept because it remains the correct shape for a caller that genuinely wants the
+// library's semantics — of which there should be none.
 func (o Origins) Patterns() []string {
 	out := make([]string, len(o))
 	copy(out, o)
 	return out
 }
 
-// Match reports whether origin is allowed and, if so, returns the value to echo
-// in Access-Control-Allow-Origin: the REQUEST's origin, verbatim, never "*". "*"
-// is technically harmless while nothing here uses credentials, but it is a
-// footgun that becomes a real vulnerability the instant anyone adds one, and
-// echoing the matched origin costs nothing now (docs/PLAN.md §9.8).
+// Match reports whether origin is allowed and, if so, returns the value to echo in
+// Access-Control-Allow-Origin: the REQUEST's origin, verbatim, never "*". "*" is
+// technically harmless while nothing here uses credentials, but it is a footgun that
+// becomes a real vulnerability the instant anyone adds one, and echoing the matched
+// origin costs nothing now (docs/PLAN.md §9.8).
 //
-// Match and Patterns MUST accept exactly the same set — that is the entire
-// reason this package exists (docs/PLAN.md §2.4) — so Match reimplements the
-// identical primitive coder/websocket's Accept uses internally (path.Match,
-// case-folded, against "scheme://host"), rather than inventing a matching shape
-// of its own that could silently diverge. internal/signaling carries the test
-// that asserts the two agree against the real library (§12.2): this package
-// stays a leaf and does not import coder/websocket itself.
+// Match is the ONE matcher: the REST CORS surface and every WebSocket upgrade (via
+// AllowUpgrade) must accept exactly the set it accepts, which is the entire reason
+// this package exists (docs/PLAN.md §2.4).
+//
+// It compares directly rather than through path.Match. That is a deliberate change
+// from the original, which mirrored the library's primitive in the hope of matching
+// its behaviour — a hope the same-Host shortcut made false anyway, since no choice of
+// pattern primitive can reproduce a rule that fires before patterns are consulted.
+// Once the library is off the decision path, mirroring buys nothing and costs the
+// metacharacter surface and an error case; ParseOrigins has already reduced every
+// accepted pattern to exactly two shapes, so matching them by hand is both total and
+// obvious.
+//
+// A trailing ":*" is a PORT wildcard only: it matches any port, never a different
+// host, and never a missing port ("http://localhost:*" does not match
+// "http://localhost", which is a different origin to a browser).
 func (o Origins) Match(origin string) (string, bool) {
 	u, err := url.Parse(origin)
 	if err != nil || u.Scheme == "" || u.Host == "" {
@@ -102,9 +129,46 @@ func (o Origins) Match(origin string) (string, bool) {
 	}
 	target := strings.ToLower(u.Scheme + "://" + u.Host)
 	for _, pattern := range o {
-		if matched, _ := path.Match(strings.ToLower(pattern), target); matched {
+		if matchOne(strings.ToLower(pattern), target) {
 			return origin, true
 		}
 	}
 	return "", false
+}
+
+// matchOne compares one already-validated, already-lowercased pattern against one
+// already-lowercased "scheme://host" target.
+func matchOne(pattern, target string) bool {
+	prefix, isWildcard := strings.CutSuffix(pattern, ":*")
+	if !isWildcard {
+		return pattern == target
+	}
+	// The wildcard covers the port and nothing else: the host must match exactly and
+	// a port must actually be present. Rejecting an empty port keeps ":*" from
+	// admitting "scheme://host:" as a sneaky spelling of the portless origin.
+	port, ok := strings.CutPrefix(target, prefix+":")
+	return ok && port != "" && !strings.ContainsAny(port, ":/")
+}
+
+// AllowUpgrade reports whether a WebSocket upgrade carrying this Origin header value
+// may proceed. It is the single decision every upgrade endpoint in this process must
+// make — /ws and the dashboard's event stream — so that a security control does not
+// exist in two places and diverge.
+//
+// Two rules:
+//
+//   - An ABSENT Origin is allowed. Only browsers send the header; every Go peer sends
+//     none, and refusing them would break the entire data plane. This is not a hole:
+//     a request with no Origin is not a cross-origin browser request, which is the
+//     only thing this gate exists to stop.
+//   - A PRESENT Origin is allowed only if the operator listed it. Notably NOT if it
+//     merely agrees with the request's Host — that is the DNS-rebinding bypass, and
+//     the reason callers must pass InsecureSkipVerify to websocket.Accept and gate
+//     here instead of handing the library Patterns().
+func (o Origins) AllowUpgrade(origin string) bool {
+	if origin == "" {
+		return true
+	}
+	_, ok := o.Match(origin)
+	return ok
 }

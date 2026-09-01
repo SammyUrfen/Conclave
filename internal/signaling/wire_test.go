@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"runtime"
 	"strings"
 	"sync"
@@ -421,21 +422,23 @@ func TestHubOriginPolicy(t *testing.T) {
 	}
 }
 
-// TestOriginsMatchAgreesWithWebsocketAccept is the one assertion that is the
-// entire justification for internal/policy existing (docs/PLAN.md §2.4, §12.2):
-// Origins.Match — used by the future dashboard CORS surface — MUST accept exactly
-// the set that Origins.Patterns() makes the REAL websocket.Accept accept. This
-// package may import both signaling and policy, so the check runs against the
-// genuine library rather than a second copy of the matching algorithm.
+// TestUpgradeAdmitsExactlyTheMatchSet is the entire justification for
+// internal/policy existing (docs/PLAN.md §2.4, §12.2): the WebSocket upgrade and the
+// dashboard's REST CORS surface must admit EXACTLY the same set of browser origins,
+// so there is one matcher and it is ours.
 //
-// Empty origin is deliberately excluded: websocket.Accept always allows an absent
-// Origin header (it means a non-browser client, like our Go peer, sent no CORS
-// preflight at all), whereas Origins.Match(("")) correctly refuses to match
-// anything — there is no dashboard use case for CORS-approving a request with no
-// Origin. That is an intentional difference in what the two are FOR, not a case
-// the "same set" property covers; TestHubOriginPolicy's "no origin" case already
-// exercises the websocket.Accept side of it.
-func TestOriginsMatchAgreesWithWebsocketAccept(t *testing.T) {
+// This test previously compared our matcher against coder/websocket's, and it passed
+// while a critical bypass sat underneath it, because its candidate list contained no
+// case where the two disagree. They disagree on exactly one class, and it is the
+// dangerous one: authenticateOrigin returns ALLOW on strings.EqualFold(r.Host,
+// u.Host) before it ever consults OriginPatterns, and ignores the scheme while doing
+// so. policy.Origins has no such rule and must not gain one — Host is set by the
+// client, so "Origin agrees with Host" is a statement the attacker authored.
+//
+// So the same-Host candidate below is not one more row in a table; it is the point of
+// the test. The hub no longer delegates to the library's matcher at all, and this
+// pins that the decision it makes instead is precisely policy's.
+func TestUpgradeAdmitsExactlyTheMatchSet(t *testing.T) {
 	origins, err := policy.ParseOrigins("https://sammyurfen.github.io,http://localhost:*")
 	if err != nil {
 		t.Fatalf("ParseOrigins: %v", err)
@@ -454,6 +457,9 @@ func TestOriginsMatchAgreesWithWebsocketAccept(t *testing.T) {
 		"http://sammyurfen.github.io",
 		"HTTPS://SAMMYURFEN.GITHUB.IO",
 		"https://sammyurfen.github.io.evil.example",
+		// THE case the old list omitted: an origin identical to the server's own
+		// Host. The library allows it unconditionally; we must not.
+		"http://" + srv.Listener.Addr().String(),
 	}
 	for _, origin := range candidates {
 		t.Run(origin, func(t *testing.T) {
@@ -466,11 +472,20 @@ func TestOriginsMatchAgreesWithWebsocketAccept(t *testing.T) {
 				conn.CloseNow()
 			}
 			if gotAllowed != wantAllowed {
-				t.Errorf("origin %q: policy.Origins.Match says allowed=%v, but websocket.Accept (via Patterns()) says allowed=%v",
+				t.Errorf("origin %q: policy.Origins.Match says allowed=%v, but the upgrade says allowed=%v",
 					origin, wantAllowed, gotAllowed)
 			}
 		})
 	}
+
+	// Stated separately so the property cannot be satisfied by a Match that has
+	// quietly grown the same Host shortcut.
+	t.Run("the server's own origin is not on the list and must be refused", func(t *testing.T) {
+		self := "http://" + srv.Listener.Addr().String()
+		if _, ok := origins.Match(self); ok {
+			t.Fatalf("Match allowed the server's own origin %q; Host must carry no authority", self)
+		}
+	})
 }
 
 // TestHubPingReapsDeadSocket is the whole point of the WS keepalive: a TCP socket
@@ -748,4 +763,63 @@ func waitFor(t *testing.T, what string, pred func() bool) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+// TestPeerNameValidation bounds the one remaining unvalidated boundary input. A
+// peer name is not decoration: it becomes a map key, is fanned out to every member
+// of the meet on join and leave, keys the relay tree, and is re-serialised into
+// every dashboard snapshot — so an unbounded name is an amplification primitive,
+// N subscribers wide, bounded only by MaxHeaderBytes. Meet ids were capped for
+// exactly this reason; names were not, until now.
+func TestPeerNameValidation(t *testing.T) {
+	srv, wsURL, _ := newWireServer(t, HubConfig{}, nil)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	tests := []struct {
+		label  string
+		name   string
+		accept bool
+	}{
+		{label: "absent (a mesh peer)", name: "", accept: true},
+		{label: "ordinary label", name: "leaf-b", accept: true},
+		{label: "at the length bound", name: strings.Repeat("n", 64), accept: true},
+		{label: "one over the bound", name: strings.Repeat("n", 65)},
+		// ~64 KiB, well inside MaxHeaderBytes and far past anything a human types.
+		{label: "amplification payload", name: strings.Repeat("n", 64<<10)},
+		{label: "uppercase", name: "Relay"},
+		{label: "shell metacharacters", name: "a;rm -rf /"},
+		{label: "whitespace", name: "two words"},
+		{label: "leading hyphen looks like a flag", name: "-rf"},
+		{label: "path separator", name: "a/b"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.label, func(t *testing.T) {
+			// Percent-encode: the point is what the SERVER decodes, and an
+			// unescaped ';' or '&' would be mangled by query parsing before it ever
+			// reached the validator, quietly turning a hostile name into no name.
+			target := wsURL
+			if tt.name != "" {
+				target += "&name=" + url.QueryEscape(tt.name)
+			}
+			conn := dial(ctx, t, target)
+			defer conn.CloseNow()
+
+			got := readMsg(ctx, t, conn)
+			if tt.accept {
+				if got.Type != TypeJoined {
+					t.Fatalf("name %q was refused: %+v", tt.name, got)
+				}
+				return
+			}
+			if got.Type != TypeError {
+				t.Fatalf("name of %d chars was admitted: %+v", len(tt.name), got)
+			}
+			if !strings.Contains(got.Error, "name") {
+				t.Errorf("error %q does not say what was wrong", got.Error)
+			}
+		})
+	}
 }

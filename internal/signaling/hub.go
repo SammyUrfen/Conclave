@@ -275,11 +275,34 @@ func (h *Hub) nextID() string {
 func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 	// WebSocket upgrades are NOT subject to CORS — the browser sends Origin and it
 	// is the server's job to check it. An unlisted origin gets the upgrade refused
-	// outright, not a 200 with an empty stream. A Go peer sends no Origin header at
-	// all, so the library's same-origin default already passes it; this list only
-	// widens the policy for the browser dashboard, and never to "*".
+	// outright, not a 200 with an empty stream.
+	//
+	// The check is OURS, and InsecureSkipVerify turns the library's off. That reads
+	// backwards, so: websocket.Accept's own check returns ALLOW as soon as the Origin
+	// header's host equals the request's Host — before it looks at OriginPatterns at
+	// all, and ignoring the scheme. Host is a client-supplied header, so that rule
+	// lets a caller authorise itself, which is exactly what DNS rebinding
+	// manufactures: an attacker rebinds evil.example to this server's address, the
+	// victim's browser sends Host: evil.example with Origin: http://evil.example, the
+	// two agree, and the attacker has a socket into a process they could never dial
+	// directly. That reachability is the whole reason "it only listens on localhost"
+	// is considered safe. Handing the library our patterns therefore admits a
+	// strictly larger set than the REST surface does, from the one component whose
+	// purpose is to be the single trustworthy matcher.
+	//
+	// So: skip the library's gate and apply policy.Origins.AllowUpgrade, which the
+	// dashboard's event stream applies too. An absent Origin is allowed there —
+	// every Go peer sends none, and breaking that breaks the data plane.
+	if origin := r.Header.Get("Origin"); !h.allowedOrigins.AllowUpgrade(origin) {
+		http.Error(w, "origin not allowed", http.StatusForbidden)
+		h.log.Warn("rejected websocket upgrade from unlisted origin",
+			slog.String("origin", origin), slog.String("host", r.Host))
+		return
+	}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		OriginPatterns: h.allowedOrigins.Patterns(),
+		// Safe ONLY because the gate above has already run. Never set this without
+		// an explicit origin check preceding it.
+		InsecureSkipVerify: true,
 	})
 	if err != nil {
 		// Accept has already written an error response to w.
@@ -308,7 +331,23 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 	}
 	// name is the peer's self-declared label (optional). It is authoritative only
 	// as "what this connection calls itself" — the id remains the routing address.
+	//
+	// It is bounded and charset-restricted at this boundary for the same reason the
+	// meet id is, and with more urgency: a name is not merely stored, it is FANNED
+	// OUT — announced to every member on join and on leave, carried in every roster
+	// snapshot, used as a map key, adopted as the relay tree's node identity, and
+	// re-serialised into every dashboard event. An unbounded name is therefore an
+	// amplification primitive, N-subscribers wide, bounded only by MaxHeaderBytes.
+	// Reject rather than truncate: a shortened name could collide with a live one,
+	// and collisions are exactly what the join path refuses connections to prevent.
 	name := r.URL.Query().Get("name")
+	if !policy.ValidPeerName(name) {
+		_ = wsjson.Write(r.Context(), conn, Message{Type: TypeError, From: ServerID,
+			Error: fmt.Sprintf("peer name is invalid; it must match %s", policy.PeerNamePattern)})
+		h.log.Warn("rejected invalid peer name",
+			slog.Int("name_len", len(name)), slog.String("room_id", roomID))
+		return
+	}
 
 	// One cancelable context per connection, derived from the request context so
 	// it also dies if the HTTP server shuts down. Cancelling it is the single
