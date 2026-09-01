@@ -51,6 +51,11 @@
 // AdoptCoordinator, so this package never learns the arbiter's types — may raise a
 // peer's epoch.
 //
+// The Router also reports its REALIZED overlay position (Realized) — the parent it
+// is actually attached to and the children it is actually serving, in topology
+// names — which is the ground truth a newly promoted coordinator rebuilds the
+// previous tree from, instead of inheriting its predecessor's beliefs.
+//
 // Media sources (PlayIVF, SendSynthetic) feed an outbound track; sinks
 // (RecordVP8, DrainAndCount) consume a remote track. Codecs are pinned to VP8 in
 // the MediaEngine so both ends agree without depending on default ordering.

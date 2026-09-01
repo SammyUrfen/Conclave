@@ -277,6 +277,9 @@ func (r *Router) startReparent(ctx context.Context, oldParent, newParent string,
 		oldParent: oldParent, newParent: newParent, viaBackup: viaBackup,
 	}
 	r.rp.cancel = cancel
+	// The new parent is now OPEN but not realized: it must show up in a heartbeat as
+	// neither our parent nor our child until media arrives over it.
+	r.setParent(oldParent, newParent)
 	r.log.Info("re-parenting",
 		slog.String("old_parent", oldParent), slog.String("new_parent", newParent),
 		slog.Bool("via_backup", viaBackup))
@@ -323,7 +326,7 @@ func (r *Router) commitReparent() {
 	}
 	rp.cancel()
 	r.rp = nil
-	r.parentInUse = rp.newParent
+	r.setParent(rp.newParent, "")
 	r.log.Info("re-parent complete",
 		slog.String("old_parent", rp.oldParent), slog.String("new_parent", rp.newParent))
 	r.hookReparent("committed", rp.oldParent)
@@ -363,7 +366,7 @@ func (r *Router) reparentFailed(ctx context.Context, reason string) {
 	// Reality is still the OLD parent, whatever the pushed tree says. Recording it
 	// is what lets the next push see the move as still outstanding and retry it,
 	// rather than reading the tree back as if it had been realised.
-	r.parentInUse = rp.oldParent
+	r.setParent(rp.oldParent, "")
 	r.hookReparent("abandoned", rp.oldParent)
 	r.reportReparent(rp.oldParent, "", false, reason)
 }

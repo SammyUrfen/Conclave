@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -108,8 +109,14 @@ type Router struct {
 	// the one the pushed tree names: a re-parent that was abandoned keeps the old
 	// one. The diff compares against reality, not against the last tree, so an
 	// unrealised instruction is retried by the next push instead of being read back
-	// as done.
-	parentInUse string
+	// as done. pendingParent is a re-parent target whose session is open but which
+	// is not carrying media yet — it is neither our parent nor our child, and
+	// reporting it as either would put a wrong edge into a rebuilt tree.
+	//
+	// Both are written only from the Run goroutine but READ from the heartbeat
+	// goroutine (Realized), so both live under mu.
+	parentInUse   string
+	pendingParent string
 
 	// fence is this peer's view of control-plane AUTHORITY (§6.5): the epoch the
 	// arbiter last announced, who it named coordinator for that epoch, and the
@@ -481,8 +488,26 @@ func (r *Router) applyTopology(ctx context.Context, from string, payload []byte)
 // settles, one way or the other.
 func (r *Router) noteParent(topo *overlay.Topology) {
 	if r.rp == nil {
-		r.parentInUse = topo.ParentOf(r.selfName)
+		r.setParent(topo.ParentOf(r.selfName), "")
 	}
+}
+
+// setParent records the realized upstream and the pending one together, because
+// they are read together and an inconsistent pair (both naming the same peer, or a
+// stale pending) is what would put a wrong edge in a rebuilt tree.
+func (r *Router) setParent(inUse, pending string) {
+	r.mu.Lock()
+	r.parentInUse = inUse
+	r.pendingParent = pending
+	r.mu.Unlock()
+}
+
+// currentParent is the realized upstream: the peer we actually take media from,
+// which during a re-parent is still the OLD one.
+func (r *Router) currentParent() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.parentInUse
 }
 
 // liveState snapshots what the Router currently holds, in topology names, for the
@@ -490,7 +515,7 @@ func (r *Router) noteParent(topo *overlay.Topology) {
 // so a push that was partly applied (a neighbour that had not joined yet) converges
 // on the next one instead of drifting.
 func (r *Router) liveState() liveState {
-	st := liveState{roles: map[string]bool{}, parent: r.parentInUse}
+	st := liveState{roles: map[string]bool{}, parent: r.currentParent()}
 	// A re-parent in flight means the tree already says our parent is the new one
 	// while reality is still the old one. The diff must see reality.
 	if r.rp != nil {
@@ -1014,6 +1039,85 @@ func (r *Router) AdoptCoordinator(epoch uint64, coordinatorID string) bool {
 			slog.Uint64("epoch", epoch), slog.String("coordinator_id", coordinatorID))
 	}
 	return adopted
+}
+
+// SelfID reports the runtime peer id the server assigned this Router at join time,
+// or "" before the joined frame lands.
+//
+// It exists because the control plane keys on IDS while the tree is expressed in
+// NAMES: an arbiter announcement names the coordinator by id, so a peer comparing it
+// against its own -name can never recognise itself and would refuse to take the job
+// it was just given.
+func (r *Router) SelfID() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.selfID
+}
+
+// Realized reports this peer's ACTUAL overlay position — the parent it is really
+// attached to, the state of that edge, and the children it is really serving — in
+// topology names, for the heartbeat that feeds rebuild-from-peers (§6.6).
+//
+// "Realized" is the entire point and it is a different question from "what does the
+// tree say". A coordinator promoted mid-call reconstructs the previous tree from
+// these frames rather than inheriting its predecessor's beliefs, so anything here
+// that reports intent instead of fact re-introduces exactly the divergence the
+// mechanism exists to avoid. Three consequences, each of which is a way to get this
+// wrong:
+//
+//   - Nothing is filtered on the current topology. An edge the tree commanded but
+//     that never came up is absent; an edge that exists outside the tree (a promoted
+//     backup child, §7.5a) is present. Both are facts.
+//   - Nothing is filtered on connection state either. A child that has not reached
+//     `connected` is reported WITH its true state, because a half-established subtree
+//     is precisely the situation a handover has to reconstruct.
+//   - The pending target of a re-parent in flight is neither parent nor child, so it
+//     appears as neither. Our realized parent is still the old one until media
+//     arrives over the new edge.
+//
+// children are sorted by name ascending, matching metrics.Heartbeat.Normalize.
+// Sorting here as well as there is not redundant: an unordered slice would make the
+// edge list a new coordinator rebuilds depend on Go's map iteration order, and
+// Topology.Edges order is a replayed invariant. parentState is the pion
+// PeerConnectionState string, "" when there is no parent.
+//
+// Meaningful in tree mode only; a full-mesh Router has no overlay position to report.
+func (r *Router) Realized() (parent string, parentState string, children []metrics.ChildLink) {
+	r.mu.Lock()
+	parent = r.parentInUse
+	pending := r.pendingParent
+	// Snapshot names and sessions together under the one lock: reading the peer map
+	// and the id↔name map separately could observe a peer mid-teardown and report a
+	// child under an empty name.
+	type edge struct {
+		name    string
+		session *Session
+	}
+	edges := make([]edge, 0, len(r.peers))
+	for id, link := range r.peers {
+		name := r.nameByID[id]
+		if name == "" || link.session == nil {
+			continue // a nameless peer has no place in a tree rebuilt from names
+		}
+		edges = append(edges, edge{name: name, session: link.session})
+	}
+	r.mu.Unlock()
+
+	for _, e := range edges {
+		switch e.name {
+		case parent:
+			parentState = e.session.ConnectionState().String()
+		case pending:
+			// In flight, not realized: reporting it as a child would hand the
+			// coordinator an edge pointing the wrong way.
+		default:
+			children = append(children, metrics.ChildLink{
+				Name: e.name, State: e.session.ConnectionState().String(),
+			})
+		}
+	}
+	sort.Slice(children, func(i, j int) bool { return children[i].Name < children[j].Name })
+	return parent, parentState, children
 }
 
 // Fence returns a snapshot of this peer's authority state, for the host to report to
