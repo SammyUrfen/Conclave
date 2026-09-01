@@ -301,14 +301,16 @@ func TestNegotiationSerializer(t *testing.T) {
 			clk.waitCreated(t, i)
 			clk.advance(NegotiationRetryDelay)
 		}
+		// Count OFFERS, not raw sends: the same failing transport also carries
+		// trickled ICE candidates, which are not negotiation attempts.
 		waitFor(t, "all attempts to be spent", 5*time.Second, func() bool {
-			_, _, attempts := bTr.counts()
-			return attempts == 1+NegotiationRetries
+			offers, _, _ := bTr.counts()
+			return offers == 1+NegotiationRetries
 		})
 		// And then it STOPS: no further timer, no further attempt.
 		stableFor(t, "no attempt past the bound", 300*time.Millisecond, func() bool {
-			_, _, attempts := bTr.counts()
-			return attempts == 1+NegotiationRetries && clk.createdCount() == NegotiationRetries
+			offers, _, _ := bTr.counts()
+			return offers == 1+NegotiationRetries && clk.createdCount() == NegotiationRetries
 		})
 	})
 }
@@ -365,11 +367,22 @@ func TestSessionRemoveTrack(t *testing.T) {
 		if err != nil {
 			t.Fatalf("add forward track: %v", err)
 		}
-		waitFor(t, "the initial negotiation to settle", 5*time.Second, func() bool {
-			return offerer.pc.SignalingState() == webrtc.SignalingStateStable &&
-				offerer.pc.CurrentRemoteDescription() != nil
+		// Wait for QUIESCENCE, not just for the first answer: pion may fire another
+		// negotiation round on the return to stable, and starting the removal while
+		// one is pending would make "one more offer" ambiguous.
+		var before int
+		waitFor(t, "the initial negotiation to settle", 10*time.Second, func() bool {
+			if offerer.pc.SignalingState() != webrtc.SignalingStateStable ||
+				offerer.pc.CurrentRemoteDescription() == nil {
+				return false
+			}
+			o, _, _ := bTr.counts()
+			if o != before {
+				before = o
+				return false
+			}
+			return true
 		})
-		before, _, _ := bTr.counts()
 
 		if err := offerer.RemoveTrack(sender); err != nil {
 			t.Fatalf("RemoveTrack: %v", err)

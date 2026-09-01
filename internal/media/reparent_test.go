@@ -103,6 +103,7 @@ func newMeetFixture(t *testing.T, ctx context.Context, room string, cfgs map[str
 		cfg := cfgs[name]
 		cfg.SelfName = name
 		cfg.Managed = true
+		cfg.Clock = scaledClock{factor: 4}
 		r := NewRouter(logger, client, cfg)
 		f.routers[name] = r
 		f.wg.Add(1)
@@ -179,9 +180,12 @@ func TestRouterAppliesTopologyDiff(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
+	// b and c both send: after the re-shape c must RECEIVE something over its new
+	// edge, and a relay never sends media of its own, so a fixture with a single
+	// sender would starve the peer whose promotion is under test.
 	f := newMeetFixture(t, ctx, "diff", map[string]RouterConfig{
 		"a": {},
-		"b": {},
+		"b": {SendMedia: true},
 		"c": {SendMedia: true},
 	})
 

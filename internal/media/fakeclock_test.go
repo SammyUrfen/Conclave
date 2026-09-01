@@ -127,3 +127,28 @@ func (t *fakeTimer) fire(now time.Time) {
 	default:
 	}
 }
+
+// scaledClock is a real clock whose TIMERS run slow by a fixed factor. It exists
+// for one honest reason: under `-race`, pion's ICE+DTLS handshake on this machine
+// takes 2–3s for a bare pair and ~6s in a four-client fixture, which is longer than
+// the production ReparentConnectTimeout of 5s. Rather than loosen a frozen
+// production constant to suit the race detector, the integration fixture stretches
+// the CLOCK the state machine reads, so the logic under test is bit-for-bit the
+// production logic and only the wall-clock budget moves.
+//
+// Now() is deliberately NOT scaled: it feeds the relay's PLI throttle, which is
+// about real elapsed time between real packets.
+type scaledClock struct {
+	factor time.Duration
+}
+
+func (c scaledClock) Now() time.Time { return time.Now() }
+func (c scaledClock) NewTimer(d time.Duration) clock.Timer {
+	return clock.System().NewTimer(d * c.factor)
+}
+func (c scaledClock) NewTicker(d time.Duration) clock.Ticker {
+	return clock.System().NewTicker(d * c.factor)
+}
+func (c scaledClock) After(d time.Duration) <-chan time.Time {
+	return clock.System().After(d * c.factor)
+}

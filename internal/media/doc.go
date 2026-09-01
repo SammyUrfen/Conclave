@@ -26,6 +26,23 @@
 // original sender with the SSRC translated. That is what lets a *participant* relay
 // others' media, so the sender's upload stays O(1) and the relay bears the fan-out.
 //
+// From Phase 5 the tree CHANGES underneath all of this. A pushed topology is
+// diffed against what is live and only the difference is applied, which brings in
+// three things that are easy to get wrong and are documented where they live:
+//
+//   - Negotiation is serialized (session.go). Tracks are added and removed
+//     mid-call now, so at most one offer is outstanding per session; pion's own
+//     signaling state is the primary guard, because pion re-fires
+//     negotiation-needed itself on the return to stable.
+//   - A parent change is an ASYNCHRONOUS state machine (reparent.go), never a
+//     blocking sequence. Nothing on the Router's Run goroutine, and nothing in a
+//     pion callback, may wait on I/O — those goroutines are what FEED the
+//     negotiation a wait would be waiting for.
+//   - Make-before-break means two upstreams briefly feed the same downstream leg,
+//     so each leg's outgoing RTP is rewritten (rewrite.go) to stay one continuous
+//     sequence/timestamp series across the switch. A keyframe does not repair a
+//     broken transport ordering; it repairs reference state, one layer up.
+//
 // Media sources (PlayIVF, SendSynthetic) feed an outbound track; sinks
 // (RecordVP8, DrainAndCount) consume a remote track. Codecs are pinned to VP8 in
 // the MediaEngine so both ends agree without depending on default ordering.

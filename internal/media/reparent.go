@@ -1,0 +1,455 @@
+package media
+
+import (
+	"context"
+	"log/slog"
+	"time"
+
+	"github.com/pion/webrtc/v4"
+
+	"github.com/SammyUrfen/conclave/internal/metrics"
+	"github.com/SammyUrfen/conclave/internal/overlay"
+)
+
+// ReparentConnectTimeout bounds how long a peer waits for a new parent's session to
+// reach Connected. 5s covers ICE gathering + connectivity checks + DTLS on a normal
+// path with a STUN round trip; a path that has not connected in 5s is usually not
+// going to (a blocked candidate, a dead peer), and holding the old parent open
+// longer than that means paying double upload for a leg that will not arrive.
+const ReparentConnectTimeout = 5 * time.Second
+
+// ReparentMediaTimeout is how long a peer waits, after its new parent's session
+// reaches Connected, for actual media to arrive before declaring the promotion
+// failed.
+//
+// 3s: one keyframe interval plus slack. The relay requests an upstream keyframe the
+// moment a child connects, so on a working path the first track arrives well inside
+// this. Its whole job is to distinguish "I can reach B" from "B can reach the root",
+// which is exactly the distinction that makes ratification safe — ratifying on ICE
+// alone would let the coordinator stickily defend an edge carrying nothing.
+const ReparentMediaTimeout = 3 * time.Second
+
+// ParentDisconnectGrace is how long a parent edge may sit in
+// PeerConnectionStateDisconnected before we treat it as failed and promote the
+// backup. pion reaches `disconnected` on a short consent-freshness lapse and
+// frequently recovers on its own; `failed` is the definitive state and we act on it
+// immediately. This grace only covers the case where the edge sits in
+// `disconnected` indefinitely without ever declaring `failed`.
+const ParentDisconnectGrace = 2 * time.Second
+
+// internalQueue is the depth of the Router's own event channel. 32 is far more than
+// the handful of pion callbacks and timers that can be in flight at once; the depth
+// matters less than the NON-BLOCKING send, because blocking a pion dispatch
+// goroutine is precisely the failure this channel exists to fix.
+const internalQueue = 32
+
+// routerEventKind names the things that happen TO a Router asynchronously — on a
+// pion callback goroutine or a timer — and that must be handled on the Run
+// goroutine, which is the single owner of the topology and the peer map.
+type routerEventKind int
+
+const (
+	// evPeerState is a PeerConnection state transition, posted from pion's callback.
+	evPeerState routerEventKind = iota
+	// evPeerTrack says a remote media track arrived from a peer. It is the evidence
+	// that distinguishes "connected to the backup" from "the backup is attached to
+	// the root", and is therefore what ratifies a promotion.
+	evPeerTrack
+	// evReparentConnect / evReparentMedia are the two re-parent deadlines.
+	evReparentConnect
+	evReparentMedia
+	// evParentGrace fires when a parent edge has sat in `disconnected` for
+	// ParentDisconnectGrace without recovering or declaring itself failed.
+	evParentGrace
+)
+
+// routerEvent is one such happening. It carries names, not pointers, so handling it
+// on the Run goroutine re-resolves everything against the topology in force THEN —
+// the world may have moved on between posting and handling.
+type routerEvent struct {
+	kind     routerEventKind
+	peerName string
+	state    webrtc.PeerConnectionState
+	// gen fences a timer against the re-parent it was armed for: a superseded
+	// re-parent's deadline must not abort its successor.
+	gen uint64
+}
+
+// reparentPhase is the state of the at-most-one re-parent in flight.
+type reparentPhase int
+
+const (
+	rpOpening       reparentPhase = iota // new parent's session opened, waiting for Connected
+	rpAwaitingMedia                      // Connected; waiting for a track to prove the path
+)
+
+// reparent is the per-Router state machine for a parent change in flight.
+//
+// It exists because NOTHING in this path may block. applyTopology and every pion
+// callback run on goroutines that also FEED the negotiation they would be waiting
+// for: waiting for `Connected` on the Run goroutine starves the offer/answer frames
+// deliver() must route, so the wait times out every single time. Every wait is
+// therefore a timer plus a state transition, resumed on the Run goroutine.
+//
+// At most one is live. A topology arriving mid-re-parent supersedes it: the new
+// target is adopted and the old pending session is closed.
+type reparent struct {
+	gen       uint64
+	phase     reparentPhase
+	oldParent string
+	newParent string
+	// viaBackup marks a SELF-promotion (§7.5) rather than a coordinator-directed
+	// move. Only a self-promotion is reported to the control plane, because only a
+	// self-promotion is news to it.
+	viaBackup bool
+	// triedBackup records that the backup has already been attempted for this
+	// failure, so a second timeout abandons instead of looping.
+	triedBackup bool
+	// cancel retires this re-parent's deadline goroutines. Superseding or finishing
+	// a re-parent must not leave a timer alive that can abort its successor.
+	cancel context.CancelFunc
+}
+
+// postEvent hands an event to the Run goroutine. It NEVER blocks: it is called from
+// pion callbacks and from timer goroutines, and blocking either is the failure mode
+// being fixed. A full queue drops the event and says so — the coordinator's next
+// push re-drives the same decision, so a dropped event costs latency, not
+// correctness.
+func (r *Router) postEvent(ev routerEvent) {
+	select {
+	case r.internal <- ev:
+	default:
+		r.log.Warn("internal event queue full; dropping",
+			slog.Int("kind", int(ev.kind)), slog.String("peer_name", ev.peerName))
+	}
+}
+
+// armDeadline posts ev after d unless ctx is cancelled first. The goroutine is
+// joined by the Router's WaitGroup, so shutdown waits for it; ctx is the re-parent's
+// own, so superseding it retires the timer.
+func (r *Router) armDeadline(ctx context.Context, d time.Duration, ev routerEvent) {
+	timer := r.clk.NewTimer(d)
+	r.spawnTracked(func() {
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+		case <-timer.C():
+			r.postEvent(ev)
+		}
+	})
+}
+
+// handleInternal dispatches one asynchronous event. Run's select owns this, so
+// everything below runs on the single goroutine that mutates r.topo and r.peers —
+// which is why none of it takes a lock over the state machine itself.
+func (r *Router) handleInternal(ctx context.Context, ev routerEvent) {
+	switch ev.kind {
+	case evPeerState:
+		r.onPeerState(ctx, ev.peerName, ev.state)
+	case evPeerTrack:
+		r.onPeerTrack(ev.peerName)
+	case evReparentConnect:
+		if r.rp != nil && r.rp.gen == ev.gen && r.rp.phase == rpOpening {
+			r.reparentFailed(ctx, "new parent never connected")
+		}
+	case evReparentMedia:
+		if r.rp != nil && r.rp.gen == ev.gen && r.rp.phase == rpAwaitingMedia {
+			r.reparentFailed(ctx, "new parent connected but carried no media")
+		}
+	case evParentGrace:
+		// Still our parent, still not connected: the edge is not coming back.
+		if r.isParentEdge(ev.peerName) && r.connectionStateByName(ev.peerName) != webrtc.PeerConnectionStateConnected {
+			r.onParentLost(ctx, ev.peerName)
+		}
+	}
+}
+
+// onPeerState handles a PeerConnection transition on the Run goroutine.
+func (r *Router) onPeerState(ctx context.Context, name string, st webrtc.PeerConnectionState) {
+	switch st {
+	case webrtc.PeerConnectionStateConnected:
+		// A relay asks upstream for a keyframe the moment a child connects, so the
+		// joiner gets an I-frame instead of black video. This used to run inline on
+		// the pion callback; it runs here now because no pion callback may do work
+		// that can block.
+		if r.fwd != nil && r.isRelayNow() {
+			r.fwd.keyframeForChild(name)
+		}
+		if r.rp != nil && r.rp.phase == rpOpening && r.rp.newParent == name {
+			r.rp.phase = rpAwaitingMedia
+			r.hookReparent("connected", r.rp.oldParent)
+			r.armDeadline(r.rpCtx, ReparentMediaTimeout,
+				routerEvent{kind: evReparentMedia, gen: r.rp.gen})
+			// Ask for a keyframe on everything we expect from this parent. It is
+			// best-effort: until the new upstream's track arrives we do not know its
+			// SSRC, so this only fires for sources already learned. The parent's own
+			// keyframeForChild covers the rest from the other side.
+			if r.fwd != nil {
+				r.fwd.keyframeForChild(r.selfName)
+				r.fwd.requestUpstreamKeyframe(name)
+			}
+		}
+	case webrtc.PeerConnectionStateFailed:
+		if r.isParentEdge(name) {
+			r.onParentLost(ctx, name)
+		}
+	case webrtc.PeerConnectionStateDisconnected:
+		if r.isParentEdge(name) {
+			// `disconnected` is frequently a consent-freshness blip that heals
+			// itself; only a sustained one is a failure.
+			r.armDeadline(ctx, ParentDisconnectGrace, routerEvent{kind: evParentGrace, peerName: name})
+		}
+	}
+}
+
+// onPeerTrack handles "media arrived from name". For a re-parent in flight from
+// this peer, it is the ratifying evidence: reaching Connected proves we can reach
+// the new parent, an arrived track proves the new parent can reach the root.
+func (r *Router) onPeerTrack(name string) {
+	if r.rp == nil || r.rp.phase != rpAwaitingMedia || r.rp.newParent != name {
+		return
+	}
+	r.commitReparent()
+}
+
+// isParentEdge reports whether name is the peer we currently take media from. All
+// three answers matter and they can disagree: the tree's parent, the parent we are
+// really attached to (an abandoned re-parent leaves those different), and the old
+// parent of a re-parent still in flight — which is still our live upstream until
+// the new one carries media.
+func (r *Router) isParentEdge(name string) bool {
+	if name == "" {
+		return false
+	}
+	if r.rp != nil && r.rp.oldParent == name {
+		return true
+	}
+	return name == r.parentInUse || name == r.parentName()
+}
+
+// parentName is our upstream under the topology in force, or "" if we are the root
+// (or not yet attached).
+func (r *Router) parentName() string {
+	topo := r.currentTopo()
+	if topo == nil {
+		return ""
+	}
+	return topo.ParentOf(r.selfName)
+}
+
+// startReparent opens the session to newParent and returns IMMEDIATELY, leaving the
+// old parent fully intact and still receiving. Break-before-make would guarantee a
+// gap of ICE + DTLS + first keyframe (1–3s); make-before-break costs one transient
+// extra PeerConnection and one duplicated inbound stream for at most
+// ReparentConnectTimeout + ReparentMediaTimeout.
+func (r *Router) startReparent(ctx context.Context, oldParent, newParent string, viaBackup bool) {
+	if newParent == "" {
+		r.reportReparent(oldParent, "", false, "no parent to move to")
+		return
+	}
+	if r.rp != nil {
+		// Superseded. Close the pending session unless the new target is the same
+		// one, and retire its deadlines before they can abort the successor.
+		if r.rp.newParent != newParent {
+			r.stopPeerByName(r.rp.newParent)
+		}
+		r.rp.cancel()
+		if oldParent == "" {
+			oldParent = r.rp.oldParent
+		}
+	}
+
+	peerID := r.idForName(newParent)
+	if peerID == "" {
+		// The new parent is not in the roster yet. maybeStartPeer picks it up when
+		// its peer-joined arrives, and the coordinator will push again; abandoning
+		// here keeps the old parent, which is the one outcome that is never wrong.
+		r.log.Warn("re-parent target not in the roster yet", slog.String("new_parent", newParent))
+		r.reportReparent(oldParent, "", false, "new parent not present")
+		return
+	}
+
+	r.rpGen++
+	rpCtx, cancel := context.WithCancel(ctx)
+	r.rpCtx = rpCtx
+	r.rp = &reparent{
+		gen: r.rpGen, phase: rpOpening,
+		oldParent: oldParent, newParent: newParent, viaBackup: viaBackup,
+	}
+	r.rp.cancel = cancel
+	r.log.Info("re-parenting",
+		slog.String("old_parent", oldParent), slog.String("new_parent", newParent),
+		slog.Bool("via_backup", viaBackup))
+	r.hookReparent("opening", r.rp.oldParent)
+
+	// A backup edge is not in the tree, so Topology.Offers says nothing useful about
+	// it and the far end has no reason to offer. The peer that promotes is the one
+	// that initiates; the far end answers (see acceptBackupChild).
+	opts := peerOpts{}
+	if viaBackup {
+		yes := true
+		opts.offerer = &yes
+	}
+	r.startPeerOpt(ctx, peerID, opts)
+	r.armDeadline(rpCtx, ReparentConnectTimeout, routerEvent{kind: evReparentConnect, gen: r.rp.gen})
+
+	// A former child can become our parent after a re-root, in which case the
+	// session already exists and no state transition is coming. Synthesize one.
+	if r.connectionStateByName(newParent) == webrtc.PeerConnectionStateConnected {
+		r.postEvent(routerEvent{kind: evPeerState, peerName: newParent,
+			state: webrtc.PeerConnectionStateConnected})
+	}
+}
+
+// commitReparent is the point of no return: the new upstream carries media, so the
+// forwarder is spliced onto it and the old parent is torn down LAST, so nothing is
+// lost if any earlier step failed.
+//
+// Downstream sessions are NOT touched. Their forwarded tracks are the same objects
+// they always were; only the upstream feeding them changes, and rtpRewriter keeps
+// each one's RTP series continuous across the splice. That is what keeps a
+// re-parent local to one hop instead of cascading down the whole subtree.
+func (r *Router) commitReparent() {
+	rp := r.rp
+	r.hookReparent("committing", rp.oldParent)
+
+	if r.fwd != nil {
+		if sess := r.sessionByName(rp.newParent); sess != nil {
+			r.fwd.renameSource(rp.oldParent, rp.newParent, sess)
+		}
+	}
+	if id := r.idForName(rp.oldParent); id != "" {
+		r.stopPeer(id)
+	}
+	rp.cancel()
+	r.rp = nil
+	r.parentInUse = rp.newParent
+	r.log.Info("re-parent complete",
+		slog.String("old_parent", rp.oldParent), slog.String("new_parent", rp.newParent))
+	r.hookReparent("committed", rp.oldParent)
+	if rp.viaBackup {
+		r.reportReparent(rp.oldParent, rp.newParent, true, "backup parent promoted")
+	}
+}
+
+// reparentFailed is the abandon path. It tries the precomputed backup ONCE, and
+// otherwise KEEPS the old parent if it is still alive: the one outcome that is
+// never acceptable is ending up parentless because we obeyed an instruction we
+// could not carry out.
+func (r *Router) reparentFailed(ctx context.Context, reason string) {
+	rp := r.rp
+	r.log.Warn("re-parent failed",
+		slog.String("new_parent", rp.newParent), slog.String("reason", reason))
+	r.hookReparent("abandoning", rp.oldParent)
+
+	// The half-open session to the failed target must go, or it lingers as a peer
+	// that is in nobody's topology.
+	r.stopPeerByName(rp.newParent)
+
+	backup := r.backupParent()
+	if r.cfg.Backup && !rp.triedBackup && backup != "" && backup != rp.newParent && backup != rp.oldParent {
+		rp.cancel()
+		r.rp = nil
+		r.clearLocalBackup()
+		r.startReparent(ctx, rp.oldParent, backup, true)
+		if r.rp != nil {
+			r.rp.triedBackup = true
+		}
+		return
+	}
+
+	rp.cancel()
+	r.rp = nil
+	// Reality is still the OLD parent, whatever the pushed tree says. Recording it
+	// is what lets the next push see the move as still outstanding and retry it,
+	// rather than reading the tree back as if it had been realised.
+	r.parentInUse = rp.oldParent
+	r.hookReparent("abandoned", rp.oldParent)
+	r.reportReparent(rp.oldParent, "", false, reason)
+}
+
+// onParentLost is the local failover trigger: our upstream died, so we promote the
+// precomputed backup OURSELVES, without asking the coordinator. The coordinator's
+// job afterwards is to ratify the choice rather than fight it.
+func (r *Router) onParentLost(ctx context.Context, parent string) {
+	if r.rp != nil && r.rp.oldParent == parent {
+		return // already moving off this parent
+	}
+	if !r.cfg.Backup {
+		r.reportReparent(parent, "", false, "backup promotion disabled")
+		return
+	}
+	backup := r.backupParent()
+	if backup == "" || backup == parent {
+		r.log.Warn("parent lost with no usable backup", slog.String("parent", parent))
+		r.reportReparent(parent, "", false, "no backup parent")
+		return
+	}
+	// §5.6 step 3: clear the local backup on promotion. The pushed Backups still
+	// name the node we are moving TO — it was computed before the failure — so a
+	// naive second attempt would re-target the parent we already have and burn a
+	// whole ReparentConnectTimeout doing it. A backup is regained on the
+	// coordinator's next push, which this promotion's ratification triggers.
+	r.clearLocalBackup()
+	r.startReparent(ctx, parent, backup, true)
+}
+
+// backupParent is the precomputed secondary parent for this peer under the topology
+// in force, or "" if it has none — a normal answer, not an error: the root's own
+// children have no legal backup by construction.
+func (r *Router) backupParent() string {
+	topo := r.currentTopo()
+	if topo == nil {
+		return ""
+	}
+	return topo.BackupOf(r.selfName)
+}
+
+// clearLocalBackup drops our own entry from the topology in force. It replaces the
+// Backups slice rather than mutating it in place because Stats and the remote-track
+// sinks read the topology from other goroutines.
+func (r *Router) clearLocalBackup() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.topo == nil {
+		return
+	}
+	kept := make([]overlay.Backup, 0, len(r.topo.Backups))
+	for _, b := range r.topo.Backups {
+		if b.Node != r.selfName {
+			kept = append(kept, b)
+		}
+	}
+	next := *r.topo
+	next.Backups = kept
+	r.topo = &next
+}
+
+// reportReparent ships the outcome to the control plane through the injected
+// callback, so media never learns the wire format. Nil callback ⇒ no report, which
+// is the right default for the static-tree and mesh modes that have no coordinator.
+func (r *Router) reportReparent(from, to string, ok bool, reason string) {
+	if r.cfg.OnReparented == nil {
+		return
+	}
+	var epoch, rev uint64
+	if topo := r.currentTopo(); topo != nil {
+		epoch, rev = topo.Epoch, topo.Rev
+	}
+	r.cfg.OnReparented(metrics.Reparented{
+		Name: r.selfName, From: from, To: to, OK: ok,
+		Epoch: epoch, Rev: rev, Reason: reason,
+	})
+}
+
+// hookReparent notifies the test observer, if any, of a state transition and
+// whether the old parent's session is still open at that moment — the one fact that
+// distinguishes make-before-break from break-before-make and that a poller cannot
+// reliably catch. oldParent is passed explicitly so the terminal transitions still
+// report after r.rp has been cleared.
+func (r *Router) hookReparent(phase, oldParent string) {
+	if r.reparentHook == nil {
+		return
+	}
+	r.reparentHook(phase, r.hasSession(oldParent))
+}
