@@ -223,13 +223,18 @@ function applyDelta(snapshot, frame) {
       if (data.epoch !== undefined) next.epoch = data.epoch;
       break;
     }
-    case 'stale_rejected': {
-      const cur = typeof next.stale_rejected === 'number' ? next.stale_rejected : 0;
-      next.stale_rejected = cur + 1;
-      break;
-    }
+    // stale_rejected is deliberately NOT applied here. `next.stale_rejected` is the
+    // MEET-WIDE sum (coordinator.RoomSnapshot.StaleRejected) — it only ever arrives on a
+    // snapshot frame. This event's `data.total` is a DIFFERENT number: one peer's
+    // cumulative refusal count this session (coordinator.Event.Count), which the wire
+    // doc (internal/dashboard/wire.go) says can legitimately DECREASE when that peer
+    // rejoins and its fence resets. Synthesizing the meet-wide sum from a per-peer delta
+    // — by incrementing or by any other arithmetic — would mix two different counters
+    // into one field. The per-peer total is shown on the event-log line itself
+    // (see views/eventLog.js); the meet-wide sum stays whatever the last snapshot said
+    // until the next snapshot/resync refreshes it for real.
     default:
-      break; // member_joined/left, settling, unbuildable, failover, demo: log-only (see report)
+      break; // member_joined/left, settling, unbuildable, failover, demo, stale_rejected: log-only
   }
   return next;
 }
