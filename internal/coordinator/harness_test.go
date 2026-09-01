@@ -49,6 +49,23 @@ type push struct {
 // fakeSender records what the coordinator decided to send, without any signaling.
 // It is safe for concurrent use because the coordinator's sender goroutine calls it
 // while the test goroutine reads.
+//
+// DELIBERATE DUPLICATION of simnet.Capture, and simnet.Recorder below. Adopting the
+// shared versions would drop ~60 lines here, and it was offered — but they are
+// documented as never blocking and never failing, which is right for a scenario harness
+// and is precisely what two tests in this package need them NOT to be:
+//
+//   - TestSenderStallCannotStallTheLoop needs a Sender that WEDGES, to prove a blocking
+//     adapter cannot take the control loop with it;
+//   - TestAmbiguityWindowStalePushIsNeitherSentNorAccepted needs one that wedges AND
+//     announces its entry, so a term can be ended at a moment when there is provably one
+//     push inside the network call and three queued behind it. That construction is the
+//     whole test; without it the interleaving is hoped for rather than made.
+//
+// Adopting simnet.Capture for the easy cases would leave two Sender fakes in one package
+// — and, because the internal tests cannot import simnet at all (simnet imports
+// coordinator), a third publisher fake alongside them. One local pair that can do
+// everything beats three that each do part.
 type fakeSender struct {
 	mu      sync.Mutex
 	pushes  []push
