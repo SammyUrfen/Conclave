@@ -297,6 +297,15 @@ func (c *fakeClock) After(time.Duration) <-chan time.Time { return make(chan tim
 
 func (c *fakeClock) tickers() int { c.mu.Lock(); defer c.mu.Unlock(); return c.armed }
 
+// advance moves virtual time forward without delivering a tick. RTTProbe measures an
+// interval that a ticker never bounds — the probe call itself — so it needs time to
+// move inside the probe function.
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
 // tick delivers one virtual tick to whoever is ranging the ticker.
 func (c *fakeClock) tick() {
 	c.mu.Lock()
