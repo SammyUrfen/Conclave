@@ -62,6 +62,12 @@
 // it is held — exempt from the diff's ordinary "close what the tree does not name" —
 // until the coordinator rules on the promotion, one way or the other.
 //
+// Because the Router owns the peer's one signaling stream, it is also the seam the
+// control plane reaches its host through: OnCoordinator carries the arbiter's
+// announcement (which tells a peer it has the coordinator job) and OnControlFrame
+// carries the membership, metrics, heartbeat and reparent frames it needs to do it.
+// Both run on the Run goroutine, so a host queues and returns.
+//
 // The Router also reports its REALIZED overlay position (Realized) — the parent it
 // is actually attached to and the children it is actually serving, in topology
 // names — which is the ground truth a newly promoted coordinator rebuilds the
