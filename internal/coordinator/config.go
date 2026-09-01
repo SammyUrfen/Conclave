@@ -100,6 +100,13 @@ const (
 // help. Attaching successfully resets it, so this bounds one EPISODE and never a peer.
 const MaxStrandedRepairs = 3
 
+// Stickiness returns a pointer to ms, for setting Config.StickinessMs.
+//
+// It exists so an explicit zero — the memoryless build — reads as an intention at the
+// call site (`StickinessMs: coordinator.Stickiness(0)`) rather than as a temporary
+// variable whose address is being taken for reasons the reader has to reconstruct.
+func Stickiness(ms float64) *float64 { return &ms }
+
 // ReasonUnratifiable is the Event.Reason on the EventUnbuildable that reports a repair
 // loop giving up: the coordinator believes its tree is correct and the peer cannot
 // confirm it.
@@ -158,8 +165,26 @@ type Config struct {
 	// cannot serve. A caller may set a positive value to attach newcomers at an
 	// assumed budget instead.
 	DefaultUploadKbps int
-	// StickinessMs is the re-parent margin. 0 ⇒ overlay.DefaultStickinessMs.
-	StickinessMs float64
+	// StickinessMs is the re-parent margin in milliseconds — how much closer a
+	// challenger must be before a node is moved off the parent it already has.
+	//
+	// A POINTER, and that is the whole point: ZERO IS A REAL REQUEST here. It means
+	// "no margin at all", the Phase-4 memoryless build, which -stickiness-ms documents
+	// and startup validation explicitly permits. Under the `0 ⇒ use the default`
+	// convention the rest of this struct uses, an operator asking for memoryless was
+	// silently given 25 — the flag accepted and ignored.
+	//
+	// A pointer is the one shape that satisfies both properties at once: nil is the
+	// struct's zero value and resolves to the SAFE default (stability-preserving, so a
+	// caller who never thought about it cannot get the memoryless behaviour by
+	// accident), while a pointer to 0 is an unambiguous request for zero. A negative
+	// sentinel was rejected because it inverts that — it would make the struct's zero
+	// value mean "memoryless" — and a bool beside the float was rejected as the
+	// discriminator-field trap this contract has caught three times.
+	//
+	// Use Stickiness to construct one. normalize COPIES the value, so a caller may
+	// reuse or mutate its Config afterwards without retuning a running coordinator.
+	StickinessMs *float64
 	// Dwell is the sustained-degradation window. 0 ⇒ DegradationDwell.
 	Dwell time.Duration
 	// RecomputeCooldown is the anti-thrash window. 0 ⇒ RecomputeCooldown.
@@ -194,16 +219,46 @@ type Config struct {
 	SelfName string
 }
 
-// normalize resolves every zero-valued knob to its documented default, so the rest
-// of the package never repeats a "0 means X" check and a Config literal can carry
-// only what the caller wants to change.
+// normalize resolves every unset knob to its documented default, so the rest of the
+// package never repeats a "0 means X" check and a Config literal can carry only what
+// the caller wants to change.
+//
+// READ THIS BEFORE ADDING A FIELD. Config contains BOTH kinds of zero, and the
+// ambiguity between them is what let -stickiness-ms be accepted and ignored. The
+// distinction is not decoration:
+//
+//	MEANINGFUL — the zero is a REQUEST, and normalize must leave it alone:
+//	  DegradedAfter, GoneAfter  0 ⇒ derive the threshold per node from the cadence the
+//	                            PEER declared, which is the shipped design and the only
+//	                            thing keeping a slow-beating peer from being reaped
+//	  SocketDetection           0 ⇒ disable the gone-threshold floor (what simnet
+//	                            wants: it models no socket layer)
+//	  DefaultUploadKbps         0 ⇒ an unproven peer is a LEAF, never a relay — and
+//	                            this one is safe only because the request and the
+//	                            default happen to coincide
+//	  SelfName                  "" ⇒ the coordinator runs inside the arbiter process
+//
+//	NO PREFERENCE — the zero means "use the constant", and normalize fills it in:
+//	  Dwell, RecomputeCooldown, JoinSettle, Clock
+//
+//	NEITHER — invalid, and deliberately not defaulted. MaxDepth and StreamKbps have no
+//	  sensible default, and overlay.BuildTree rejects a zero with a precise message; a
+//	  silent default here would turn a misconfiguration into a wrong tree.
+//
+// A field whose zero is meaningful CANNOT use the second convention. StickinessMs is
+// one, so it is a pointer; if a new field is another, give it the same treatment rather
+// than a comment promising a behaviour the code cannot execute.
 func normalize(cfg Config) Config {
 	if cfg.DefaultUploadKbps < 0 {
 		cfg.DefaultUploadKbps = 0
 	}
-	if cfg.StickinessMs == 0 {
-		cfg.StickinessMs = overlay.DefaultStickinessMs
+	// A pointer to a fresh copy either way: nil resolves to the default, and a
+	// supplied value is copied out of the caller's variable.
+	ms := overlay.DefaultStickinessMs
+	if cfg.StickinessMs != nil {
+		ms = *cfg.StickinessMs
 	}
+	cfg.StickinessMs = &ms
 	if cfg.Dwell <= 0 {
 		cfg.Dwell = DegradationDwell
 	}

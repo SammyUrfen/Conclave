@@ -61,8 +61,8 @@ func TestStickinessReachesTheBuilderUnchanged(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, rs := stickinessDriver(t, tc.cfg)
-			if got := rs.cons("r").StickinessMs; got != tc.want {
+			d, rs := stickinessDriver(t, tc.cfg)
+			if got := d.c.constraintsFor(rs, "r").StickinessMs; got != tc.want {
 				t.Fatalf("the builder was given StickinessMs %v, want %v", got, tc.want)
 			}
 		})
@@ -74,9 +74,9 @@ func TestStickinessReachesTheBuilderUnchanged(t *testing.T) {
 func TestConfigDoesNotAliasACallersPointer(t *testing.T) {
 	ms := 40.0
 	cfg := Config{StickinessMs: &ms}
-	_, rs := stickinessDriver(t, cfg)
+	d, rs := stickinessDriver(t, cfg)
 	ms = 999
-	if got := rs.cons("r").StickinessMs; got != 40 {
+	if got := d.c.constraintsFor(rs, "r").StickinessMs; got != 40 {
 		t.Fatalf("the coordinator aliased the caller's pointer; StickinessMs is now %v", got)
 	}
 }
@@ -104,8 +104,8 @@ func TestMemorylessRequestProducesAMemorylessTree(t *testing.T) {
 
 	build := func(t *testing.T, cfg Config) *overlay.Topology {
 		t.Helper()
-		_, rs := stickinessDriver(t, cfg)
-		cons := rs.cons("r")
+		d, rs := stickinessDriver(t, cfg)
+		cons := d.c.constraintsFor(rs, "r")
 		prev := &overlay.Topology{
 			Epoch: cons.Epoch, Rev: cons.Rev - 1, Root: "r",
 			Edges: []overlay.Edge{{Parent: "r", Child: "p"}, {Parent: "r", Child: "q"},
