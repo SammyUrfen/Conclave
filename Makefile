@@ -66,8 +66,29 @@ lint: ## Run golangci-lint if installed; otherwise fall back to go vet.
 		$(GO) vet $(PKGS); \
 	fi
 
+# CONTROL_PLANE_DIRS are the packages that must be deterministically testable: they
+# drive every temporal behaviour through the injected clock.Clock, so a scenario can
+# run a whole meet in virtual time. Reaching for the wall clock in one of them breaks
+# replayability silently, which is why this is a build gate and not a review note.
+CONTROL_PLANE_DIRS := internal/overlay internal/simnet internal/coordinator internal/arbiter
+
+# WALL_CLOCK_CALLS is every entry point into package time that reads or waits on real
+# time. The list is deliberately exhaustive: a guard that catches time.Now but misses
+# time.NewTicker is worse than no guard, because it reads as coverage.
+WALL_CLOCK_CALLS := time\.(Now|Since|Until|Sleep|After|AfterFunc|Tick|NewTimer|NewTicker)\(
+
+.PHONY: check-determinism
+check-determinism: ## Fail if a control-plane package reaches for the wall clock.
+	@dirs="$(wildcard $(CONTROL_PLANE_DIRS))"; \
+	if [ -z "$$dirs" ]; then echo "check-determinism: no control-plane packages yet"; exit 0; fi; \
+	if grep -rnE '$(WALL_CLOCK_CALLS)' $$dirs; then \
+		echo ""; \
+		echo "^ the control plane must use the injected clock.Clock (see docs/PLAN.md 4.7)"; \
+		exit 1; \
+	fi
+
 .PHONY: check
-check: fmt vet test ## Format + vet + test: the pre-commit gate.
+check: fmt vet check-determinism test ## Format + vet + determinism + test: the pre-commit gate.
 
 .PHONY: clean
 clean: ## Remove build and coverage artifacts.

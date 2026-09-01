@@ -2,9 +2,12 @@ package metrics
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
+	"github.com/SammyUrfen/conclave/internal/clock"
 	"github.com/SammyUrfen/conclave/internal/overlay"
 )
 
@@ -47,6 +50,181 @@ type Report struct {
 	CPUPct  float64 `json:"cpu_pct,omitempty"`
 }
 
+// The liveness family. HeartbeatInterval sets the cadence; everything else is
+// expressed as a MULTIPLE of the cadence a peer actually declared, never of the
+// default. That is deliberate: -heartbeat lets a peer pick its own interval, so a
+// threshold hard-coded from the 1 s default would declare a peer beating every 5 s
+// gone while it is beating perfectly.
+const (
+	// HeartbeatInterval is the DEFAULT cadence a peer beats at.
+	//
+	// 1 s is the floor that is still robust: a heartbeat is ~120 bytes, so 1 Hz
+	// costs ~1 kbit/s per peer — nothing next to a 2 Mbit/s video stream. Faster
+	// (250 ms) starts producing false misses from ordinary scheduler jitter and GC
+	// pauses on a loaded home PC, the "too sensitive" failure mode; slower (5 s)
+	// makes the backstop detection unusably sluggish.
+	HeartbeatInterval = 1 * time.Second
+
+	// DegradedBeats is how many consecutive beats may be missed before a node is
+	// demoted from healthy to degraded. Three rather than one because a single
+	// missed beat is a GC pause, a Wi-Fi retransmit, or a scheduler hiccup — not a
+	// failure. Nothing acts on this transition; it colours the dashboard and arms
+	// the degradation dwell.
+	DegradedBeats = 3
+
+	// GoneBeats is how many consecutive beats may be missed before a node is
+	// declared gone, which DOES trigger repair.
+	//
+	// Eight looks slow for a system claiming keyframe-bounded failover, and it is —
+	// on purpose. This is the BACKSTOP, not the fast path: a child sees its parent's
+	// PeerConnection fail within a few seconds and promotes its precomputed backup
+	// without asking anyone, so by the time this fires the tree has usually already
+	// healed and the coordinator is merely ratifying. Keeping the backstop
+	// conservative is therefore nearly free, and it buys immunity to the ugliest
+	// false positive there is: declaring a healthy peer dead because the ARBITER's
+	// own network hiccuped.
+	GoneBeats = 8
+)
+
+// DegradedAfter is the silence that demotes a peer beating every interval from
+// healthy to degraded. A non-positive interval falls back to HeartbeatInterval, so a
+// caller that has not yet learned a peer's cadence still gets the sane default.
+func DegradedAfter(interval time.Duration) time.Duration {
+	return DegradedBeats * cadence(interval)
+}
+
+// GoneAfter is the silence that declares a peer beating every interval gone.
+func GoneAfter(interval time.Duration) time.Duration {
+	return GoneBeats * cadence(interval)
+}
+
+// cadence normalises a declared interval, so every threshold here defaults the same
+// way rather than each caller inventing its own fallback.
+func cadence(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return HeartbeatInterval
+	}
+	return interval
+}
+
+// ValidateLivenessBudget checks the one relationship between conclave's two
+// independent liveness detectors, and is meant to be called at startup and treated
+// as fatal.
+//
+// interval is the heartbeat cadence peers are configured to use; socketDetection is
+// the worst case time the transport takes to notice a dead socket
+// (signaling.Hub.LivenessBudget). The socket detector must NOT be the slower of the
+// two. If it were, there would be a window in which the control plane has declared a
+// peer gone and dropped it from the tree while its socket is still registered — and
+// because the join handshake only happens on a NEW connection, a peer whose socket
+// never closed could never re-announce itself. It would be permanently ejected from
+// a meet it believes it is still in, with no error anywhere.
+//
+// (The resurrection contract on signaling.Observer.Heartbeat is the other half of
+// this defence: it lets a still-live peer come back even inside that window. This
+// check keeps the window from existing in the first place.)
+func ValidateLivenessBudget(interval, socketDetection time.Duration) error {
+	if socketDetection <= 0 {
+		return fmt.Errorf("socket liveness budget %v must be positive", socketDetection)
+	}
+	if gone := GoneAfter(interval); socketDetection > gone {
+		return fmt.Errorf("socket liveness budget %v exceeds the gone threshold %v for a %v heartbeat: "+
+			"shorten the WebSocket ping interval/timeout or lengthen -heartbeat",
+			socketDetection, gone, cadence(interval))
+	}
+	return nil
+}
+
+// Heartbeat is the peer's liveness beat and its report of REALIZED topology state —
+// what it has actually connected, as opposed to what the coordinator believes it
+// told it to connect. That distinction is what makes rebuild-from-peers possible: a
+// new coordinator reconstructs ground truth, not its predecessor's beliefs.
+//
+// Like Report it carries no id: the server stamps the sender, and a self-reported id
+// would let a peer file liveness as someone else.
+type Heartbeat struct {
+	// Name is the peer's stable label.
+	Name string `json:"name"`
+	// Seq is a per-peer monotonic counter starting at 1, reset on rejoin. It lets
+	// the coordinator detect gaps (missed beats) without depending on its own clock,
+	// and lets a late duplicate be dropped idempotently.
+	Seq uint64 `json:"seq"`
+	// IntervalMs is the cadence THIS peer beats at, in milliseconds.
+	//
+	// It is on the wire because the thresholds are multiples of the cadence and the
+	// peer is the only party that knows its own -heartbeat setting. Without it the
+	// coordinator would have to assume the default and would declare a deliberately
+	// slow peer gone while it is beating perfectly. Absent (0) means "the default";
+	// read it through Interval rather than the field.
+	IntervalMs uint64 `json:"interval_ms,omitempty"`
+	// Epoch is the coordinator term this peer believes is current, and Rev the
+	// topology revision it has realized. The coordinator uses them to spot a peer
+	// running behind and re-push to it specifically.
+	Epoch uint64 `json:"epoch"`
+	Rev   uint64 `json:"rev"`
+	// Parent is the peer's realized upstream neighbour name, "" if it is the root or
+	// currently parentless. ParentState is the pion PeerConnectionState string of
+	// that edge ("new"/"connecting"/"connected"/"disconnected"/"failed"/"closed").
+	Parent      string `json:"parent,omitempty"`
+	ParentState string `json:"parent_state,omitempty"`
+	// Children are the realized downstream neighbours. Absent on a leaf.
+	//
+	// This is an ORDERED SLICE and not the map[string]string it obviously wants to
+	// be, and that is load-bearing rather than fussy. A coordinator taking over a
+	// meet rebuilds the previous tree's edge list from these heartbeats, and
+	// overlay.Topology.Edges ORDER is an invariant the stability-preserving builder
+	// replays. Go randomises map iteration, so a map here would make the first tree
+	// of every new epoch depend on nothing but hash seed — silently destroying the
+	// determinism the whole test strategy rests on. Call Normalize before sending.
+	Children []ChildLink `json:"children,omitempty"`
+}
+
+// ChildLink is one realized downstream edge: the child's stable label and the pion
+// PeerConnectionState string of the edge to it.
+type ChildLink struct {
+	Name  string `json:"name"`
+	State string `json:"state"`
+}
+
+// Interval is the cadence this peer declared, falling back to HeartbeatInterval when
+// the frame does not say (a peer built before the field existed, or one that left it
+// at the default). Read the cadence through this, never through IntervalMs.
+func (h Heartbeat) Interval() time.Duration {
+	if h.IntervalMs == 0 {
+		return HeartbeatInterval
+	}
+	return time.Duration(h.IntervalMs) * time.Millisecond
+}
+
+// Normalize puts Children into the canonical order (name ascending) so that two
+// peers reporting the same realized edges produce byte-identical frames. A sender
+// must call it; a receiver may call it defensively. Name is a total order because a
+// meet rejects duplicate names.
+func (h *Heartbeat) Normalize() {
+	sort.Slice(h.Children, func(i, j int) bool { return h.Children[i].Name < h.Children[j].Name })
+}
+
+// Reparented tells the control plane that a peer changed its own parent WITHOUT
+// being told to — it promoted its precomputed backup after its primary failed, or it
+// tried and could not. It is the peer half of the fast-failover path; the
+// coordinator's job is to RATIFY the choice rather than fight it.
+type Reparented struct {
+	Name string `json:"name"`
+	// From is the parent that was lost; To is the parent now in use ("" when OK is
+	// false and the peer is parentless).
+	From string `json:"from"`
+	To   string `json:"to,omitempty"`
+	// OK is false when the peer could not attach to any parent and is stranded. The
+	// coordinator must treat that as an urgent threshold event: a stranded peer is
+	// receiving nothing, so the anti-thrash cooldown is the wrong trade there.
+	OK bool `json:"ok"`
+	// Epoch/Rev of the topology the peer was acting under, so the coordinator can
+	// tell a failover under the current tree from one under a tree it has replaced.
+	Epoch  uint64 `json:"epoch"`
+	Rev    uint64 `json:"rev"`
+	Reason string `json:"reason,omitempty"` // free text for the dashboard; never parsed
+}
+
 // Reporter is the producer side of the metrics plane: on its own goroutine it
 // samples the local node's telemetry every interval and ships it to the
 // coordinator. It is deliberately decoupled from both signaling and media — it
@@ -56,6 +234,7 @@ type Report struct {
 type Reporter struct {
 	log      *slog.Logger
 	interval time.Duration
+	clk      clock.Clock
 	sample   func() Report
 	send     func(Report) error
 }
@@ -64,14 +243,23 @@ type Reporter struct {
 // current telemetry (so live values can be folded in later without changing this
 // type); send ships one report and may fail transiently — telemetry is
 // best-effort and a dropped report must never fault the peer, so send errors are
-// logged, not returned. A zero or negative interval falls back to DefaultInterval.
-func NewReporter(log *slog.Logger, interval time.Duration, sample func() Report, send func(Report) error) *Reporter {
+// logged, not returned. A zero or negative interval falls back to DefaultInterval,
+// and a nil clk to clock.System().
+//
+// clk is a parameter rather than a package-level var swapped in tests: a global
+// would race between parallel tests and would make "which clock is this code on"
+// invisible at the call site.
+func NewReporter(log *slog.Logger, interval time.Duration, clk clock.Clock, sample func() Report, send func(Report) error) *Reporter {
 	if interval <= 0 {
 		interval = DefaultInterval
+	}
+	if clk == nil {
+		clk = clock.System()
 	}
 	return &Reporter{
 		log:      log.With(slog.String("component", "metrics-reporter")),
 		interval: interval,
+		clk:      clk,
 		sample:   sample,
 		send:     send,
 	}
@@ -85,13 +273,13 @@ func NewReporter(log *slog.Logger, interval time.Duration, sample func() Report,
 func (r *Reporter) Run(ctx context.Context) {
 	r.report()
 
-	ticker := time.NewTicker(r.interval)
+	ticker := r.clk.NewTicker(r.interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-ticker.C():
 			r.report()
 		}
 	}

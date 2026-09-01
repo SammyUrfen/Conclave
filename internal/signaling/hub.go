@@ -6,11 +6,15 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+
+	"github.com/SammyUrfen/conclave/internal/clock"
 )
 
 const (
@@ -30,6 +34,61 @@ const (
 	readLimit = 1 << 20
 )
 
+// The control-link liveness constants. They are a FAMILY, not three independent
+// numbers, and the relationship between them is the load-bearing part.
+const (
+	// WSPingInterval is how often the Hub sends a WebSocket protocol ping.
+	//
+	// A TCP connection that dies without a FIN — a sleeping laptop, a yanked
+	// Ethernet cable — leaves wsjson.Read blocked forever, so without a ping the
+	// Hub would carry a ghost member in the roster indefinitely. 5 s is far inside
+	// any NAT or proxy idle timeout (typically 60 s+), so the ping doubles as a
+	// keepalive, and it is cheap: a ping frame is a handful of bytes next to a
+	// 2 Mbit/s video stream.
+	//
+	// It is deliberately NOT the 15 s a keepalive alone would want. See
+	// WSLivenessBudget for the constraint that pins it down.
+	WSPingInterval = 5 * time.Second
+	// WSPingTimeout is how long the Hub waits for the matching pong. A pong needs
+	// no application processing, so a socket that cannot turn one around in 2 s is
+	// dead rather than slow. It must stay strictly below WSPingInterval or pings
+	// would overlap; NewHubWithConfig enforces that.
+	WSPingTimeout = 2 * time.Second
+	// WSLivenessBudget is the worst-case time for the Hub to notice a dead socket:
+	// the socket can die immediately after a successful ping, so detection takes a
+	// full interval plus the pong timeout.
+	//
+	// REQUIRED RELATIONSHIP, and the reason the two constants above are as tight as
+	// they are: this budget must not exceed the control plane's "gone" threshold
+	// (metrics.GoneAfter of the peer's declared heartbeat cadence, 8 s at the 1 s
+	// default). If the socket detector were the slower of the two, there would be a
+	// window in which the coordinator has declared a peer gone and removed it from
+	// the tree while its socket is still registered here — and since TypeJoined is
+	// only ever sent on a NEW connection, a peer whose socket never closed could
+	// never rejoin. It would be permanently ejected from a meet it believes it is
+	// still in. cmd/server validates the relationship at startup with
+	// metrics.ValidateLivenessBudget; this comment states it where the numbers live.
+	WSLivenessBudget = WSPingInterval + WSPingTimeout
+)
+
+// RoomIDPattern is the one rule for what a meet id may look like. A meet id is used
+// verbatim as a ?room= query value and as an HTTP path segment, so it is constrained
+// at the boundary rather than escaped at every use.
+//
+// The same pattern governs POST /api/meets. Enforcing it here too is what stops a
+// meet existing that /ws admitted but the API would reject — a meet the dashboard
+// could never render.
+const RoomIDPattern = `^[a-z0-9][a-z0-9_-]{0,63}$`
+
+// roomIDRe is the compiled RoomIDPattern. A package-level var holding an immutable
+// compiled regexp is not the mutable global state this project forbids; it is the
+// standard Go idiom for "compile once, at init, and fail loudly if the literal is
+// wrong".
+var roomIDRe = regexp.MustCompile(RoomIDPattern)
+
+// ValidRoomID reports whether id is an acceptable meet id (RoomIDPattern).
+func ValidRoomID(id string) bool { return roomIDRe.MatchString(id) }
+
 // Observer is the control-plane's window into room membership and telemetry. A Hub
 // with an observer set (Phase 4's coordinator) calls it when a peer joins or
 // leaves and when a metrics frame arrives — the events that let the coordinator
@@ -40,9 +99,28 @@ const (
 // safe to call concurrently and cheap (the coordinator's implementation just
 // enqueues an event and returns).
 type Observer interface {
+	// PeerJoined reports a new member. name is the peer's self-declared label.
 	PeerJoined(roomID, peerID, name string)
+	// PeerLeft reports a member whose socket has closed — a graceful quit, a write
+	// failure, or a keepalive ping the peer failed to answer.
 	PeerLeft(roomID, peerID string)
+	// Metrics delivers an opaque metrics.Report body.
 	Metrics(roomID, peerID string, payload []byte)
+	// Heartbeat delivers an opaque metrics.Heartbeat body.
+	//
+	// RESURRECTION CONTRACT — the half the control plane must implement. The Hub
+	// keeps no health state: it calls this for every LIVE socket, whatever verdict
+	// the control plane has reached about that peer. So a heartbeat arriving for a
+	// peerID the control plane has already declared gone is PROOF the peer is back,
+	// and MUST be treated as a re-join rather than dropped. Everything a re-join
+	// needs is present: peerID is server-stamped here, and the payload carries the
+	// peer's name. The Hub cannot help by re-sending TypeJoined, because that frame
+	// is bound to a new connection and this socket never closed — this callback is
+	// the only re-entry point. Hub.Roster is the authoritative cross-check.
+	Heartbeat(roomID, peerID string, payload []byte)
+	// Reparented delivers an opaque metrics.Reparented body: a peer promoted its
+	// own backup parent, or failed to and is stranded.
+	Reparented(roomID, peerID string, payload []byte)
 }
 
 // Hub is the signaling rendezvous: it multiplexes connected peers into rooms and
@@ -56,8 +134,38 @@ type Observer interface {
 // otherwise. Crucially, actual sends happen AFTER the lock is released (see
 // register/unregister/relay): we snapshot the target clients under the lock,
 // then fan out, so a slow socket can never be written to while the map is held.
+// HubConfig parameterises a Hub. Every field has a working zero value except Log,
+// so a caller may pass only what it wants to change.
+type HubConfig struct {
+	// Log is the structured logger. nil falls back to slog.Default().
+	Log *slog.Logger
+	// Clock drives the keepalive ping. nil ⇒ clock.System().
+	Clock clock.Clock
+	// AllowedOrigins gates the WebSocket upgrade. Empty means same-origin only,
+	// which is the Phase 1-4 behaviour and is correct for a Go peer (it sends no
+	// Origin header at all). The browser dashboard lives on a different origin, so
+	// it needs its host listed here — the SAME list the REST surface uses for CORS,
+	// injected in both places rather than written down twice. Patterns are matched
+	// by path.Match against "scheme://host", so "http://localhost:*" is a port
+	// wildcard. Never pass "*".
+	AllowedOrigins []string
+	// PingInterval / PingTimeout override the keepalive cadence. 0 ⇒ the WSPing*
+	// defaults. They exist so a test can observe a reap without waiting seconds,
+	// and so an operator running a non-default -heartbeat can keep the two liveness
+	// detectors consistent (see WSLivenessBudget).
+	PingInterval time.Duration
+	PingTimeout  time.Duration
+}
+
 type Hub struct {
 	log *slog.Logger
+	clk clock.Clock
+
+	// allowedOrigins, pingInterval and pingTimeout are fixed at construction and
+	// read-only thereafter, so they need no lock.
+	allowedOrigins []string
+	pingInterval   time.Duration
+	pingTimeout    time.Duration
 
 	mu    sync.Mutex
 	rooms map[string]map[string]*member // roomID → peerID → member
@@ -69,13 +177,51 @@ type Hub struct {
 	obs Observer
 }
 
-// NewHub returns a ready Hub that logs through the given logger.
-func NewHub(log *slog.Logger) *Hub {
+// NewHub returns a ready Hub with default configuration, logging through the given
+// logger. It is the Phase 1-4 constructor and is kept so no existing call site has
+// to change; it delegates to NewHubWithConfig.
+func NewHub(log *slog.Logger) *Hub { return NewHubWithConfig(HubConfig{Log: log}) }
+
+// NewHubWithConfig returns a ready Hub built from cfg.
+//
+// It PANICS on a self-contradictory ping configuration (a pong timeout at least as
+// long as the ping interval, which would let pings overlap and make the detection
+// window unbounded). That is the fail-loud discipline this project uses for config:
+// the alternative is a Hub that silently never reaps a dead socket. The signature
+// has no error return because this is a programmer error at startup, not a runtime
+// condition — the same call the standard library makes for regexp.MustCompile and
+// time.NewTicker.
+func NewHubWithConfig(cfg HubConfig) *Hub {
+	if cfg.Log == nil {
+		cfg.Log = slog.Default()
+	}
+	if cfg.Clock == nil {
+		cfg.Clock = clock.System()
+	}
+	if cfg.PingInterval <= 0 {
+		cfg.PingInterval = WSPingInterval
+	}
+	if cfg.PingTimeout <= 0 {
+		cfg.PingTimeout = WSPingTimeout
+	}
+	if cfg.PingTimeout >= cfg.PingInterval {
+		panic(fmt.Sprintf("signaling: PingTimeout %v must be shorter than PingInterval %v",
+			cfg.PingTimeout, cfg.PingInterval))
+	}
 	return &Hub{
-		log:   log.With(slog.String("component", "signaling")),
-		rooms: make(map[string]map[string]*member),
+		log:            cfg.Log.With(slog.String("component", "signaling")),
+		clk:            cfg.Clock,
+		allowedOrigins: cfg.AllowedOrigins,
+		pingInterval:   cfg.PingInterval,
+		pingTimeout:    cfg.PingTimeout,
+		rooms:          make(map[string]map[string]*member),
 	}
 }
+
+// LivenessBudget is the worst case time this Hub takes to notice a dead socket. It
+// is exported so the binary that also knows the heartbeat cadence can validate the
+// cross-package relationship documented on WSLivenessBudget.
+func (h *Hub) LivenessBudget() time.Duration { return h.pingInterval + h.pingTimeout }
 
 // SetObserver attaches a control-plane observer. Call it once, before serving any
 // connection (there is no lock guarding obs precisely because it is fixed at
@@ -102,10 +248,13 @@ func (h *Hub) nextID() string {
 // ServeWS upgrades an HTTP request to a WebSocket and runs that peer's
 // connection to completion. It is the http.HandlerFunc mounted at GET /ws.
 func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
+	// WebSocket upgrades are NOT subject to CORS — the browser sends Origin and it
+	// is the server's job to check it. An unlisted origin gets the upgrade refused
+	// outright, not a 200 with an empty stream. A Go peer sends no Origin header at
+	// all, so the library's same-origin default already passes it; this list only
+	// widens the policy for the browser dashboard, and never to "*".
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		// Our Go peer sends no Origin header, so the default same-origin check
-		// passes. When a browser dashboard arrives (Phase 7), authorize its host
-		// here via OriginPatterns rather than reaching for InsecureSkipVerify.
+		OriginPatterns: h.allowedOrigins,
 	})
 	if err != nil {
 		// Accept has already written an error response to w.
@@ -121,6 +270,16 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 	roomID := r.URL.Query().Get("room")
 	if roomID == "" {
 		roomID = defaultRoom
+	}
+	// Reject rather than normalise: a silently rewritten meet id would put a peer in
+	// a different meet than the one it asked for, which is far harder to debug than
+	// a refusal. The write is safe without a writePump because no other goroutine
+	// has this connection yet.
+	if !ValidRoomID(roomID) {
+		_ = wsjson.Write(r.Context(), conn, Message{Type: TypeError, From: ServerID,
+			Error: fmt.Sprintf("meet id %q is invalid; it must match %s", roomID, RoomIDPattern)})
+		h.log.Warn("rejected invalid meet id", slog.String("room_id", roomID))
+		return
 	}
 	// name is the peer's self-declared label (optional). It is authoritative only
 	// as "what this connection calls itself" — the id remains the routing address.
@@ -154,9 +313,19 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 		return // deferred conn.CloseNow closes the socket
 	}
 
-	// Now start our write side and greet ourselves with our id + the current roster.
-	go c.writePump(ctx)
+	// Start the two per-connection helper goroutines. Both select on ctx, and both
+	// are JOINED below before ServeWS returns: a goroutine that merely gets
+	// cancelled is still a goroutine, and one leaked per connection is invisible in
+	// a two-peer test and fatal in a long-lived server.
+	var pumps sync.WaitGroup
+	pumps.Add(2)
+	go func() { defer pumps.Done(); c.writePump(ctx) }()
+	go func() { defer pumps.Done(); h.pingLoop(ctx, c) }()
+
 	c.send(Message{Type: TypeJoined, To: c.id, Peers: peers})
+	// Broadcast the new roster AFTER the newcomer's joined frame is queued on its
+	// own FIFO channel, so it learns its id before it is handed a roster naming it.
+	h.broadcastMembership(roomID)
 
 	// Only NOW tell the control plane this peer joined — strictly after its joined
 	// frame is queued on its own outbound channel. The coordinator reacts by pushing
@@ -172,7 +341,49 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 	// which is what keeps the handler (and so the accepted conn) alive. When it
 	// returns, the peer is gone: leave the room and tell everyone.
 	h.readLoop(ctx, roomID, c)
+	// Cancel before joining: readLoop returning means the connection is finished, and
+	// the two helpers only unblock once their shared context is done.
+	cancel()
+	pumps.Wait()
 	h.unregister(roomID, c)
+}
+
+// pingLoop is the control-link liveness detector, and it needs its own goroutine:
+// readLoop occupies the handler goroutine for the life of the connection, and it is
+// blocked in exactly the read that a dead-but-unclosed socket never satisfies.
+//
+// It writes a PROTOCOL ping, not a Message, so it cannot be routed through the
+// member's outbound channel — that channel carries application frames and is drained
+// by writePump. Concurrency is safe anyway: coder/websocket serialises control
+// frames against data writes with its own internal write lock, and Conn.Ping is
+// documented as requiring a concurrent reader (our readLoop) to consume the pong.
+// The alternative — teaching writePump to emit pings — would put liveness detection
+// behind the very buffer that a wedged peer fills, so a stuck peer could never be
+// detected. Hence: separate goroutine, direct control write.
+func (h *Hub) pingLoop(ctx context.Context, c *member) {
+	ticker := h.clk.NewTicker(h.pingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C():
+			pingCtx, cancel := context.WithTimeout(ctx, h.pingTimeout)
+			err := c.conn.Ping(pingCtx)
+			cancel()
+			if err != nil {
+				if ctx.Err() != nil {
+					return // the connection was already going away
+				}
+				// A pong that never arrives is a definitive "this socket is dead",
+				// which is the one thing a blocked read can never tell us.
+				c.log.Info("keepalive ping failed; closing member",
+					slog.String("peer_id", c.id), slog.Any("error", err))
+				c.cancel()
+				return
+			}
+		}
+	}
 }
 
 // register adds c to roomID and returns the members already present (id + name),
@@ -254,6 +465,51 @@ func (h *Hub) unregister(roomID string, c *member) {
 	if h.obs != nil {
 		h.obs.PeerLeft(roomID, c.id)
 	}
+	// And tell every peer, so an ELECTED coordinator (which has no Observer) sees
+	// the same departure the server-hosted one does. Without this a peer-hosted
+	// coordinator would learn a graceful leave only from the multi-second "gone"
+	// backstop, i.e. the two coordinator hosts would have different fidelity and the
+	// difference would only surface after a handover.
+	h.broadcastMembership(roomID)
+}
+
+// Roster returns a snapshot of roomID's members, ordered by name then id.
+//
+// The order is a TOTAL order chosen for replayability, not join order: a coordinator
+// that rebuilds state from a roster must get the same sequence every time, or the
+// first tree it computes depends on Go's map iteration.
+//
+// It is derived purely from which sockets are registered, so it is ground truth
+// about liveness and carries no health verdict: a peer the control plane has
+// declared gone is still here if its socket is. That is what makes it the
+// authoritative cross-check for the resurrection contract on Observer.Heartbeat.
+func (h *Hub) Roster(roomID string) []Peer {
+	h.mu.Lock()
+	room := h.rooms[roomID]
+	peers := make([]Peer, 0, len(room))
+	for id, m := range room {
+		peers = append(peers, Peer{ID: id, Name: m.name})
+	}
+	h.mu.Unlock()
+
+	sort.Slice(peers, func(i, j int) bool {
+		if peers[i].Name != peers[j].Name {
+			return peers[i].Name < peers[j].Name
+		}
+		return peers[i].ID < peers[j].ID
+	})
+	return peers
+}
+
+// broadcastMembership pushes the authoritative roster to every member of roomID.
+// It is a snapshot, so a peer that missed a delta frame self-corrects on the next
+// membership change instead of drifting permanently.
+func (h *Hub) broadcastMembership(roomID string) {
+	roster := h.Roster(roomID)
+	if len(roster) == 0 {
+		return // the meet is gone; there is nobody to tell
+	}
+	h.SendRoom(roomID, Message{Type: TypeMembership, Peers: roster})
 }
 
 // readLoop reads frames from c until the connection ends, routing each one. It
@@ -287,7 +543,12 @@ func (h *Hub) readLoop(ctx context.Context, roomID string, c *member) {
 // relayed); every other type is server-originated and rejected if received.
 func (h *Hub) route(roomID string, sender *member, msg Message) {
 	switch msg.Type {
-	case TypeOffer, TypeAnswer, TypeCandidate:
+	case TypeOffer, TypeAnswer, TypeCandidate, TypeTopology:
+		// TypeTopology is relayed like a media frame when it comes FROM a peer: that
+		// is an elected coordinator pushing a tree. The Hub deliberately does not
+		// check whether the arbiter actually named that peer coordinator — policing
+		// the control plane here would grow a second, divergent copy of the epoch
+		// rules. The receiving peer's fence rejects an unauthorised push.
 		if msg.To == "" {
 			sender.send(Message{Type: TypeError, To: sender.id,
 				Error: fmt.Sprintf("%s frame missing 'to'", msg.Type)})
@@ -297,12 +558,23 @@ func (h *Hub) route(roomID string, sender *member, msg Message) {
 			sender.send(Message{Type: TypeError, To: sender.id,
 				Error: fmt.Sprintf("unknown peer %q in room", msg.To)})
 		}
-	case TypeMetrics:
-		// Telemetry is for the coordinator, not another peer: hand the raw payload
-		// to the observer and stop. Without a coordinator (Phases 1–3) it is simply
-		// dropped — a peer that reports into a relay-only server loses nothing.
-		if h.obs != nil {
+	case TypeMetrics, TypeHeartbeat, TypeReparented:
+		// Control-plane frames are for the coordinator, not another peer: hand the
+		// raw payload to the observer and stop. Without a coordinator (Phases 1–3)
+		// they are simply dropped — a peer reporting into a relay-only server loses
+		// nothing. When the coordinator is an elected PEER, it is the server's
+		// Observer implementation that forwards the frame onward, so a peer still
+		// needs only one control link.
+		if h.obs == nil {
+			return
+		}
+		switch msg.Type {
+		case TypeMetrics:
 			h.obs.Metrics(roomID, sender.id, msg.Payload)
+		case TypeHeartbeat:
+			h.obs.Heartbeat(roomID, sender.id, msg.Payload)
+		case TypeReparented:
+			h.obs.Reparented(roomID, sender.id, msg.Payload)
 		}
 	default:
 		sender.log.Warn("ignoring unexpected frame type from peer",
@@ -321,8 +593,42 @@ func (h *Hub) SendTo(roomID, peerID string, msg Message) bool {
 	if dst == nil {
 		return false
 	}
-	dst.send(msg)
+	dst.send(stampServer(msg))
 	return true
+}
+
+// SendRoom delivers a server-originated frame to EVERY member of roomID and returns
+// how many it reached. Like SendTo, the roster snapshot is taken under the lock and
+// the sends happen after it is released, so one wedged peer cannot stall the rest.
+//
+// This is the first genuinely BROADCAST frame in the system — every other fan-out
+// carries per-peer content — and it exists for the coordinator announcement and the
+// membership snapshot, both of which are the same fact for everyone.
+func (h *Hub) SendRoom(roomID string, msg Message) int {
+	h.mu.Lock()
+	room := h.rooms[roomID]
+	members := make([]*member, 0, len(room))
+	for _, m := range room {
+		members = append(members, m)
+	}
+	h.mu.Unlock()
+
+	msg = stampServer(msg)
+	for _, m := range members {
+		m.send(msg)
+	}
+	return len(members)
+}
+
+// stampServer marks a frame as server-originated, but only when no sender is set.
+// An explicit From is preserved because the server also FORWARDS frames on a peer's
+// behalf — telemetry relayed to an elected coordinator keeps the original peer's id,
+// or the receiver would attribute it to the arbiter and fence it wrongly.
+func stampServer(msg Message) Message {
+	if msg.From == "" {
+		msg.From = ServerID
+	}
+	return msg
 }
 
 // relay forwards msg to the peer named by msg.To within roomID. It returns false
