@@ -28,10 +28,20 @@ func TestLivenessFrameWireFormat(t *testing.T) {
 					{Name: "leaf-a", State: "connecting"},
 					{Name: "leaf-b", State: "connected"},
 				},
+				StaleRejected: 3,
 			},
 			want: `{"name":"relay","seq":4,"interval_ms":1000,"epoch":2,"rev":9,` +
 				`"parent":"root","parent_state":"connected",` +
-				`"children":[{"name":"leaf-a","state":"connecting"},{"name":"leaf-b","state":"connected"}]}`,
+				`"children":[{"name":"leaf-a","state":"connecting"},{"name":"leaf-b","state":"connected"}],` +
+				`"stale_rejected":3}`,
+		},
+		{
+			// The common case is a peer that has refused nothing, so the key is
+			// omitempty: a healthy fleet does not pay for a counter that is 0 on
+			// every beat from every peer.
+			name: "a peer that has refused nothing omits the counter",
+			in:   Heartbeat{Name: "leaf-a", Seq: 2, Epoch: 1, Rev: 4, Parent: "relay", ParentState: "connected"},
+			want: `{"name":"leaf-a","seq":2,"epoch":1,"rev":4,"parent":"relay","parent_state":"connected"}`,
 		},
 		{
 			name: "leaf heartbeat omits children",
@@ -306,3 +316,64 @@ type fakeTicker struct{ ch chan time.Time }
 
 func (t fakeTicker) C() <-chan time.Time { return t.ch }
 func (t fakeTicker) Stop()               {}
+
+// TestStaleRejectedSemantics pins the two properties the coordinator's emission rule
+// depends on. It fires EventStale on an INCREASE rather than per heartbeat, so the
+// counter must be cumulative within a session and must restart at 0 on rejoin — the
+// fence itself resets on TypeJoined, so a carried-over total would either mask a real
+// refusal (the new total never exceeds the old one) or invent one (a rejoined peer
+// appears to refuse everything again).
+func TestStaleRejectedSemantics(t *testing.T) {
+	t.Run("an increase is visible to a difference check", func(t *testing.T) {
+		// The exact comparison the coordinator makes across consecutive beats.
+		beats := []Heartbeat{
+			{Name: "leaf-a", Seq: 1, Epoch: 2, Rev: 5},
+			{Name: "leaf-a", Seq: 2, Epoch: 2, Rev: 5, StaleRejected: 1},
+			{Name: "leaf-a", Seq: 3, Epoch: 2, Rev: 5, StaleRejected: 1},
+			{Name: "leaf-a", Seq: 4, Epoch: 2, Rev: 5, StaleRejected: 4},
+		}
+		wantEmit := []bool{false, true, false, true}
+		var prev uint64
+		for i, hb := range beats[0:] {
+			emit := hb.StaleRejected > prev
+			if emit != wantEmit[i] {
+				t.Errorf("beat %d (total %d, prev %d): emit = %v, want %v",
+					i, hb.StaleRejected, prev, emit, wantEmit[i])
+			}
+			prev = hb.StaleRejected
+		}
+	})
+
+	t.Run("a rejoin restarts the counter with Seq", func(t *testing.T) {
+		// A rejoining peer restarts Seq at 1; StaleRejected restarts with it,
+		// because both describe a session that has just begun.
+		before := Heartbeat{Name: "leaf-a", Seq: 9, Epoch: 2, Rev: 5, StaleRejected: 7}
+		after := Heartbeat{Name: "leaf-a", Seq: 1, Epoch: 0, Rev: 0}
+		if after.Seq != 1 {
+			t.Fatalf("a rejoin must restart Seq at 1, got %d", after.Seq)
+		}
+		if after.StaleRejected != 0 {
+			t.Errorf("a rejoin must restart StaleRejected at 0, got %d", after.StaleRejected)
+		}
+		if after.StaleRejected >= before.StaleRejected {
+			t.Errorf("a restarted counter (%d) must not look like an increase over the old session (%d)",
+				after.StaleRejected, before.StaleRejected)
+		}
+	})
+
+	t.Run("round-trips", func(t *testing.T) {
+		for _, want := range []uint64{0, 1, 4096} {
+			raw, err := json.Marshal(Heartbeat{Name: "a", StaleRejected: want})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var back Heartbeat
+			if err := json.Unmarshal(raw, &back); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if back.StaleRejected != want {
+				t.Errorf("round-trip of %d gave %d", want, back.StaleRejected)
+			}
+		}
+	})
+}
