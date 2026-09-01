@@ -9,6 +9,8 @@ package coordinator_test
 
 import (
 	"encoding/json"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/SammyUrfen/conclave/internal/coordinator"
@@ -39,23 +41,37 @@ func beatWithStale(t *testing.T, hb metrics.Heartbeat, stale uint64) []byte {
 }
 
 // TestStaleRejectedShimIsStillNeeded is a SELF-REMOVING SCAFFOLD. The coordinator reads
-// `stale_rejected` off the raw heartbeat payload because metrics.Heartbeat has no field
-// for it yet. The instant WI-0 adds one, this test fails and names the two lines to
-// delete — so the duplicate reader cannot quietly become a second source of truth that
-// drifts from the first.
+// `stale_rejected` off the raw heartbeat payload because metrics.Heartbeat had no field
+// for it. The instant WI-0 adds one, this test fails and names the two lines to delete —
+// so the duplicate reader cannot quietly become a second source of truth that drifts
+// from the first.
+//
+// CORRECTED DETECTION. The first version marshalled a zero-valued Heartbeat and looked
+// for the key in the JSON. That could never fire: the shipped field is tagged
+// `omitempty`, so a zero value omits the key and the test concluded the field did not
+// exist — a test passing for the wrong reason, which is the exact class of bug the
+// scaffold was built to prevent. Reflection over the struct TAGS sees the field whatever
+// its value and whatever its encoding options, because it asks about the type rather
+// than about one instance of it.
 func TestStaleRejectedShimIsStillNeeded(t *testing.T) {
-	raw, err := json.Marshal(metrics.Heartbeat{Name: "a", Seq: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var m map[string]any
-	if err := json.Unmarshal(raw, &m); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := m["stale_rejected"]; ok {
+	if _, ok := jsonTagField(reflect.TypeOf(metrics.Heartbeat{}), "stale_rejected"); ok {
 		t.Fatal("metrics.Heartbeat now carries stale_rejected: delete coordinator's staleShim " +
-			"and read hb.StaleRejected directly, then delete this test")
+			"and its second json.Unmarshal, read hb.StaleRejected directly, then replace this test")
 	}
+}
+
+// jsonTagField finds the struct field whose json tag NAME is want, ignoring options such
+// as omitempty. Asking the type rather than a marshalled instance is the whole point:
+// the value of a field says nothing about whether the field exists.
+func jsonTagField(t reflect.Type, want string) (reflect.StructField, bool) {
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		if name == want {
+			return f, true
+		}
+	}
+	return reflect.StructField{}, false
 }
 
 // TestMemberEventsCarryTheServerStampedID: §9.4 mandates an `id` on member_joined and
