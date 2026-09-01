@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -97,6 +98,9 @@ type callConfig struct {
 	managed                                   bool
 	uploadKbps                                int
 	nat                                       overlay.NATType
+	// mediaPorts is the UDP range media is confined to; the zero value means
+	// "ephemeral", which is what a peer run without -media-ports gets.
+	mediaPorts [2]uint16
 
 	// heartbeat is the liveness cadence this peer declares on every beat.
 	//
@@ -153,7 +157,14 @@ func parseArgs(args []string) (options, error) {
 		"on primary-parent failure, promote the coordinator's precomputed backup parent without asking (tree mode)")
 	coordinatable := fs.Bool("coordinatable", true,
 		"may this peer be elected coordinator; false declines (a laptop on battery) (managed mode)")
+	mediaPorts := fs.String("media-ports", "",
+		"confine media (ICE/SRTP) to these UDP ports, e.g. 47000-47019; empty lets the OS choose (call mode)")
 	if err := fs.Parse(args); err != nil {
+		return options{}, err
+	}
+
+	ports, err := parseMediaPorts(*mediaPorts)
+	if err != nil {
 		return options{}, err
 	}
 
@@ -185,6 +196,7 @@ func parseArgs(args []string) (options, error) {
 		heartbeat:     *heartbeat,
 		backup:        *backup,
 		coordinatable: *coordinatable,
+		mediaPorts:    ports,
 	}
 	if err := validate(cfg, *timeout); err != nil {
 		return options{}, err
@@ -378,6 +390,46 @@ func finite(v float64) float64 {
 	return v
 }
 
+// parseMediaPorts reads the -media-ports flag: "lo-hi", or a bare port meaning a
+// range of one, or empty for pion's ephemeral default.
+//
+// It fails loud on anything unusable, because the alternative is far worse than a
+// startup error: a peer given an impossible range gathers no candidates, never
+// connects, and reports nothing that points at the flag. Bad config should stop a
+// peer at startup, not surface as a mysterious missing stream later.
+func parseMediaPorts(s string) ([2]uint16, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return [2]uint16{}, nil
+	}
+	lo, hi, found := strings.Cut(s, "-")
+	if !found {
+		hi = lo
+	}
+	parse := func(field string) (uint16, error) {
+		n, err := strconv.Atoi(strings.TrimSpace(field))
+		// Port 0 is excluded deliberately: to the kernel it means "pick any", so a
+		// range starting at 0 would silently disable the confinement this flag exists
+		// to provide.
+		if err != nil || n < 1 || n > 65535 {
+			return 0, fmt.Errorf("invalid -media-ports %q: %q is not a port in 1-65535", s, strings.TrimSpace(field))
+		}
+		return uint16(n), nil
+	}
+	min, err := parse(lo)
+	if err != nil {
+		return [2]uint16{}, err
+	}
+	max, err := parse(hi)
+	if err != nil {
+		return [2]uint16{}, err
+	}
+	if max < min {
+		return [2]uint16{}, fmt.Errorf("invalid -media-ports %q: the high port %d is below the low port %d", s, max, min)
+	}
+	return [2]uint16{min, max}, nil
+}
+
 func sampleReport(cfg callConfig) metrics.Report {
 	return metrics.Report{
 		Name:       cfg.name,
@@ -403,13 +455,14 @@ func routerConfigFor(
 	onCoordinator func(payload []byte),
 ) media.RouterConfig {
 	rc := media.RouterConfig{
-		ICEServers: iceServers,
-		SendMedia:  cfg.send,
-		MediaPath:  cfg.mediaPath,
-		RecordPath: cfg.recordPath,
-		Topology:   topo,
-		SelfName:   cfg.name,
-		Managed:    cfg.managed,
+		ICEServers:     iceServers,
+		MediaPortRange: cfg.mediaPorts,
+		SendMedia:      cfg.send,
+		MediaPath:      cfg.mediaPath,
+		RecordPath:     cfg.recordPath,
+		Topology:       topo,
+		SelfName:       cfg.name,
+		Managed:        cfg.managed,
 		// THE POLARITY FLIP, and the only one in the tree. -backup reads positively
 		// to an operator ("do the failover"); media spells it negatively so that its
 		// ZERO value is the safe case — a caller who forgets the field gets failover
