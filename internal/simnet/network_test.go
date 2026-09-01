@@ -20,13 +20,13 @@ func TestBuildTreeProperty(t *testing.T) {
 	for seed := int64(1); seed <= 300; seed++ {
 		rng := rand.New(rand.NewSource(seed))
 		net := Random(rng, 1+rng.Intn(10)) // 1..10 nodes
-		topo, c, err := net.Build(cons)
+		topo, c, err := net.Build(nil, cons)
 		if err != nil {
 			continue // honestly over-constrained fleet — an allowed outcome
 		}
 		built++
 		nodes := net.OverlayNodes()
-		if verr := overlay.Validate(topo, nodes, c); verr != nil {
+		if verr := validateTopology(topo, nodes, c); verr != nil {
 			t.Fatalf("seed %d: built tree fails Validate: %v\nnodes=%+v\nedges=%+v", seed, verr, nodes, topo.Edges)
 		}
 		if d := depth(topo, c.Root); d > deepest {
@@ -63,11 +63,11 @@ func TestChurnKeepsInvariants(t *testing.T) {
 			net.RemoveRandom(rng)
 		}
 
-		topo, c, err := net.Build(cons)
+		topo, c, err := net.Build(nil, cons)
 		if err != nil {
 			t.Fatalf("step %d (%d nodes): build failed unexpectedly: %v", step, net.Len(), err)
 		}
-		if verr := overlay.Validate(topo, net.OverlayNodes(), c); verr != nil {
+		if verr := validateTopology(topo, net.OverlayNodes(), c); verr != nil {
 			t.Fatalf("step %d: invariant broken after churn: %v\nedges=%+v", step, verr, topo.Edges)
 		}
 	}
@@ -84,11 +84,11 @@ func TestLatencyAttachment(t *testing.T) {
 	net.SetRTT("leaf", "r1", 80)
 	net.SetRTT("leaf", "r2", 5)
 
-	topo, c, err := net.Build(overlay.Constraints{MaxDepth: 3, StreamKbps: 2000})
+	topo, c, err := net.Build(nil, overlay.Constraints{MaxDepth: 3, StreamKbps: 2000})
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	if verr := overlay.Validate(topo, net.OverlayNodes(), c); verr != nil {
+	if verr := validateTopology(topo, net.OverlayNodes(), c); verr != nil {
 		t.Fatalf("validate: %v", verr)
 	}
 	if p := topo.ParentOf("leaf"); p != "r2" {
@@ -96,13 +96,15 @@ func TestLatencyAttachment(t *testing.T) {
 	}
 }
 
-// TestScenarioDeterministic pins the harness's headline promise: the same seed
-// replays the exact same tree, so any bug found in simnet is reproducible.
-func TestScenarioDeterministic(t *testing.T) {
+// TestBuildReplayIsDeterministic pins the harness's headline promise at the Network
+// level: the same seed replays the exact same tree, so any bug found in simnet is
+// reproducible. (Renamed from TestScenarioDeterministic when Scenario became a real
+// type, to stop the name claiming coverage it does not have.)
+func TestBuildReplayIsDeterministic(t *testing.T) {
 	cons := overlay.Constraints{MaxDepth: 2, StreamKbps: 1000}
 	run := func() []overlay.Edge {
 		rng := rand.New(rand.NewSource(99))
-		topo, _, err := Random(rng, 9).Build(cons)
+		topo, _, err := Random(rng, 9).Build(nil, cons)
 		if err != nil {
 			t.Fatalf("build: %v", err)
 		}
