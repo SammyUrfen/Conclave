@@ -3748,7 +3748,7 @@ with the concrete numeric consequences pinned as separate table cases:
 | one join, no re-root | **exactly 1** (the joiner) |
 | one leaf departs | **0** |
 | one relay `X` departs, no re-root | **≤ `len(childrenOf_prev(X))`** |
-| one self-promotion (§5.6) | **exactly 1** (the promoted node), and the strict form must hold: `next.ParentOf(u) == published.BackupOf(u)`. This row read "**0** — the ratified edge is already in `prevPatched`" before v2.1, which was true only of the *working* copy; against `published` the promotion is a real, visible, and checkable parent change. That it became checkable is the whole point of §15.7. |
+| one self-promotion (§5.6) | **exactly 1** (the promoted node), and the strict form must hold: `next.ParentOf(u) == published.BackupOf(u)`. Against `published` a promotion is a real, visible, checkable parent change — which is the whole point of §15.7. (This row carried a different bound before v2.1; see §15.9.) |
 | one node becomes `Impaired` | **≤ `len(childrenOf_prev(node))`** (rank 1 is voided for exactly those children, §3.4) |
 | an RTT improvement past `StickinessMs` | **≤ 1 per improving node**, and each must satisfy `ValidateLocalRepair`'s justification 4 — this row is only assertable because RULING D widened the oracle to see RTT |
 | a sticky build failed and the relaxed retry ran (§5.9a) | **unbounded** — assert `Outcome == OutcomeRelaxed` was published, the same way the re-root row asserts `Reroot == true` |
