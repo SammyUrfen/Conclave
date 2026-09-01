@@ -10,6 +10,8 @@ import (
 
 	"github.com/pion/webrtc/v4"
 
+	"github.com/SammyUrfen/conclave/internal/clock"
+	"github.com/SammyUrfen/conclave/internal/metrics"
 	"github.com/SammyUrfen/conclave/internal/overlay"
 	"github.com/SammyUrfen/conclave/internal/signaling"
 )
@@ -37,6 +39,23 @@ type RouterConfig struct {
 	// topology arrives, then behaves exactly as a static-tree peer would. Ignored
 	// when Topology is non-nil (an explicit tree wins over a pushed one).
 	Managed bool
+
+	// Backup enables honouring the coordinator's precomputed backup parents on a
+	// primary-parent failure, without asking anyone. NOTE the zero value is false,
+	// so a managed peer that wants the fast failover path must set it explicitly —
+	// see the report on §7.5, which specifies "default true" for a plain bool.
+	Backup bool
+
+	// Clock is the time source for every re-parent deadline and the relay's PLI
+	// throttle. Injected so a test drives them instead of sleeping. Nil ⇒
+	// clock.System().
+	Clock clock.Clock
+
+	// OnReparented is called after this peer promotes its own backup parent, with
+	// the outcome the control plane needs to ratify (or urgently repair) the
+	// decision. Declared as a callback so media never learns the wire format — the
+	// same seam discipline as Transport. Nil ⇒ no report.
+	OnReparented func(metrics.Reparented)
 }
 
 // Router owns a signaling.Client and turns its single inbound frame stream into
@@ -54,6 +73,38 @@ type Router struct {
 	// fwd is the relay forwarder; non-nil only when this peer is a relay in tree
 	// mode. It owns the RTP fan-out and the upstream-PLI plumbing.
 	fwd *forwarder
+
+	clk clock.Clock
+
+	// internal is how pion callbacks and clock timers reach the Run goroutine.
+	// They POST and return immediately; all handling happens on Run, which is also
+	// the only goroutine that mutates topo, peers and the re-parent state machine.
+	// That keeps the existing "one owner" discipline intact instead of adding locks
+	// — and, critically, means no pion dispatch goroutine ever blocks on us.
+	internal chan routerEvent
+
+	// rp is the at-most-one re-parent in flight; rpCtx and rpGen belong to it. All
+	// three are touched ONLY from the Run goroutine, so they need no lock.
+	rp    *reparent
+	rpCtx context.Context
+	rpGen uint64
+	// parentInUse is the parent we are ACTUALLY attached to, which is not always
+	// the one the pushed tree names: a re-parent that was abandoned keeps the old
+	// one. The diff compares against reality, not against the last tree, so an
+	// unrealised instruction is retried by the next push instead of being read back
+	// as done.
+	parentInUse string
+
+	// staleRejected counts pushed topologies dropped by the ordering fence. A
+	// nonzero count is visible proof the fence works, not an error condition.
+	staleRejected atomic.Uint64
+
+	// reparentHook, when non-nil, observes re-parent state transitions. It exists
+	// for tests: the sequence is inherently asynchronous, and whether the old parent
+	// was still open at the moment the new one connected — the whole difference
+	// between make-before-break and break-before-make — cannot be caught reliably by
+	// a poller. Nil in production.
+	reparentHook func(phase string, oldParentOpen bool)
 
 	// wg joins every goroutine the Router itself spawns — the upload-meter sampler,
 	// one media pump per outbound peer, and each forwarder RTCP drain — so Run does
@@ -90,11 +141,17 @@ type peerLink struct {
 
 // NewRouter constructs a Router over an already-dialed signaling client.
 func NewRouter(log *slog.Logger, client *signaling.Client, cfg RouterConfig) *Router {
+	clk := cfg.Clock
+	if clk == nil {
+		clk = clock.System()
+	}
 	r := &Router{
 		log:      log.With(slog.String("component", "media-router")),
 		client:   client,
 		cfg:      cfg,
+		clk:      clk,
 		meter:    &uploadMeter{},
+		internal: make(chan routerEvent, internalQueue),
 		selfName: cfg.SelfName,
 		topo:     cfg.Topology,
 		peers:    make(map[string]*peerLink),
@@ -108,7 +165,7 @@ func NewRouter(log *slog.Logger, client *signaling.Client, cfg RouterConfig) *Ro
 	// inert (empty maps, no goroutines). Whether it is ACTUALLY used for a given
 	// track is gated on the live topology via isRelayNow(), not on fwd != nil.
 	if cfg.Managed || (cfg.Topology != nil && cfg.Topology.IsRelay(cfg.SelfName)) {
-		r.fwd = newForwarder(r.log, r.meter, r.spawnTracked)
+		r.fwd = newForwarder(r.log, r.meter, r.spawnTracked, clk)
 	}
 	return r
 }
@@ -173,6 +230,8 @@ func (r *Router) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case ev := <-r.internal:
+			r.handleInternal(runCtx, ev)
 		case msg, ok := <-r.client.Incoming():
 			if !ok {
 				r.log.Info("signaling stream closed")
@@ -244,27 +303,32 @@ func (r *Router) handle(ctx context.Context, msg signaling.Message) {
 		r.stopPeer(msg.From)
 		r.forgetPeer(msg.From)
 	case signaling.TypeOffer, signaling.TypeAnswer, signaling.TypeCandidate:
-		r.deliver(msg)
+		r.deliver(ctx, msg)
 	case signaling.TypeTopology:
-		r.applyTopology(ctx, msg.Payload)
+		r.applyTopology(ctx, msg.From, msg.Payload)
 	case signaling.TypeError:
 		r.log.Warn("signaling error frame", slog.String("error", msg.Error))
 	}
 }
 
-// applyTopology realises a topology the coordinator pushed (managed mode). It
-// swaps in the new tree and opens a session to every neighbour it can already
-// resolve to an id; a neighbour not yet in the roster is picked up later, when its
-// peer-joined frame runs maybeStartPeer against this now-current topology. The two
-// orders — topology-then-peer and peer-then-topology — both converge, because both
-// funnel through maybeStartPeer and startPeer is idempotent per peer.
+// applyTopology realises a coordinator-pushed topology. It DIFFS the incoming tree
+// against the one currently in force and applies the difference: open sessions to
+// new neighbours, close sessions to dropped ones, re-parent, add and remove
+// forwarding legs, and request keyframes where a source changed.
 //
-// Phase 4 is deliberately ADDITIVE: it connects new neighbours but does not tear
-// down a session to a peer the new tree drops. Mid-call re-parenting and teardown
-// (and the renegotiation a new upstream source forces onto existing children) are
-// the churn problem Phase 5 owns; doing them here would be a half-built version of
-// that phase. A dropped-neighbour is logged so the gap is visible, not silent.
-func (r *Router) applyTopology(ctx context.Context, payload []byte) {
+// It returns IMMEDIATELY. A re-parent is handed to an asynchronous state machine
+// rather than performed inline, because this runs on the Run goroutine — the same
+// goroutine whose deliver() feeds every session's offer/answer/candidate inbox.
+// Blocking here to wait for the new parent to connect would starve the very frames
+// that connection depends on.
+//
+// Ordering within one apply is fixed: fence, then role inversions (they are
+// tear-down-and-recreate, so earliest), then adds, then leg adds BEFORE leg removes
+// — a child must never lose a source it is about to regain — then removes, then the
+// re-parent hand-off. The serializer folds each session's adds and removes into ONE
+// renegotiation, which is why the order within a session does not cost an extra
+// interruption.
+func (r *Router) applyTopology(ctx context.Context, from string, payload []byte) {
 	if !r.cfg.Managed {
 		r.log.Debug("ignoring pushed topology (not in managed mode)")
 		return
@@ -274,23 +338,170 @@ func (r *Router) applyTopology(ctx context.Context, payload []byte) {
 		r.log.Warn("bad topology payload", slog.Any("error", err))
 		return
 	}
+	// Ordering fence: a duplicate or reordered push is dropped and counted rather
+	// than applied, so a late frame cannot undo a newer tree.
+	//
+	// NOTE this is only the ORDERING half of the §6.5 fence. The AUTHORIZATION half
+	// — "from is the coordinator the arbiter named for the epoch I currently believe
+	// in" — needs overlay.Fence, which is not yet shipped; see the report.
+	if !topo.Supersedes(r.currentTopo()) {
+		r.staleRejected.Add(1)
+		r.log.Debug("rejected a non-advancing topology",
+			slog.String("from", from), slog.Uint64("epoch", topo.Epoch), slog.Uint64("rev", topo.Rev))
+		return
+	}
+
+	live := r.liveState()
+	diff := diffTopology(r.selfName, &topo, live)
+
 	r.mu.Lock()
 	r.topo = &topo
 	r.mu.Unlock()
+	if !diff.reparent {
+		r.noteParent(&topo)
+	}
 
-	neighbors := topo.NeighborsOf(r.selfName)
-	r.log.Info("applied pushed topology",
-		slog.Int("edges", len(topo.Edges)), slog.Bool("relay", topo.IsRelay(r.selfName)),
-		slog.Any("neighbors", neighbors))
+	r.log.Info("applying pushed topology",
+		slog.String("from", from), slog.Uint64("epoch", topo.Epoch), slog.Uint64("rev", topo.Rev),
+		slog.Bool("relay", topo.IsRelay(r.selfName)),
+		slog.Any("add", diff.add), slog.Any("remove", diff.remove), slog.Any("invert", diff.invert),
+		slog.Bool("reparent", diff.reparent))
+	if diff.empty() {
+		return
+	}
 
-	for _, name := range neighbors {
-		r.mu.Lock()
-		id := r.idByName[name]
-		r.mu.Unlock()
-		if id != "" {
-			r.maybeStartPeer(ctx, id)
+	// (1) Inversions first: the session must be re-created before anything else
+	// decides what legs it carries. Tearing down and re-creating is the ONLY cure
+	// pion allows — an answerer has no way to add m-lines, so a mutable role would
+	// need a "please offer me" control frame, a new round trip, and a brand-new
+	// glare surface in a design built entirely on never having glare.
+	for _, name := range diff.invert {
+		id := r.idForName(name)
+		if id == "" {
+			continue
+		}
+		r.log.Info("re-creating an edge whose offerer role inverted", slog.String("peer_name", name))
+		r.stopPeer(id)
+		r.startPeer(ctx, id)
+	}
+
+	// (2) New neighbours.
+	for _, name := range diff.add {
+		if id := r.idForName(name); id != "" {
+			r.startPeer(ctx, id)
 		}
 	}
+
+	// (3) Legs: adds before removes, so a child never loses a source it is about to
+	// regain. The overlap is harmless; a gap is not.
+	changed := map[string]bool{}
+	for _, l := range diff.addLegs {
+		if r.addLegLive(l) {
+			changed[l.child] = true
+		}
+	}
+	for _, l := range diff.removeLegs {
+		if r.removeLegLive(l) {
+			changed[l.child] = true
+		}
+	}
+
+	// (4) Departures. stopPeer drops the peer in BOTH forwarding roles and hands
+	// back the senders that were carrying its media, which we remove from the
+	// surviving children so the serializer folds them into one renegotiation each.
+	for _, name := range diff.remove {
+		if id := r.idForName(name); id != "" {
+			for _, child := range r.stopPeer(id) {
+				changed[child] = true
+			}
+		}
+	}
+
+	// (5) Every child whose source set moved starts mid-GOP; ask upstream.
+	if r.fwd != nil {
+		for child := range changed {
+			r.fwd.keyframeForChild(child)
+		}
+	}
+
+	// (6) Finally the re-parent, asynchronously.
+	if diff.reparent {
+		r.startReparent(ctx, diff.oldParent, diff.newParent, false)
+	}
+}
+
+// noteParent records the parent this tree attaches us to, unless a re-parent is
+// still in flight — in which case the state machine records reality when it
+// settles, one way or the other.
+func (r *Router) noteParent(topo *overlay.Topology) {
+	if r.rp == nil {
+		r.parentInUse = topo.ParentOf(r.selfName)
+	}
+}
+
+// liveState snapshots what the Router currently holds, in topology names, for the
+// diff to compare against. Reality — not the previous topology — is the baseline,
+// so a push that was partly applied (a neighbour that had not joined yet) converges
+// on the next one instead of drifting.
+func (r *Router) liveState() liveState {
+	st := liveState{roles: map[string]bool{}, parent: r.parentInUse}
+	// A re-parent in flight means the tree already says our parent is the new one
+	// while reality is still the old one. The diff must see reality.
+	if r.rp != nil {
+		st.parent = r.rp.oldParent
+	}
+	r.mu.Lock()
+	for id, link := range r.peers {
+		name := r.nameByID[id]
+		if name == "" || link.session == nil {
+			continue
+		}
+		st.roles[name] = link.session.Offerer()
+	}
+	r.mu.Unlock()
+	if r.fwd != nil {
+		st.legs = r.fwd.legs()
+	}
+	return st
+}
+
+// addLegLive creates one (source → child) forwarding leg on a session that is
+// already running: a new forwarded track plus its bookkeeping. The serializer emits
+// the renegotiating offer; we do not offer by hand.
+func (r *Router) addLegLive(l leg) bool {
+	if r.fwd == nil {
+		return false
+	}
+	session := r.sessionByName(l.child)
+	if session == nil {
+		return false
+	}
+	track, sender, err := session.AddForwardTrack(forwardTrackPrefix+l.src, "conclave")
+	if err != nil {
+		r.log.Error("add forward track mid-call",
+			slog.String("source", l.src), slog.String("child", l.child), slog.Any("error", err))
+		return false
+	}
+	r.fwd.addOutLive(l.src, l.child, track, sender)
+	return true
+}
+
+// removeLegLive drops one (source → child) leg from a running session.
+func (r *Router) removeLegLive(l leg) bool {
+	if r.fwd == nil {
+		return false
+	}
+	sender := r.fwd.removeOut(l.src, l.child)
+	if sender == nil {
+		return false
+	}
+	if session := r.sessionByName(l.child); session != nil {
+		if err := session.RemoveTrack(sender); err != nil {
+			r.log.Warn("remove forward track",
+				slog.String("source", l.src), slog.String("child", l.child), slog.Any("error", err))
+		}
+	}
+	return true
 }
 
 // learnPeer records a runtime id↔name mapping from the roster or a peer-joined
@@ -345,9 +556,26 @@ func neighborOf(topo *overlay.Topology, self, name string) bool {
 	return false
 }
 
+// forwardTrackPrefix names a forwarded track after the SOURCE whose media it
+// carries, so both ends can talk about a leg without a second naming scheme.
+const forwardTrackPrefix = "fwd-"
+
+// peerOpts are the per-call overrides startPeer normally derives from the topology.
+type peerOpts struct {
+	// offerer overrides Topology.Offers for this edge. It is set on exactly one
+	// path: a backup-parent promotion, whose edge is NOT in the tree, so Offers says
+	// nothing meaningful about it and the far end has no reason to initiate. The
+	// peer that promotes offers; the far end answers.
+	offerer *bool
+}
+
 // startPeer creates and starts a Session toward peerID (idempotent per peer),
 // attaches an outbound track if configured, and wires the remote-track sink.
 func (r *Router) startPeer(ctx context.Context, peerID string) {
+	r.startPeerOpt(ctx, peerID, peerOpts{})
+}
+
+func (r *Router) startPeerOpt(ctx context.Context, peerID string, opts peerOpts) {
 	r.mu.Lock()
 	if _, exists := r.peers[peerID]; exists {
 		r.mu.Unlock()
@@ -368,18 +596,19 @@ func (r *Router) startPeer(ctx context.Context, peerID string) {
 	// connects, so the joiner gets an I-frame instead of black video.
 	topo := r.currentTopo()
 	var offererOverride *bool
-	var onState func(webrtc.PeerConnectionState)
 	if topo != nil {
 		o := topo.Offers(r.selfName, peerName)
 		offererOverride = &o
 	}
-	if r.isRelayNow() {
-		childName := peerName
-		onState = func(st webrtc.PeerConnectionState) {
-			if st == webrtc.PeerConnectionStateConnected {
-				r.fwd.keyframeForChild(childName)
-			}
-		}
+	if opts.offerer != nil {
+		offererOverride = opts.offerer
+	}
+	// The state callback runs on a pion dispatch goroutine, so it does exactly one
+	// thing: post. Everything it used to do inline (the relay's keyframe request,
+	// and now the whole re-parent state machine) happens on the Run goroutine.
+	name := peerName
+	onState := func(st webrtc.PeerConnectionState) {
+		r.postEvent(routerEvent{kind: evPeerState, peerName: name, state: st})
 	}
 
 	session, err := NewSession(SessionConfig{
@@ -389,6 +618,8 @@ func (r *Router) startPeer(ctx context.Context, peerID string) {
 		Transport:     tr,
 		ICEServers:    r.cfg.ICEServers,
 		Offerer:       offererOverride,
+		Clock:         r.clk,
+		Spawn:         r.spawnTracked,
 		OnRemoteTrack: r.remoteTrackSink(linkCtx, peerID),
 		OnState:       onState,
 	})
@@ -456,7 +687,7 @@ func (r *Router) setupRelayEdge(session *Session, topo *overlay.Topology, peerNa
 		if src == peerName {
 			continue
 		}
-		fwdTrack, sender, err := session.AddForwardTrack("fwd-"+src, "conclave")
+		fwdTrack, sender, err := session.AddForwardTrack(forwardTrackPrefix+src, "conclave")
 		if err != nil {
 			r.log.Error("add forward track",
 				slog.String("source", src), slog.String("child", peerName), slog.Any("error", err))
@@ -509,6 +740,9 @@ func (r *Router) remoteTrackSink(ctx context.Context, peerID string) func(*webrt
 			slog.String("codec", track.Codec().MimeType), slog.Any("ssrc", track.SSRC()))
 		log.Info("remote track arrived")
 		r.markReceived(peerID)
+		// Media arriving is the evidence a pending re-parent waits for; the Run
+		// goroutine decides what it means.
+		r.postEvent(routerEvent{kind: evPeerTrack, peerName: peerName})
 
 		// Relay: this is a source's media — hand the single reader to the forwarder
 		// to fan out. A TrackRemote has exactly ONE reader, so the relay must not
@@ -549,10 +783,24 @@ func (r *Router) remoteTrackSink(ctx context.Context, peerID string) func(*webrt
 }
 
 // deliver routes a media-signaling frame to the session for its sender.
-func (r *Router) deliver(msg signaling.Message) {
+//
+// One frame legitimately arrives for a peer we hold no session to: the first offer
+// from a child promoting US as its precomputed backup parent. That edge is not in
+// the tree — it exists precisely because the tree is momentarily wrong — so the
+// ordinary neighbour check would drop it and the failover could never complete.
+// Accepting it is gated on the topology naming us as that peer's backup, so it is
+// not an open door.
+func (r *Router) deliver(ctx context.Context, msg signaling.Message) {
 	r.mu.Lock()
 	link := r.peers[msg.From]
 	r.mu.Unlock()
+	if link == nil && msg.Type == signaling.TypeOffer && r.acceptsBackupChild(msg.From) {
+		no := false
+		r.startPeerOpt(ctx, msg.From, peerOpts{offerer: &no})
+		r.mu.Lock()
+		link = r.peers[msg.From]
+		r.mu.Unlock()
+	}
 	if link == nil {
 		r.log.Debug("frame for unknown peer", slog.String("from", msg.From), slog.String("type", string(msg.Type)))
 		return
@@ -565,30 +813,138 @@ func (r *Router) deliver(msg signaling.Message) {
 	}
 }
 
-func (r *Router) stopPeer(peerID string) {
+// stopPeer closes the session to peerID and returns the names of the children whose
+// forwarded source set changed as a result, so the caller can ask upstream for a
+// keyframe on each.
+func (r *Router) stopPeer(peerID string) []string {
 	r.mu.Lock()
 	link := r.peers[peerID]
 	delete(r.peers, peerID)
 	peerName := r.nameByID[peerID] // still mapped: stopPeer runs before forgetPeer
 	r.mu.Unlock()
 	if link == nil {
-		return
+		return nil
 	}
 	link.cancel()
 	if link.session != nil {
 		_ = link.session.Close()
 	}
+	if r.fwd == nil || peerName == "" {
+		r.log.Info("session stopped", slog.String("peer_id", peerID))
+		return nil
+	}
 	// Relay: drop the departed peer in BOTH forwarding roles. removeChild trims the
 	// legs INTO it (its own session closing reaps their drains); removeSource drops
-	// the forwardSource for its media so f.sources can't grow without bound as senders
-	// churn. (Its downstream legs on surviving children linger until they leave — a
-	// Phase-5 teardown item, see removeSource.)
-	if r.fwd != nil && peerName != "" {
-		r.fwd.removeChild(peerName)
-		r.fwd.removeSource(peerName)
+	// the forwardSource for its media AND hands back every downstream sender that
+	// was carrying it, so those tracks are actually removed from the surviving
+	// children instead of lingering as m-lines that will never carry a packet again.
+	var affected []string
+	for _, l := range r.fwd.legs() {
+		if l.src == peerName {
+			affected = append(affected, l.child)
+		}
+	}
+	r.fwd.removeChild(peerName)
+	for _, sender := range r.fwd.removeSource(peerName) {
+		r.removeSenderFromItsSession(sender)
 	}
 	r.log.Info("session stopped", slog.String("peer_id", peerID))
+	return affected
 }
+
+// removeSenderFromItsSession finds the live session holding sender and removes the
+// track. The forwarder deliberately does not know which session a sender belongs to
+// — it stores legs, not sessions — so the lookup lives here, where the peer map is.
+func (r *Router) removeSenderFromItsSession(sender *webrtc.RTPSender) {
+	r.mu.Lock()
+	sessions := make([]*Session, 0, len(r.peers))
+	for _, link := range r.peers {
+		if link.session != nil {
+			sessions = append(sessions, link.session)
+		}
+	}
+	r.mu.Unlock()
+	for _, s := range sessions {
+		if s.HasSender(sender) {
+			if err := s.RemoveTrack(sender); err != nil {
+				r.log.Warn("remove departed source track", slog.Any("error", err))
+			}
+			return
+		}
+	}
+}
+
+// idForName resolves a topology name to the runtime id the server assigned, or ""
+// if that peer is not in the roster (yet, or any more).
+func (r *Router) idForName(name string) string {
+	if name == "" {
+		return ""
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.idByName[name]
+}
+
+// sessionByName returns the live Session toward a topology name, or nil.
+func (r *Router) sessionByName(name string) *Session {
+	id := r.idForName(name)
+	if id == "" {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if link := r.peers[id]; link != nil {
+		return link.session
+	}
+	return nil
+}
+
+// hasSession reports whether a peerLink for name is still registered — which is
+// what "the old parent is still open" means during a re-parent.
+func (r *Router) hasSession(name string) bool {
+	id := r.idForName(name)
+	if id == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.peers[id] != nil
+}
+
+// connectionStateByName reports a neighbour's PeerConnection state, or "new" when
+// there is no session at all.
+func (r *Router) connectionStateByName(name string) webrtc.PeerConnectionState {
+	if s := r.sessionByName(name); s != nil {
+		return s.ConnectionState()
+	}
+	return webrtc.PeerConnectionStateNew
+}
+
+// stopPeerByName is stopPeer keyed by topology name; a no-op when there is no such
+// session, so abandon paths can call it unconditionally.
+func (r *Router) stopPeerByName(name string) {
+	if id := r.idForName(name); id != "" {
+		r.stopPeer(id)
+	}
+}
+
+// acceptsBackupChild reports whether the topology in force names US as peerID's
+// backup parent — the one case where an unsolicited offer from a non-neighbour is
+// legitimate.
+func (r *Router) acceptsBackupChild(peerID string) bool {
+	topo := r.currentTopo()
+	if topo == nil {
+		return false
+	}
+	r.mu.Lock()
+	name := r.nameByID[peerID]
+	r.mu.Unlock()
+	return name != "" && topo.BackupOf(name) == r.selfName
+}
+
+// StaleRejected reports how many pushed topologies the ordering fence dropped. A
+// nonzero count is proof the fence works, not an error condition.
+func (r *Router) StaleRejected() uint64 { return r.staleRejected.Load() }
 
 func (r *Router) closeAll() {
 	r.mu.Lock()
