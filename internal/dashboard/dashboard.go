@@ -151,11 +151,15 @@ type Server struct {
 // meetStream is the per-meet fan-out state.
 type meetStream struct {
 	subs map[*subscription]struct{}
-	// stale counts the fence rejections this process has observed for the meet.
-	// coordinator.RoomSnapshot carries no such field, so the dashboard owns the
-	// counter §9.3 puts in every snapshot; capturing it when a snapshot frame is
-	// MINTED (not when it is materialised) is what keeps it consistent with the
-	// deltas that follow — each rejection is counted exactly once, never twice.
+	// stale is the INTERIM fence-rejection counter, superseded by
+	// RoomSnapshot.StaleRejected once §15.14's carrier lands (see meetBody).
+	// coordinator.RoomSnapshot carries no such field as of this commit, so the
+	// dashboard owns the number §9.3 puts in every snapshot; capturing it when a
+	// snapshot frame is MINTED (not when it is materialised) is what keeps it
+	// consistent with the deltas that follow — each rejection counted exactly once.
+	//
+	// It is monotonic and per-process, and the real counter is neither, which is why
+	// this is replaced rather than reconciled when the carrier arrives.
 	stale uint64
 	// epoch and rev are the last control-plane version seen for this meet, from an
 	// event or a snapshot. They stamp frames that carry no version of their own (a
@@ -163,10 +167,11 @@ type meetStream struct {
 	// them: web/js/state.js copies frame.epoch onto its snapshot for every delta, so
 	// a zero would blank the epoch the operator is watching.
 	epoch, rev uint64
-	// health is the last published Health per node, because §9.4's health_changed
-	// asks for prev_health and coordinator.Event carries only the new value. The
-	// dashboard is the one place that sees the whole series, so it remembers.
-	// Bounded by live membership: an entry is dropped when the member leaves.
+	// health is the INTERIM last-published Health per node, superseded by
+	// coordinator.Event.PrevHealth once §15.14's plumbing lands (see healthData).
+	// coordinator.Event carries only the new value as of this commit, so the dashboard
+	// remembers the series it is the only component to see in full. Bounded by live
+	// membership: an entry is dropped when the member leaves.
 	health map[string]coordinator.Health
 	// touched drives the maxTrackedMeets eviction.
 	touched time.Time

@@ -94,7 +94,18 @@ type meetBody struct {
 	Edges          []edgeBody   `json:"edges"`
 	Backups        []backupBody `json:"backups"`
 	// StaleRejected is the visible proof of the fence: how many stale-epoch
-	// instructions this process has refused for the meet.
+	// instructions were refused for the meet.
+	//
+	// BLOCKED: §15.14 ratified metrics.Heartbeat.StaleRejected as the carrier, with
+	// coordinator.RoomSnapshot/MemberSnapshot gaining StaleRejected and EventStale
+	// firing on an INCREASE carrying the total in Event.Count. None of those fields
+	// exist as of this commit, and nothing in the tree publishes EventStale at all, so
+	// this reads 0 in production and is fed by the dashboard's own interim counter.
+	//
+	// When the real value lands, note that it can DECREASE: the peer's fence resets on
+	// TypeJoined (§5.7 rule 6), so the counter resets on rejoin exactly like Seq. A
+	// decrease is legitimate and must not be read as corruption — which is precisely
+	// why the interim counter below, being monotonic, cannot simply be kept.
 	StaleRejected uint64 `json:"stale_rejected"`
 	// Converged and Diverged expose the gap between intended and realized (§9.4b).
 	// A non-empty Diverged means convergence lag, a failed apply, or a fenced-out
@@ -107,26 +118,33 @@ type meetBody struct {
 }
 
 // nodeBody is one member. Units are frozen by §9.4a: *_kbps is kbit/s integer, *_ms is
-// float milliseconds, LossPct/CPUPct are 0-100 to one decimal, Fitness is 0-1 to three,
-// and Depth is hops from the root with -1 meaning "not in the tree" (which the UI must
-// render as "unattached", never as a number).
+// float milliseconds, LossPct/CPUPct are 0-100 to one decimal, FitnessLowerBound is
+// 0-1 to three, and Depth is hops from the root with -1 meaning "not in the tree"
+// (which the UI must render as "unattached", never as a number).
 type nodeBody struct {
-	ID             string   `json:"id"`
-	Name           string   `json:"name"`
-	Roles          []string `json:"roles"`
-	Health         string   `json:"health"`
-	Parent         string   `json:"parent"`
-	Backup         string   `json:"backup"`
-	Children       []string `json:"children"`
-	Depth          int      `json:"depth"`
-	UploadKbps     int      `json:"upload_kbps"`
-	NAT            string   `json:"nat"`
-	RTTServerMs    float64  `json:"rtt_server_ms"`
-	LossPct        float64  `json:"loss_pct"`
-	CPUPct         float64  `json:"cpu_pct"`
-	Fitness        float64  `json:"fitness"`
-	LastBeatSeq    uint64   `json:"last_beat_seq"`
-	LastBeatUnixMs int64    `json:"last_beat_unix_ms"`
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Roles       []string `json:"roles"`
+	Health      string   `json:"health"`
+	Parent      string   `json:"parent"`
+	Backup      string   `json:"backup"`
+	Children    []string `json:"children"`
+	Depth       int      `json:"depth"`
+	UploadKbps  int      `json:"upload_kbps"`
+	NAT         string   `json:"nat"`
+	RTTServerMs float64  `json:"rtt_server_ms"`
+	LossPct     float64  `json:"loss_pct"`
+	CPUPct      float64  `json:"cpu_pct"`
+	// FitnessLowerBound is named for what it IS (§15.14), not for what a reader would
+	// like it to be. arbiter.Fitness.UptimeSec is unreachable from a
+	// coordinator.MemberSnapshot — there is no join time on it — so the uptime term is
+	// 0 and this figure is short of the arbiter's own score by up to the 0.15 uptime
+	// weight. The key carries the caveat because a number quietly 0.15 too low is
+	// INVISIBLY wrong; a footnote in a spec does not travel with the value onto a
+	// screen. The UI must label it ">=" and must not present it as the arbiter's score.
+	FitnessLowerBound float64 `json:"fitness_lower_bound"`
+	LastBeatSeq       uint64  `json:"last_beat_seq"`
+	LastBeatUnixMs    int64   `json:"last_beat_unix_ms"`
 }
 
 // edgeBody is one intended parent->child link. The slice preserves Topology.Edges'
@@ -189,19 +207,32 @@ const (
 // The per-kind `data` shapes (§9.4).
 
 type memberData struct {
-	// ID is always empty today and that is honest rather than lazy:
-	// coordinator.Event carries only the node's NAME, so the dashboard has no peer id
-	// to put here. The field is kept because §9.4 names it and the frontend already
-	// ignores it; flagged for the spec owner.
+	// ID is BLOCKED, not designed. §15.14 ruled that coordinator.Event gains NodeID —
+	// the coordinator already holds it as nodeState.id, so this was a plumbing gap and
+	// not a missing fact — and that the dashboard must read it, so a delta can be
+	// joined against nodes[] on the same server-authoritative key the snapshot uses
+	// rather than on a peer-supplied name.
+	//
+	// coordinator.Event has NO NodeID field as of this commit, so this is "" until
+	// WI-3 lands it. The fix is one line here (ev.NodeID) and TestEventKindMapping
+	// pins the "" exactly, so landing NodeID fails that test and forces the swap
+	// instead of leaving a silently empty field behind.
 	ID   string `json:"id"`
 	Name string `json:"name"`
 }
 
 type healthData struct {
 	Name string `json:"name"`
-	// Health and PrevHealth are the transition, not a sample. PrevHealth is filled
-	// from the dashboard's own memory of the last value it published for this node,
-	// because coordinator.Event carries only the new one.
+	// Health and PrevHealth are the transition, not a sample.
+	//
+	// PrevHealth is BLOCKED the same way as memberData.ID: §15.14 ruled that
+	// coordinator.Event gains PrevHealth and that the dashboard MUST NOT remember it
+	// in-process, because in-process memory is wrong across a restart and wrong for a
+	// fresh subscriber, whose first transition reports "". coordinator.Event has no
+	// such field as of this commit, so the in-process memory below is retained as an
+	// INTERIM: dropping it now would make prev_health permanently "" rather than
+	// merely "" on the first transition, which is strictly worse than the state the
+	// ruling is correcting. It must be deleted the moment Event.PrevHealth lands.
 	Health     string `json:"health"`
 	PrevHealth string `json:"prev_health"`
 }
@@ -216,17 +247,19 @@ type topologyData struct {
 	Reason  string       `json:"reason"`
 }
 
+// reparentData carries a peer's self-promotion to its precomputed backup.
+//
+// There is deliberately no `self_promoted` discriminator (REMOVED in §15.14).
+// coordinator.EventReparent is emitted ONLY from the self-promotion path — a move the
+// coordinator decided arrives as `failover` plus `topology` — so the field could only
+// ever hold one value, and a field that can only hold one value states something false
+// about the type: that the other value is reachable. If a coordinator-decided reparent
+// ever needs its own event, the answer is a new KIND, not a flag.
 type reparentData struct {
-	Name string `json:"name"`
-	From string `json:"from"`
-	To   string `json:"to"`
-	// SelfPromoted is true for every reparent frame, and the constant is the point
-	// rather than a stub: coordinator.EventReparent is emitted ONLY from the
-	// self-promotion path (a peer moving itself to its precomputed backup). A move
-	// the coordinator decided reaches the dashboard as `failover` plus `topology`,
-	// never as `reparent`.
-	SelfPromoted bool   `json:"self_promoted"`
-	Reason       string `json:"reason"`
+	Name   string `json:"name"`
+	From   string `json:"from"`
+	To     string `json:"to"`
+	Reason string `json:"reason"`
 }
 
 type failoverData struct {

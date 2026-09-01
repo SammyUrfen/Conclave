@@ -118,22 +118,22 @@ func (s *Server) buildMeetBody(meet arbiter.Meet, snap coordinator.RoomSnapshot,
 // §9.4b forbids the UI from rendering them in the same element.
 func nodeOf(m coordinator.MemberSnapshot, topo *overlay.Topology, coordName string) nodeBody {
 	n := nodeBody{
-		ID:             m.ID,
-		Name:           m.Name,
-		Roles:          rolesOf(m.Name, topo, coordName),
-		Health:         healthOf(m.Health),
-		Parent:         m.Parent,
-		Backup:         m.Backup,
-		Children:       append(make([]string, 0, len(m.Children)), m.Children...),
-		Depth:          -1,
-		UploadKbps:     m.Report.UploadKbps,
-		NAT:            natOf(m.Report.NAT),
-		RTTServerMs:    finite(m.Report.RTTServerMs),
-		LossPct:        round1(m.Report.LossPct),
-		CPUPct:         round1(m.Report.CPUPct),
-		Fitness:        round3(fitnessOf(m)),
-		LastBeatSeq:    m.LastBeatSeq,
-		LastBeatUnixMs: unixMs(m.LastBeatAt),
+		ID:                m.ID,
+		Name:              m.Name,
+		Roles:             rolesOf(m.Name, topo, coordName),
+		Health:            healthOf(m.Health),
+		Parent:            m.Parent,
+		Backup:            m.Backup,
+		Children:          append(make([]string, 0, len(m.Children)), m.Children...),
+		Depth:             -1,
+		UploadKbps:        m.Report.UploadKbps,
+		NAT:               natOf(m.Report.NAT),
+		RTTServerMs:       finite(m.Report.RTTServerMs),
+		LossPct:           round1(m.Report.LossPct),
+		CPUPct:            round1(m.Report.CPUPct),
+		FitnessLowerBound: round3(fitnessOf(m)),
+		LastBeatSeq:       m.LastBeatSeq,
+		LastBeatUnixMs:    unixMs(m.LastBeatAt),
 	}
 	sort.Strings(n.Children)
 	if topo != nil {
@@ -161,11 +161,19 @@ func rolesOf(name string, topo *overlay.Topology, coordName string) []string {
 
 // fitnessOf scores a member with the arbiter's OWN formula rather than a second one.
 //
-// One honest gap: arbiter.Fitness.UptimeSec is unavailable at this seam —
-// coordinator.MemberSnapshot carries no join time — so the uptime term contributes 0
-// and this value is a LOWER BOUND on the arbiter's own score, by at most the 0.15
-// uptime weight. Inventing an uptime would be worse: it would put a number the arbiter
-// never computed under the name of one it did. Flagged for the spec owner.
+// arbiter.Fitness.UptimeSec is unavailable at this seam — coordinator.MemberSnapshot
+// carries no join time — so the uptime term contributes 0 and the result is a LOWER
+// BOUND on the arbiter's own score, short by at most the 0.15 uptime weight. Inventing
+// an uptime would be worse: it would put a number the arbiter never computed under the
+// name of one it did. §15.14 ruled that the wire key says so out loud
+// (`fitness_lower_bound`) rather than footnoting it.
+//
+// The proper fix, recorded and deliberately NOT taken here, is for the ARBITER to
+// expose the score it actually computed per node: it is the only component holding
+// every input (Live is its own verdict), and this function is a second implementation
+// of a decision the arbiter owns. It is not taken because §13.1 already records that
+// the fitness inputs are unmeasured, so more precision would be more precisely
+// fictional.
 //
 // Live is derived from the health FSM (anything but "gone" is live) and Coordinatable
 // from the peer's own declaration, so the three hard disqualifiers — TURN-bound, not
