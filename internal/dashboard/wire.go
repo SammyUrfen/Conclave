@@ -79,7 +79,7 @@ type joinInfo struct {
 //
 // This is the INTENDED view: Root/Edges/Backups/Rev come from the coordinator's last
 // published tree. Each node's Parent/Children are REALIZED (from its last heartbeat),
-// which is what makes Converged/Diverged computable at all.
+// which is what makes Convergence/Diverged computable at all.
 type meetBody struct {
 	APIVersion     int          `json:"api_version"`
 	ID             string       `json:"id"`
@@ -102,12 +102,28 @@ type meetBody struct {
 	// that: it would pin the display at a high-water mark belonging to a fence that no
 	// longer exists.
 	StaleRejected uint64 `json:"stale_rejected"`
-	// Converged and Diverged expose the gap between intended and realized (§9.4b).
+	// Convergence and Diverged expose the gap between intended and realized (§9.4b).
 	// A non-empty Diverged means convergence lag, a failed apply, or a fenced-out
 	// peer — the three faults hardest to see any other way, and each of them
 	// invisible if the UI simply renders whichever number it fetched last.
-	Converged bool     `json:"converged"`
-	Diverged  []string `json:"diverged"`
+	//
+	// Convergence is a THREE-VALUE ENUM and not the boolean it used to be, because the
+	// comparison has three outcomes and one of them is "there was nothing to compare".
+	// With no published tree the old boolean reported true — len(Diverged) == 0 fell
+	// out of the formula — and "converged" beside an empty subnet reads as HEALTHY, so
+	// a meet that had failed to build showed a green signal. Naming the third state is
+	// the same correction as renaming `fitness` to `fitness_lower_bound`: when a value
+	// cannot be computed, say that, rather than emitting whatever the formula produces.
+	//
+	// Rejected: a NULLABLE boolean. JSON null is falsy in JavaScript, so every naive
+	// `if (converged)` and `!converged` would silently render "nothing to compare" as
+	// DIVERGED — the same confusion, moved. Rejected: keeping `converged` and adding a
+	// second `comparable` flag. Two booleans encode four states for three meanings, and
+	// the constructible-but-illegal combination is precisely the misleading one. A
+	// string enum has neither problem, and §9.4a already tells a UI how to survive an
+	// enum value it does not know: render it verbatim in a neutral style.
+	Convergence string   `json:"convergence"`
+	Diverged    []string `json:"diverged"`
 	// Provenance is the literal "intended" (§9.4b).
 	Provenance string `json:"provenance"`
 }
