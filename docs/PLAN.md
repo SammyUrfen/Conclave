@@ -1,6 +1,6 @@
 # PLAN.md — the Phase 5–6 architecture contract
 
-> **Status: v2.1, FROZEN**, 2026-09-01. v1 was frozen the same day, reviewed adversarially by
+> **Status: v2.2, FROZEN**, 2026-09-01. v1 was frozen the same day, reviewed adversarially by
 > two independent reviewers (12 critical + ~15 major findings), and amended in place. **§15 is
 > the amendment log — read it first if you built against v1**, because several frozen names
 > changed. v2 also reconciles the document with what WI-0 actually shipped; where the shipped
@@ -524,8 +524,35 @@ still *become* a relay for later newcomers — which is the behaviour we want.
 | Rank | Rule | Kind |
 |---:|---|---|
 | 0 | **Hard filters.** Candidate `p` must be: already attached in this build; `capacityOf(p, c) > 0` (not TURN-bound, enough derated upload); `depth[p] < c.MaxDepth`; `children[p] < capacityOf(p, c)`; `p != u`. | eliminate |
-| 0b | **Impairment filter (SOFT).** A candidate with `p.Impaired` is excluded — **but only if at least one non-impaired candidate survives rank 0.** If every eligible candidate is impaired, impaired candidates are re-admitted. Degradation is a preference; disconnection is not, and a degraded parent beats no parent. Implement as two passes over the same candidate set, not as a score. | eliminate (soft) |
-| 1 | **Incumbency.** If `prev.ParentOf(u) == P`, `P` survived rank 0, **and `!P.Impaired`**, then **`P` wins** — unless some surviving candidate `q` satisfies `rtt(u,q) + c.StickinessMs < rtt(u,P)`. Only a *materially* closer parent breaks incumbency. A merely-less-loaded or alphabetically-earlier parent never does. **An impaired incumbent gets NO protection**: this is the single rank that turns a fired dwell timer into an actual re-parent, and it is the reason the dwell is not dead machinery. | prefer |
+| 0b | **Impairment filter (SOFT).** Let **`healthyAvailable`** = "at least one candidate surviving rank 0 has `!Impaired`". If `healthyAvailable`, every `p.Impaired` candidate is excluded. If not, impaired candidates are **re-admitted** — degradation is a preference, disconnection is not, and a degraded parent beats no parent. Implement as two passes over the same candidate set, not as a score. | eliminate (soft) |
+| 1 | **Incumbency.** If `prev.ParentOf(u) == P` and `P` survived rank 0, then **`P` wins** — unless some surviving candidate `q` satisfies `rtt(u,q) + c.StickinessMs < rtt(u,P)`. Only a *materially* closer parent breaks incumbency; a merely-less-loaded or alphabetically-earlier parent never does. **An impaired incumbent gets no protection — but ONLY when `healthyAvailable`.** See the coupling rule immediately below; this is the single rank that turns a fired dwell timer into an actual re-parent, and it is the reason the dwell is not dead machinery. | prefer |
+
+> **COUPLING RULE (frozen).** Rank 0b's impairment *filter* and rank 1's impairment *void*
+> are the same decision and **must read the same `healthyAvailable` flag**. One variable,
+> computed once per node placement, consumed by both ranks.
+>
+> **Why (ruling, §15.9).** WI-1 observed that the rank 1 `!Impaired` clause is unobservable
+> in normal fleets — 0b has already removed impaired candidates — and becomes observable in
+> exactly one situation: when *every* candidate is impaired and 0b re-admits them all. v2.1
+> as written then moved a child from one impaired parent to another marginally-closer
+> impaired parent. **That is not intended.**
+>
+> The void exists for exactly one purpose, stated in its own justification below: *let the
+> dwell move children off an impaired relay onto a healthy one.* When no healthy relay
+> exists, the clause's entire premise is absent and all that remains is churn — a stream
+> interruption bought for an RTT delta, in the one situation where the fleet is already
+> degraded and least able to absorb interruptions. Worse, impairment is by definition a
+> **sustained** condition, so an all-impaired fleet can stay that way for a long time and
+> every recompute would reshuffle children between impaired parents. That is precisely the
+> thrash Phase 5 exists to prevent, arriving through the mechanism meant to prevent it.
+>
+> So: **when there is nowhere healthy to go, stability is the only value left, and
+> incumbency is preserved.** WI-1's instinct was right; it built the contract as written and
+> flagged it rather than silently "fixing" it, which is exactly the behaviour §0 asks for.
+>
+> The clause remains observable and testable in its intended case — impaired incumbent,
+> healthy candidate with spare capacity, children move — so C8's requirement that the dwell
+> not be inert machinery is untouched.
 | 2 | **Minimum RTT.** Among the remaining candidates (all of them, when rank 1 did not decide), lowest `rtt(u, p)`. Unknown RTT scores `unknownRTT` (worst), unchanged. | prefer |
 | 3 | **Fewest children.** Load balance. This is what makes attachment sane on a LAN where no RTT has been measured. | prefer |
 | 4 | **Name ascending.** Determinism. Total order, no ties survive. | prefer |
@@ -1564,6 +1591,27 @@ fail. WI-0 shipped the enforcement, and it is hereby frozen as an invariant of t
 func ValidateLivenessBudget(interval, socketDetection time.Duration) error
 ```
 
+**Startup validation is necessary but NOT sufficient, and v2 missed why.** The server can
+only check the invariant against the *default* cadence, because `GoneAfter` is a function of
+a cadence each **peer** declares at run time (`Heartbeat.IntervalMs`). A peer declaring a
+FASTER cadence shrinks its own `GoneAfter` — at `-heartbeat 500ms` it is 4 s, well below the
+7 s `WSLivenessBudget` — and reopens the exact C4 window this invariant exists to close.
+**The peer, not the operator, breaks it**, so no amount of flag validation can catch it.
+
+> **FROZEN: the coordinator floors every per-node gone threshold at the socket-detection
+> budget.**
+>
+> ```
+> goneThreshold(node) = max(metrics.GoneAfter(node.declaredInterval), cfg.SocketDetection)
+> ```
+>
+> `coordinator.Config.SocketDetection` is a new field, wired in `cmd/server/main.go` from
+> `hub.LivenessBudget()`. The max makes the invariant hold **unconditionally and per node**,
+> with no rejection of the peer, no clamping of what it may declare, and no new API: a
+> fast-beating peer simply gets the same floor everyone else effectively has. Zero (the
+> field's zero value) disables the floor, which is what `simnet` wants — it drives virtual
+> time and models no socket layer at all.
+
 Why the inequality is in this direction: the health FSM must be the *slower* of the two, so
 that whenever the coordinator declares a peer gone, the Hub has either already reaped the
 socket (a real death — the peer is not coming back without a rejoin) or the socket is
@@ -1656,12 +1704,15 @@ When node `X` is declared gone (or leaves):
 2. If `X == prev.Root`, this is a **re-root**: `PickRoot` will choose a new root and the
    whole tree is rebuilt. Publish a `failover` event flagged `reroot: true` so the operator
    sees why everything moved. This is the one legitimately global repair.
-3. Otherwise build `prevPatched` = `prev` with `X` and every edge touching `X` removed.
-   `Root`, `Epoch`, and the surviving `Edges`' order are carried over.
-4. Call `BuildTree(nodesWithoutX, prevPatched, cons)` with `Rev = prev.Rev + 1`.
-5. Assert `overlay.Validate` and `overlay.ValidateLocalRepair(prev, next, []string{X}, nil)`
-   in tests; in production, `Validate` failure means **keep the previous tree and log an
-   error** — never publish a tree that fails its own oracle.
+3. Otherwise derive the **`working`** copy (§5.6a) — `published` with `X` and every edge
+   touching `X` removed. `Root`, `Epoch`, and the surviving `Edges`' order are carried over.
+4. Call `BuildTree(nodesWithoutX, working, cons)` with `Rev = published.Rev + 1`, subject to
+   the two-attempt rule in §5.9a.
+5. Assert `overlay.Validate(next, nodes, cons)` and
+   `overlay.ValidateLocalRepair(published, next, nodes, cons, overlay.Churn{Gone: []string{X}})`
+   in tests — **`published`, never `working`** (§5.6a). In production, a `Validate` failure
+   means **keep the previous tree and log an error**; never publish a tree that fails its own
+   oracle.
 
 > **Why there is no `overlay.Repair()` function.** The obvious design is a bespoke repair
 > that patches only the orphans' edges. It was rejected because it would be a *second*
@@ -1727,13 +1778,13 @@ meet, and confusing any two produces a silent correctness bug rather than a comp
 | Name | What it is | Who consumes it |
 |---|---|---|
 | **`published`** | The last tree actually sent to peers. Carries the `Epoch`/`Rev` peers are fencing against and — load-bearing — the `Backups` assignment they promoted under. | `ValidateLocalRepair`'s `prev`; the dashboard snapshot; `Fence` reasoning |
-| **`working`** | `published`, patched with every ratified promotion since (§5.6). Rebuilt from `published` each round; never sent anywhere. | `BuildTree`'s `prev` |
+| **`working`** | `published`, patched with everything the coordinator already knows changed: every ratified promotion (§5.6) **and** the removal of every departed/`gone` node and its edges (§5.5). Rebuilt from `published` each round; never sent anywhere. | `BuildTree`'s `prev` |
 | **`next`** | `BuildTree`'s output for this round. | published on success, and then **becomes `published`** |
 
 So one recompute round is:
 
 ```
-working := patch(published, ratifiedPromotions)
+working := patch(published, ratifiedPromotions, departures)
 next    := BuildTree(nodes, working, cons)          // sticky attempt, §5.9a
 _       =  Validate(next, nodes, cons)              // gate
 _       =  ValidateLocalRepair(published, next, nodes, cons, churn)   // NOT working
@@ -1784,6 +1835,12 @@ type Config struct {
 	DegradedAfter     time.Duration // 0 ⇒ DegradedAfter
 	GoneAfter         time.Duration // 0 ⇒ GoneAfter
 	JoinSettle        time.Duration // 0 ⇒ JoinSettle (§5.9)
+	// SocketDetection is the Hub's worst-case socket-death detection window
+	// (hub.LivenessBudget(); 7s by default). Every per-node gone threshold is FLOORED at
+	// it, so a fast-beating peer cannot shrink its own threshold below the window in which
+	// the Hub may still consider it present (§5.3). 0 disables the floor — correct only
+	// for simnet, which models no socket layer.
+	SocketDetection   time.Duration
 	Clock             clock.Clock   // nil ⇒ clock.System()
 	// SelfName is the coordinator's own peer name. Empty means the coordinator is
 	// running inside the arbiter process (Phase 5) rather than on an elected peer.
@@ -3493,6 +3550,27 @@ values.
 | `-public-url` | `""` | **new** | Externally reachable base URL used to build `join.ws_url` / `join.peer_command`; empty ⇒ derive from `-addr` |
 | `-demo` | `false` | **new** | Register the destructive demo control routes (§9.6) |
 
+**The WS ping family is COMPILE-TIME ONLY — deliberately not operator-tunable (frozen).**
+`WSPingInterval` and `WSPingTimeout` get **no flags**. WI-0b was right to flag the gap rather
+than invent one; the resolution is a decision, not an omission:
+
+- They are **not independent knobs.** They are bound by
+  `WSPingInterval + WSPingTimeout ≤ GoneAfter(interval)`, whose right-hand side depends on a
+  cadence each *peer* declares. An operator turning these dials would have to reason about a
+  relationship spanning two processes and a value they do not control — a footgun with no
+  use case behind it.
+- **What an operator actually wants to tune is already exposed.** "How fast is a dead peer
+  noticed" is `-gone-after` / `-degraded-after` on the server and `-heartbeat` on the peer.
+  The ping cadence is an implementation detail of the socket layer beneath that.
+- `HubConfig.PingInterval` / `PingTimeout` remain **programmatic** overrides, which is
+  exactly what the hub and simnet tests need. Configurable from Go, not from argv.
+
+Consequently `NewHubWithConfig`'s error names **the `HubConfig` field**, not a flag — there
+is no flag to name, and inventing one in an error message would send an operator hunting for
+something that does not exist. WI-0b's instinct was correct. The flag-level failure is a
+separate check that lives elsewhere: `cmd/server` calls `metrics.ValidateLivenessBudget` and
+reports against **`-gone-after`**, which *is* a real flag an operator can act on.
+
 **`-coordinate` vs `-elect` precedence (frozen).** `-coordinate` means "this process may host
 the coordinator". `-elect` means "arbitrate the role among peers". With both set: the arbiter
 hosts the coordinator until a peer scores above `DemoteBelowScore`, then hands over. With
@@ -3597,7 +3675,7 @@ safe.
 
 | Layer | Package | Style | Must cover |
 |---|---|---|---|
-| **Pure graph** | `overlay` | Table-driven + the independent `Validate` oracle. Never re-derive the expected tree. | Epoch/rev stamping; stickiness at rank 1 (an incumbent survives a lower-load and a marginally-closer challenger, loses to one beating `StickinessMs`); processing order (a strong joiner does not re-parent incumbents); backup invariant `B ∉ Subtree(P)`; root children have no backup; `ValidateLocalRepair` catches a gratuitous re-parent; `Validate` catches each new violation class; `LoadTopology` still accepts a Phase-3 file and stamps `StaticEpoch`; determinism over ≥50 repeats. **`PickRoot` never returns a provisional, impaired, or under-capacity node (a real 1200 kbit/s report against a 2000 kbit/s stream cost is NOT rootable — ruling E); an incumbent root survives a challenger inside `RootChangeMarginKbps` and loses to one beyond it; a demoted former root is processed first and its former children stay put (§3.4 step 0); `ValidateLocalRepair` accepts an RTT-justified move past `StickinessMs` and still rejects an unjustified one (ruling D).** |
+| **Pure graph** | `overlay` | Table-driven + the independent `Validate` oracle. Never re-derive the expected tree. | Epoch/rev stamping; stickiness at rank 1 (an incumbent survives a lower-load and a marginally-closer challenger, loses to one beating `StickinessMs`); processing order (a strong joiner does not re-parent incumbents); backup invariant `B ∉ Subtree(P)`; root children have no backup; `ValidateLocalRepair` catches a gratuitous re-parent; `Validate` catches each new violation class; `LoadTopology` still accepts a Phase-3 file and stamps `StaticEpoch`; determinism over ≥50 repeats. **`PickRoot` never returns a provisional, impaired, or under-capacity node (a real 1200 kbit/s report against a 2000 kbit/s stream cost is NOT rootable — ruling E); an incumbent root survives a challenger inside `RootChangeMarginKbps` and loses to one beyond it; a demoted former root is processed first and its former children stay put (§3.4 step 0); `ValidateLocalRepair` accepts an RTT-justified move past `StickinessMs` and still rejects an unjustified one (ruling D).** **The impairment coupling rule, BOTH branches: with a healthy candidate available, an impaired incumbent loses its children (the void fires); with EVERY candidate impaired, the same fleet keeps every incumbent edge unchanged (the void is suppressed) — a fleet that differs only in whether one candidate is impaired must produce those two different outcomes, or the coupling is not wired.** |
 | **Deterministic sim** | `simnet` | Seeded scenarios + property tests over many seeds. | Replay identity (same seed ⇒ identical trace); virtual-clock ordering (same-instant timers fire in creation order); each injection primitive; ≥200-step churn keeping **both** oracles green (the interim RTT-free / RTT-rich split collapses once ruling D lands); the dwell suppressing a noisy-but-stable metric stream; the dwell firing on a sustained one. **The three §12.3 properties**, including the 120-permutation enumeration asserting validity + bounded delta on each — and pinning `9 distinct trees, 1 root` as a regression check on the trade itself. |
 | **Control loop** | `coordinator` | `-race`, fake `Sender`, fake `Publisher`, `VirtualClock`, `Sync` barrier. | The eight threshold events and **only** those recompute; `RecomputeCooldown` coalescing a burst; the `OK:false` cooldown bypass; health FSM transitions in virtual time; local repair moves only orphans (asserted via `ValidateLocalRepair`); the ratification rule (a self-promoted parent survives the next rebuild); re-root on root loss; `Snapshot` never tears. **The settle rule: a 1-member meet never builds and never consumes the settle; every join RE-ARMS it; a join burst coalesces into one build; a join bypasses `RecomputeCooldown` but not the settle; `unbuildable` is emitted only post-settle.** **The §5.9a relaxed retry: a fleet that is sticky-unbuildable but fresh-buildable publishes with `OutcomeRelaxed` and NEVER reports `unbuildable`; a genuinely over-constrained fleet reports `unbuildable` and keeps its previous tree; the retry does not bypass the cooldown; `PickRoot == ""` short-circuits without a second attempt.** | |
 | **Election** | `arbiter` | Table-driven `Score`; scenario-driven election. | `Score` returns 0 for TURN-bound and non-healthy; upload is absent from the formula (assert a large `UploadKbps` changes nothing); every trigger in §6.2; `MinTermDuration` blocks a voluntary handover and does **not** block a failure one; epochs strictly increase and never repeat. |
@@ -3647,18 +3725,20 @@ amount:
 
 **(a) Every produced tree is legal, and every transition is minimal.**
 For every step of every scenario: `overlay.Validate(next, nodes, cons)` passes, and
-`overlay.ValidateLocalRepair(prevPatched, next, gone, joined, promoted)` passes. This is the
-strongest correctness claim available and it holds over *every* history, not a chosen one.
+`overlay.ValidateLocalRepair(published, next, nodes, cons, churn)` passes — **`published`,
+not `working`** (§5.6a, §15.7). This is the strongest correctness claim available and it
+holds over *every* history, not a chosen one.
 
 **(b) The edge-set delta between consecutive trees is BOUNDED by the churn that caused the
 rebuild.** This is the real stability property — the one a user actually feels, because each
 changed edge is one stream interruption. Assert, per rebuild, that
 
 ```
-changedParents(prev, next) ⊆ joined
-                           ∪ childrenOf_prev(gone)
-                           ∪ promoted
-                           ∪ { u : parentOf_prev(u) became ineligible in next }
+changedParents(published, next) ⊆ joined
+                                ∪ childrenOf_published(gone)
+                                ∪ promoted
+                                ∪ impaired-children
+                                ∪ { u : parentOf_published(u) became ineligible in next }
 ```
 
 with the concrete numeric consequences pinned as separate table cases:
@@ -3668,7 +3748,7 @@ with the concrete numeric consequences pinned as separate table cases:
 | one join, no re-root | **exactly 1** (the joiner) |
 | one leaf departs | **0** |
 | one relay `X` departs, no re-root | **≤ `len(childrenOf_prev(X))`** |
-| one self-promotion (§5.6) | **0** — the ratified edge is already in `prevPatched` |
+| one self-promotion (§5.6) | **exactly 1** (the promoted node), and the strict form must hold: `next.ParentOf(u) == published.BackupOf(u)`. This row read "**0** — the ratified edge is already in `prevPatched`" before v2.1, which was true only of the *working* copy; against `published` the promotion is a real, visible, and checkable parent change. That it became checkable is the whole point of §15.7. |
 | one node becomes `Impaired` | **≤ `len(childrenOf_prev(node))`** (rank 1 is voided for exactly those children, §3.4) |
 | an RTT improvement past `StickinessMs` | **≤ 1 per improving node**, and each must satisfy `ValidateLocalRepair`'s justification 4 — this row is only assertable because RULING D widened the oracle to see RTT |
 | a sticky build failed and the relaxed retry ran (§5.9a) | **unbounded** — assert `Outcome == OutcomeRelaxed` was published, the same way the re-root row asserts `Reroot == true` |
@@ -3836,7 +3916,7 @@ everything that changed, and why.
 | `Config.FirstBuildSettle` | **`Config.JoinSettle`** | C2 |
 | `-first-build-settle` | **`-join-settle`** | C2 |
 | `coordinator.SetEpoch(epoch)` | **`SetEpoch(roomID, epoch)`** | C7 — epoch is per-meet |
-| `overlay.ValidateLocalRepair(prev, next, gone, joined)` | **`(prev, next, gone, joined, promoted)`** | M2 — self-promotions were flagged as unjustified |
+| `overlay.ValidateLocalRepair(prev, next, gone, joined)` | **`(prev, next, nodes, c, ch Churn)`** — and `prev` is the **last published** tree | M2, then rulings D (§15.8) and §15.7. The intermediate `(prev,next,gone,joined,promoted)` form named in v2 was superseded before anyone built it; this row shows the final signature to stop a reader implementing the middle one. |
 | `coordinator.DegradedAfter` / `GoneAfter` (constants) | **`metrics.DegradedAfter(interval)` / `metrics.GoneAfter(interval)`** (functions) | SHIPPED (WI-0) — thresholds must multiply the peer's *declared* cadence, else `-heartbeat 2s` ejects healthy peers |
 | `signaling.WSPingTimeout = 3s` | **`= 2s`** | SHIPPED (WI-0) — strict margin below the interval |
 | `signaling.WSPingInterval = 15s` | **`= 5s`** | C4 — reconcile with `GoneAfter` |
@@ -3976,7 +4056,53 @@ counterexample fleet produce **9 distinct valid trees with an identical converge
 *the root converges, the shape does not*. That is the precise statement of the
 stability/determinism trade and it is now a regression check on the trade itself.
 
-### 15.9 Where I think a reviewer is wrong
+### 15.9 v2.2 — stale-text sweep and three later rulings
+
+**Stale text swept.** v2.1's three-tree ruling (§15.7) did not reach three live call sites,
+which the WI-1 implementer correctly refused to follow. All corrected:
+
+| Was | Now |
+|---|---|
+| §5.5 step 3–5: `prevPatched`, and `ValidateLocalRepair(prev, next, []string{X}, nil)` | `working` (§5.6a vocabulary), and `ValidateLocalRepair(published, next, nodes, cons, Churn{Gone: …})` |
+| §12.3(a): `ValidateLocalRepair(prevPatched, next, gone, joined, promoted)` | `ValidateLocalRepair(published, next, nodes, cons, churn)` |
+| §12.3(b) self-promotion row: "**0** — the ratified edge is already in `prevPatched`" | **exactly 1**, plus the strict form `next.ParentOf(u) == published.BackupOf(u)` |
+
+That third one was not a wording slip: against `working` a promotion is invisible, against
+`published` it is a real, checkable parent change — so the bound was *numerically wrong*, and
+in the direction that would have made a correct implementation look like a bug. §5.6a's
+`working` definition also now absorbs departures, so §5.5 and §5.6 share one vocabulary
+instead of two.
+
+The v2 name table in my report and the contract body disagreed on
+`BackupOvershootAllowance`; **the contract body is correct** and has been consistent since
+v2.1. WI-1 was right to refuse the rename.
+
+**Ruling — the all-impaired case (§3.4).** WI-1 found the rank 1 `!Impaired` void is
+unobservable in normal fleets and observable only when *every* candidate is impaired and
+rank 0b re-admits them — where v2.1 then moved a child between two impaired parents for an
+RTT delta. **Not intended.** The void's sole purpose is to let the dwell move children off an
+impaired relay *onto a healthy one*; with no healthy relay its premise is absent and only
+churn remains — in the one state where the fleet can least afford interruptions, and
+repeatedly, since impairment is sustained by definition. Amended with a **coupling rule**:
+0b's filter and 1's void read one `healthyAvailable` flag, so incumbency is preserved exactly
+when there is nowhere healthy to go. The clause stays observable in its intended case, so
+C8's "the dwell must not be inert" requirement is untouched; §12.2 now requires both branches
+to be tested.
+
+**Ruling — the WS ping family is compile-time only (§10).** No `-ws-ping-interval` /
+`-ws-ping-timeout`. They are not independent knobs (bound to a cadence *peers* declare), and
+the tunable an operator actually wants is already `-gone-after`/`-heartbeat`. `HubConfig`
+keeps programmatic overrides for tests. So `NewHubWithConfig`'s error correctly names a
+struct field — there is no flag to name, and WI-0b was right not to invent one.
+
+**And a hole that gap exposed (§5.3).** Startup validation of the liveness budget is
+necessary but insufficient: `GoneAfter` depends on a cadence each *peer* declares, so
+`-heartbeat 500ms` yields a 4 s threshold under a 7 s socket-detection window and reopens C4
+— broken by the **peer**, where no flag validation can reach. Closed by flooring every
+per-node threshold: `max(metrics.GoneAfter(declared), Config.SocketDetection)`, with
+`SocketDetection` wired from `hub.LivenessBudget()`. New `coordinator.Config.SocketDetection`.
+
+### 15.10 Where I think a reviewer is wrong
 
 - **"`Supersedes` should be deleted."** Not taken. It is genuinely needed for *ordering* —
   the coordinator sequencing its own trees, the dashboard detecting a stale snapshot. The
@@ -3989,5 +4115,5 @@ stability/determinism trade and it is now a regression check on the trade itself
 
 ---
 
-*This document is FROZEN at v2.1. Amendments go through the owner, in this file, recorded in
+*This document is FROZEN at v2.2. Amendments go through the owner, in this file, recorded in
 §15. Implementers: build what is written, and report what is wrong.*
