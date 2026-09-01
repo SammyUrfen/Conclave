@@ -15,6 +15,11 @@ type RoomSnapshot struct {
 	RoomID string
 	Epoch  uint64
 	Rev    uint64
+	// StaleRejected is the meet-wide total across members: the visible proof that the
+	// fence is doing work. It is in the SNAPSHOT, not only in the event stream, so a
+	// dashboard connecting mid-meeting shows the right number without replaying every
+	// event that ever produced it.
+	StaleRejected uint64
 	// Topo is the last PUBLISHED tree — what the fleet was actually told to run,
 	// never the coordinator's working copy. It is a deep copy: a consumer may not
 	// corrupt coordinator state by writing through it.
@@ -27,16 +32,19 @@ type RoomSnapshot struct {
 // the Members slice itself is ordered by Name then ID — a map, or an unordered
 // slice, would make the dashboard's replay of the same history differ run to run.
 type MemberSnapshot struct {
-	ID          string
-	Name        string
-	Health      Health
-	Report      metrics.Report
-	Reported    bool
-	Parent      string   // realized, from the last heartbeat
-	Children    []string // realized, from the last heartbeat, ascending
-	Backup      string   // assigned by the current tree
-	LastBeatSeq uint64
-	LastBeatAt  time.Time
+	ID       string
+	Name     string
+	Health   Health
+	Report   metrics.Report
+	Reported bool
+	Parent   string   // realized, from the last heartbeat
+	Children []string // realized, from the last heartbeat, ascending
+	Backup   string   // assigned by the current tree
+	// StaleRejected is this member's latest reported refusal count — cumulative since
+	// the peer last JOINED, and reset by the peer when its fence resets.
+	StaleRejected uint64
+	LastBeatSeq   uint64
+	LastBeatAt    time.Time
 }
 
 // Snapshot returns a consistent view of roomID. It round-trips through the Run
@@ -85,16 +93,18 @@ func (c *Coordinator) snapshotOf(roomID string) RoomSnapshot {
 	for _, id := range c.sortedPeerIDs(rs) {
 		ns := rs.nodes[id]
 		m := MemberSnapshot{
-			ID:          ns.id,
-			Name:        ns.name,
-			Health:      ns.health,
-			Report:      ns.report,
-			Reported:    ns.reported,
-			Parent:      ns.realParent,
-			Children:    append([]string(nil), ns.realChildren...),
-			LastBeatSeq: ns.beatSeq,
-			LastBeatAt:  ns.lastBeatAt,
+			ID:            ns.id,
+			Name:          ns.name,
+			Health:        ns.health,
+			Report:        ns.report,
+			Reported:      ns.reported,
+			Parent:        ns.realParent,
+			Children:      append([]string(nil), ns.realChildren...),
+			StaleRejected: ns.staleRejected,
+			LastBeatSeq:   ns.beatSeq,
+			LastBeatAt:    ns.lastBeatAt,
 		}
+		snap.StaleRejected += ns.staleRejected
 		sort.Strings(m.Children)
 		if rs.published != nil {
 			m.Backup = rs.published.BackupOf(ns.name)

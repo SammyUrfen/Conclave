@@ -208,10 +208,14 @@ type nodeState struct {
 
 	// Realized state, from the peer's last heartbeat — what it has actually
 	// connected, as opposed to what the coordinator believes it told it to.
-	beatSeq      uint64
-	lastBeatAt   time.Time
-	realParent   string
-	realChildren []string
+	beatSeq    uint64
+	lastBeatAt time.Time
+	// staleRejected is the peer's own count of control-plane instructions its fence
+	// REFUSED, cumulative since it last joined. It is mirrored rather than derived:
+	// only the peer can see a refusal, because the refusal happens at the peer.
+	staleRejected uint64
+	realParent    string
+	realChildren  []string
 }
 
 // event kinds funnelled to the Run goroutine.
@@ -237,6 +241,7 @@ type event struct {
 	name   string
 	report metrics.Report
 	beat   metrics.Heartbeat
+	stale  uint64
 	rep    metrics.Reparented
 	roster []Member
 	epoch  uint64
@@ -428,7 +433,24 @@ func (c *Coordinator) Heartbeat(roomID, peerID string, payload []byte) {
 		return
 	}
 	hb.Normalize()
-	c.enqueue(event{kind: evBeat, roomID: roomID, peerID: peerID, beat: hb})
+	// SCAFFOLD, with a stated end. metrics.Heartbeat does not yet carry the frozen
+	// `stale_rejected` key, so it is read here with a second decode of the SAME payload
+	// — not a second copy of the wire type, and not a second source of truth: one key,
+	// one type, and it is discarded the moment the field lands.
+	// TestStaleRejectedShimIsStillNeeded fails on that day and names the lines to
+	// delete, so this cannot quietly become permanent.
+	var sh staleShim
+	if err := json.Unmarshal(payload, &sh); err != nil {
+		c.log.Debug("bad heartbeat payload", slog.String("peer_id", peerID), slog.Any("error", err))
+		return
+	}
+	c.enqueue(event{kind: evBeat, roomID: roomID, peerID: peerID, beat: hb, stale: sh.StaleRejected})
+}
+
+// staleShim reads the one heartbeat key metrics.Heartbeat has no field for yet. See
+// Heartbeat.
+type staleShim struct {
+	StaleRejected uint64 `json:"stale_rejected"`
 }
 
 // Reparented delivers a peer's report that it changed its own parent without being
@@ -556,7 +578,7 @@ func (c *Coordinator) handle(ev event) {
 	case evReport:
 		c.onReport(ev.roomID, ev.peerID, ev.report)
 	case evBeat:
-		c.onBeat(ev.roomID, ev.peerID, ev.beat)
+		c.onBeat(ev.roomID, ev.peerID, ev.beat, ev.stale)
 	case evReparent:
 		c.onReparented(ev.roomID, ev.peerID, ev.rep)
 	case evRoster:
@@ -767,16 +789,18 @@ func (c *Coordinator) fire(d deadline) {
 		}
 		ns.health = HealthDegraded
 		// Advisory ONLY: this colours the dashboard and never rebuilds a tree.
-		c.publish(rs, Event{Kind: EventHealth, Node: ns.name, Health: HealthDegraded,
-			Reason: "missed heartbeats"})
+		c.publish(rs, Event{Kind: EventHealth, Node: ns.name, NodeID: ns.id,
+			Health: HealthDegraded, PrevHealth: HealthHealthy, Reason: "missed heartbeats"})
 	case dlDwell:
 		ns := rs.nodes[d.peerID]
 		if ns == nil || ns.impaired {
 			return
 		}
 		ns.impaired = true
-		c.publish(rs, Event{Kind: EventHealth, Node: ns.name, Health: ns.health,
-			Reason: "sustained degradation"})
+		// PrevHealth == Health: a fired dwell is a QUALITY verdict, not a liveness
+		// transition, and saying so is what lets a consumer tell them apart.
+		c.publish(rs, Event{Kind: EventHealth, Node: ns.name, NodeID: ns.id,
+			Health: ns.health, PrevHealth: ns.health, Reason: "sustained degradation"})
 		// Threshold event 5. An impaired node keeps its children only if there is
 		// nowhere better for them, and loses incumbency protection over them — which
 		// is what makes a fired dwell produce a materially different tree.
@@ -790,11 +814,12 @@ func (c *Coordinator) onGone(rs *roomState, ns *nodeState) {
 	if ns == nil || ns.health == HealthGone {
 		return
 	}
+	was := ns.health
 	ns.health = HealthGone
 	c.log.Info("member declared gone", slog.String("room_id", rs.id),
 		slog.String("peer_id", ns.id), slog.String("name", ns.name))
-	c.publish(rs, Event{Kind: EventHealth, Node: ns.name, Health: HealthGone,
-		Reason: "no frames within the gone threshold"})
+	c.publish(rs, Event{Kind: EventHealth, Node: ns.name, NodeID: ns.id,
+		Health: HealthGone, PrevHealth: was, Reason: "no frames within the gone threshold"})
 	c.publishFailover(rs, ns.name, "declared gone")
 	// Threshold event 3.
 	c.recompute(rs, "member gone")
@@ -856,8 +881,8 @@ func (c *Coordinator) touch(rs *roomState, ns *nodeState) bool {
 	}
 	was := ns.health
 	ns.health = HealthHealthy
-	c.publish(rs, Event{Kind: EventHealth, Node: ns.name, Health: HealthHealthy,
-		Reason: "frame received"})
+	c.publish(rs, Event{Kind: EventHealth, Node: ns.name, NodeID: ns.id,
+		Health: HealthHealthy, PrevHealth: was, Reason: "frame received"})
 	if was == HealthDegraded {
 		return false // never left the tree; nothing to re-admit
 	}
@@ -865,7 +890,7 @@ func (c *Coordinator) touch(rs *roomState, ns *nodeState) bool {
 	// re-placed, and it arms the settle exactly like a fresh join.
 	c.log.Info("member resurrected", slog.String("room_id", rs.id),
 		slog.String("peer_id", ns.id), slog.String("name", ns.name))
-	c.publish(rs, Event{Kind: EventMember, Node: ns.name, Present: true})
+	c.publish(rs, Event{Kind: EventMember, Node: ns.name, NodeID: ns.id, Present: true})
 	return true
 }
 
@@ -896,7 +921,7 @@ func (c *Coordinator) ensure(rs *roomState, peerID, name string) (*nodeState, bo
 	rs.nodes[peerID] = ns
 	c.log.Info("member admitted from a frame", slog.String("room_id", rs.id),
 		slog.String("peer_id", peerID), slog.String("name", name))
-	c.publish(rs, Event{Kind: EventMember, Node: name, Present: true})
+	c.publish(rs, Event{Kind: EventMember, Node: name, NodeID: peerID, Present: true})
 	return ns, true
 }
 
@@ -930,7 +955,7 @@ func (c *Coordinator) onJoin(roomID, peerID, name string) {
 		c.log.Info("member joined", slog.String("room_id", roomID),
 			slog.String("peer_id", peerID), slog.String("name", name),
 			slog.Int("members", len(rs.nodes)))
-		c.publish(rs, Event{Kind: EventMember, Node: name, Present: true})
+		c.publish(rs, Event{Kind: EventMember, Node: name, NodeID: peerID, Present: true})
 	}
 	c.armSettle(rs)
 	c.markUrgentIfUnplaced(rs)
@@ -951,7 +976,7 @@ func (c *Coordinator) onLeave(roomID, peerID string) {
 	c.log.Info("member left", slog.String("room_id", roomID),
 		slog.String("peer_id", peerID), slog.String("name", ns.name),
 		slog.Int("members", len(rs.nodes)))
-	c.publish(rs, Event{Kind: EventMember, Node: ns.name, Present: false})
+	c.publish(rs, Event{Kind: EventMember, Node: ns.name, NodeID: ns.id, Present: false})
 	if rs.published != nil && rs.published.IsRelay(ns.name) {
 		// A departing relay orphans a subtree; a departing leaf orphans nobody, and
 		// reporting a failover for it would be noise.
@@ -997,6 +1022,48 @@ func (c *Coordinator) onReport(roomID, peerID string, rep metrics.Report) {
 // happens here" from "someone forgot the recompute".
 func (c *Coordinator) advanceNothing() {}
 
+// trackStale mirrors the peer's cumulative count of control-plane instructions its
+// fence REFUSED, and publishes on an INCREASE only.
+//
+// Transition, not sample. A peer beats at 1 Hz, so an event per heartbeat would put one
+// line per peer per second into the dashboard's log at exactly the moment an operator is
+// reading it during a handover — the same failure the health FSM and announcement repair
+// both avoid, for the same reason.
+//
+// A DECREASE is legitimate and is handled explicitly. The peer's fence resets when it
+// rejoins, so its counter resets with it; a counter that survived would be reporting
+// refusals made under a fence that no longer exists. So a lower value is ADOPTED
+// silently: the new base is the truth, and counting resumes from it.
+//
+// Note the comparison is `> ` on the two totals and never `new - old`. On uint64 that
+// subtraction underflows a reset into a delta near 2^64 — a number that looks like
+// catastrophic fence failure and is actually a peer reconnecting.
+func (c *Coordinator) trackStale(rs *roomState, ns *nodeState, hb metrics.Heartbeat, stale uint64) {
+	if stale == ns.staleRejected {
+		return
+	}
+	if stale < ns.staleRejected {
+		c.log.Debug("stale-rejection counter reset; the peer's fence restarted",
+			slog.String("room_id", rs.id), slog.String("name", ns.name),
+			slog.Uint64("was", ns.staleRejected), slog.Uint64("now", stale))
+		ns.staleRejected = stale
+		return
+	}
+	ns.staleRejected = stale
+	c.log.Info("peer refused a control-plane instruction under its fence",
+		slog.String("room_id", rs.id), slog.String("name", ns.name),
+		slog.Uint64("total", stale), slog.Uint64("peer_epoch", hb.Epoch),
+		slog.Uint64("meet_epoch", rs.epoch))
+	// Epoch and Rev are the PEER's, not the meet's — see publish. They are the numbers
+	// that explain the refusal, and a nonzero count here is not an error condition: it
+	// is the visible proof that the fence works.
+	c.publish(rs, Event{
+		Kind: EventStale, Node: ns.name, NodeID: ns.id,
+		Epoch: hb.Epoch, Rev: hb.Rev, Count: stale,
+		Reason: "peer refused a control-plane instruction under its fence",
+	})
+}
+
 // trackDwell arms, holds, or resets a node's sustained-degradation timer. A single
 // bad sample resets nothing; a single GOOD sample resets everything, which is what
 // makes the dwell fire only on an unbroken run.
@@ -1011,15 +1078,16 @@ func (c *Coordinator) trackDwell(rs *roomState, ns *nodeState, rep metrics.Repor
 	if ns.impaired {
 		ns.impaired = false
 		// Recovery is NOT on the threshold-event list: it updates state, publishes,
-		// and is folded into whatever rebuild happens next. Rebuilding here would
-		// let a flapping link drive the tree, which is the thing the dwell exists to
-		// prevent in the other direction.
-		c.publish(rs, Event{Kind: EventHealth, Node: ns.name, Health: ns.health,
-			Reason: "degradation cleared"})
+		// and is folded into whatever rebuild happens next. Rebuilding here would let a
+		// flapping link drive the tree, which is what the dwell exists to prevent in
+		// the other direction. PrevHealth == Health for the same reason as the
+		// impairment itself: liveness did not change.
+		c.publish(rs, Event{Kind: EventHealth, Node: ns.name, NodeID: ns.id,
+			Health: ns.health, PrevHealth: ns.health, Reason: "degradation cleared"})
 	}
 }
 
-func (c *Coordinator) onBeat(roomID, peerID string, hb metrics.Heartbeat) {
+func (c *Coordinator) onBeat(roomID, peerID string, hb metrics.Heartbeat, stale uint64) {
 	rs := c.room(roomID)
 	ns, created := c.ensure(rs, peerID, hb.Name)
 	if ns == nil {
@@ -1037,6 +1105,7 @@ func (c *Coordinator) onBeat(roomID, peerID string, hb metrics.Heartbeat) {
 	for _, ch := range hb.Children {
 		ns.realChildren = append(ns.realChildren, ch.Name)
 	}
+	c.trackStale(rs, ns, hb, stale)
 	if rs.rebuilding && ns.name != "" {
 		// A heartbeat is the ONLY frame carrying realized topology, so the rebuild
 		// window waits on heartbeats specifically — a metrics report says nothing about
@@ -1077,8 +1146,8 @@ func (c *Coordinator) onReparented(roomID, peerID string, rp metrics.Reparented)
 		c.log.Warn("peer is stranded", slog.String("room_id", roomID),
 			slog.String("name", ns.name), slog.String("from", rp.From),
 			slog.String("reason", rp.Reason))
-		c.publish(rs, Event{Kind: EventReparent, Node: ns.name, PrevParent: rp.From,
-			Reason: rp.Reason})
+		c.publish(rs, Event{Kind: EventReparent, Node: ns.name, NodeID: ns.id,
+			PrevParent: rp.From, Reason: rp.Reason})
 		rs.urgent = true
 		c.recompute(rs, "peer stranded")
 		return
@@ -1097,8 +1166,8 @@ func (c *Coordinator) onReparented(roomID, peerID string, rp metrics.Reparented)
 			slog.String("room_id", roomID), slog.String("name", ns.name),
 			slog.Uint64("reported_rev", rp.Rev))
 	}
-	c.publish(rs, Event{Kind: EventReparent, Node: ns.name, Parent: rp.To,
-		PrevParent: rp.From, Reason: rp.Reason})
+	c.publish(rs, Event{Kind: EventReparent, Node: ns.name, NodeID: ns.id,
+		Parent: rp.To, PrevParent: rp.From, Reason: rp.Reason})
 	// Threshold event 6.
 	c.recompute(rs, "peer self-promoted")
 }
@@ -1123,7 +1192,7 @@ func (c *Coordinator) onRoster(roomID string, members []Member) {
 		ns := rs.nodes[id]
 		delete(rs.nodes, id)
 		delete(rs.promotions, ns.name)
-		c.publish(rs, Event{Kind: EventMember, Node: ns.name, Present: false})
+		c.publish(rs, Event{Kind: EventMember, Node: ns.name, NodeID: ns.id, Present: false})
 	}
 
 	added := false
@@ -1134,7 +1203,7 @@ func (c *Coordinator) onRoster(roomID string, members []Member) {
 		rs.nodes[m.ID] = &nodeState{
 			id: m.ID, name: m.Name, health: HealthHealthy, lastSeen: c.cfg.Clock.Now(),
 		}
-		c.publish(rs, Event{Kind: EventMember, Node: m.Name, Present: true})
+		c.publish(rs, Event{Kind: EventMember, Node: m.Name, NodeID: m.ID, Present: true})
 		added = true
 	}
 	if added {

@@ -57,5 +57,16 @@
 // arbiter's announcements — the same single-writer discipline that makes the epoch a
 // meaningful fencing token in the first place.
 //
+// # Observability
+//
+// Every decision this package makes is emitted through the Publisher seam as an ordered
+// event stream, and one rule governs what goes in it: if the coordinator KNOWS a value,
+// it emits that value rather than letting a consumer reconstruct it. Event.NodeID,
+// Event.PrevHealth, and the StaleRejected totals in both snapshots all exist because a
+// consumer was otherwise remembering or inferring something this package already held —
+// and a derived value that only USUALLY matches is the failure mode this build has hit
+// most often. Counting events (EventStale) follow the same transition-not-sample
+// discipline as the health FSM: they fire on a change, never once per frame.
+//
 // Phases 5 and 6 of the roadmap.
 package coordinator

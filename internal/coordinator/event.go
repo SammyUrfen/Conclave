@@ -83,21 +83,46 @@ const (
 // the dashboard replays this stream, and a collection whose order comes from Go's
 // randomised map iteration makes two replays of the same history differ.
 type Event struct {
-	Kind       EventKind
-	RoomID     string
-	At         time.Time // stamped from the injected clock, never the wall clock
-	Epoch      uint64
-	Rev        uint64
-	Node       string       // the node this event is about
-	Parent     string       // new parent (reparent/failover)
-	PrevParent string       // parent that was lost (reparent/failover)
-	Health     Health       // EventHealth
-	Present    bool         // EventMember
-	Orphans    []string     // EventFailover: the subtree that had to move, ascending
-	Reroot     bool         // EventFailover: the root itself was lost
-	Waiting    []string     // EventSettling: members not yet heard from, ascending
-	Outcome    BuildOutcome // EventTopology/EventSettling/EventUnbuildable
-	Reason     string       // human-readable; never parsed
+	Kind   EventKind
+	RoomID string
+	At     time.Time // stamped from the injected clock, never the wall clock
+	Epoch  uint64
+	Rev    uint64
+	Node   string // the node this event is about (its stable NAME)
+	// NodeID is the server-assigned peer id for Node, populated on member, health,
+	// reparent, and stale events.
+	//
+	// It exists because a consumer was otherwise forced to key a membership delta on
+	// the peer-SUPPLIED name — the one field a peer controls — while keying the
+	// snapshot on the server-stamped id, so the two could not be joined reliably. The
+	// coordinator holds the id already (nodeState.id); this was a plumbing gap, not a
+	// missing fact. Deliberately absent on failover, which names a node in a tree and
+	// has no id to speak of for a node that may already be gone.
+	NodeID     string
+	Parent     string // new parent (reparent/failover)
+	PrevParent string // parent that was lost (reparent/failover)
+	Health     Health // EventHealth: the NEW value
+	// PrevHealth is the value Health transitioned FROM, for the same reason as NodeID:
+	// the coordinator performs the transition, so it is the only party that knows it
+	// without guessing. A consumer remembering the previous value in-process is wrong
+	// across a restart and wrong for a fresh subscriber, whose very first transition
+	// would report "".
+	//
+	// ONE RULE WORTH KNOWING: sustained degradation and its recovery have no event kind
+	// of their own, so they ride EventHealth — and they set PrevHealth EQUAL to Health,
+	// because a node's LIVENESS did not change. A consumer can therefore separate a
+	// liveness transition from an impairment with a comparison, rather than by parsing
+	// Reason, which this package promises never to make parseable.
+	PrevHealth Health
+	// Count is a monotonic total carried by counting events. EventStale sets it to the
+	// peer's cumulative refusal count; Reason carries no numbers.
+	Count   uint64
+	Present bool         // EventMember
+	Orphans []string     // EventFailover: the subtree that had to move, ascending
+	Reroot  bool         // EventFailover: the root itself was lost
+	Waiting []string     // EventSettling: members not yet heard from, ascending
+	Outcome BuildOutcome // EventTopology/EventSettling/EventUnbuildable
+	Reason  string       // human-readable; never parsed
 	// Topo is the tree just published (EventTopology). It is not copied: the
 	// coordinator never mutates a published Topology in place, so sharing the
 	// pointer is safe and avoids a deep copy per subscriber. DO NOT MUTATE IT.
@@ -133,11 +158,18 @@ func (c *Coordinator) publish(rs *roomState, ev Event) {
 	}
 	ev.RoomID = rs.id
 	ev.At = c.cfg.Clock.Now()
-	if ev.Epoch == 0 {
-		ev.Epoch = rs.epoch
-	}
-	if ev.Rev == 0 {
-		ev.Rev = rs.rev
+	// Most events describe the MEET, so an unset stamp defaults to the meet's term and
+	// revision. EventStale is the exception and must not be defaulted: it reports the
+	// state of ONE PEER's fence, and a peer that has adopted nothing genuinely is at
+	// epoch 0 — which is the most diagnostic case there is. Substituting the meet's
+	// epoch there would hide the exact mismatch the event exists to show.
+	if ev.Kind != EventStale {
+		if ev.Epoch == 0 {
+			ev.Epoch = rs.epoch
+		}
+		if ev.Rev == 0 {
+			ev.Rev = rs.rev
+		}
 	}
 	c.pub.Publish(ev)
 }
