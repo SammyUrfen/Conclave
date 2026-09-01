@@ -1,222 +1,362 @@
-// Command server is conclave's central bootstrap node: the always-up control
-// node that will eventually own room rendezvous, signaling relay, and — most
-// importantly — the role of election arbiter and source of truth for "who is
-// coordinator" (see docs/ROADMAP.md, Phases 1 and 6).
+// Command server is conclave's arbiter: the always-up central node that owns meet
+// rendezvous, the signaling relay, the coordinator-election arbitration, and the
+// browser-facing dashboard surface.
 //
-// For Phase 0 it does exactly one thing: answer GET /healthz. That is enough to
-// prove the module builds, runs, logs in a structured way, shuts down cleanly,
-// and is reachable — before a single line of WebRTC exists.
+// It is deliberately NEVER a media relay. Media flows peer-to-peer over the subnet an
+// elected coordinator computes; everything this process carries is control plane.
+//
+// This file is the ONE place every seam in the system meets, which is why the wiring
+// lives in a single readable list (newPlane) rather than being spread across the
+// packages it connects. Each package declares the interface it consumes and never the
+// one it implements — that is what keeps the dependency graph acyclic — so the
+// concrete ends can only be joined here.
 package main
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/SammyUrfen/conclave/internal/arbiter"
 	"github.com/SammyUrfen/conclave/internal/coordinator"
+	"github.com/SammyUrfen/conclave/internal/dashboard"
 	"github.com/SammyUrfen/conclave/internal/logging"
-	"github.com/SammyUrfen/conclave/internal/overlay"
 	"github.com/SammyUrfen/conclave/internal/signaling"
 )
 
 func main() {
-	// The whole program is one thin main → run(error) hop. main's only jobs are
-	// to hand os.Args to run and to translate a returned error into a non-zero
-	// exit code. Everything testable lives in run and below; main itself is too
-	// trivial to test. This is the idiomatic Go entrypoint shape.
+	// The whole program is one thin main → run(error) hop. main's only jobs are to
+	// hand os.Args to run and to translate a returned error into a non-zero exit
+	// code. Everything testable lives in run and below.
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "server: "+err.Error())
 		os.Exit(1)
 	}
 }
 
+// run parses and validates the flags, builds the plane, and serves until the process
+// is signalled. Every failure before the listener opens is returned, never logged and
+// swallowed: a self-contradictory configuration must not produce a running server.
 func run(args []string) error {
-	// A dedicated FlagSet (rather than the global flag.CommandLine) keeps flag
-	// parsing self-contained and testable, and ContinueOnError returns the
-	// error to us instead of calling os.Exit behind our back.
-	fs := flag.NewFlagSet("server", flag.ContinueOnError)
-	addr := fs.String("addr", ":9000", "TCP address to listen on (host:port)")
-	logLevel := fs.String("log-level", "info", "log level: debug|info|warn|error")
-	logFormat := fs.String("log-format", "text", "log format: json|text")
-	coordinate := fs.Bool("coordinate", false, "run the Phase 4 coordinator: compute and push relay trees from peer telemetry")
-	maxDepth := fs.Int("max-depth", 2, "coordinator: max relay-tree depth in hops root→leaf")
-	streamKbps := fs.Int("stream-kbps", 2000, "coordinator: assumed per-stream upload cost, kbit/s (a node's child capacity = upload budget / this)")
-	defaultUpload := fs.Int("default-upload-kbps", 0, "coordinator: upload budget assumed for a peer that has not reported yet; 0 ⇒ leaf until it reports")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	// Fail loud on bad coordinator config at startup, not silently later. Without
-	// this, -stream-kbps 0 or -max-depth 0 is accepted and only surfaces as a Warn
-	// from every recompute (BuildTree rejects the constraints), so a managed room
-	// just never gets a tree — the exact "mysterious missing stream" we refuse to
-	// ship. Same discipline as ParseLevel rejecting a bad -log-level.
-	if err := validateCoordinatorFlags(*coordinate, *streamKbps, *maxDepth); err != nil {
-		return err
-	}
-
-	level, err := logging.ParseLevel(*logLevel)
+	f, err := parseFlags(args, nil)
 	if err != nil {
 		return err
 	}
-	// .With() returns a child logger that stamps these fields onto every record.
-	// Every line this binary logs now carries service=conclave-server, so a
+	res, err := f.resolve()
+	if err != nil {
+		return err
+	}
+
+	// .With() returns a child logger that stamps these fields onto every record, so a
 	// mixed server+peer log stream stays sortable by origin.
-	logger := logging.New(os.Stdout, level, logging.Format(*logFormat)).With(
+	logger := logging.New(os.Stdout, res.level, res.format).With(
 		slog.String("service", "conclave-server"),
 	)
 
-	// signal.NotifyContext returns a context that is cancelled on Ctrl-C
-	// (SIGINT) or SIGTERM. This is our first taste of context-as-lifecycle: one
-	// cancellation source that we will, from Phase 1 on, fan out to tear down
-	// goroutines, websockets, and peer connections all at once. stop() releases
-	// the signal handler on the way out.
+	p, err := newPlane(logger, f, res)
+	if err != nil {
+		return err
+	}
+	defer p.close()
+
+	// signal.NotifyContext returns a context cancelled on Ctrl-C (SIGINT) or SIGTERM:
+	// one cancellation source fanned out to every goroutine, socket, and peer
+	// connection at once. stop() releases the signal handler on the way out.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// The signaling hub is a process-lived dependency, constructed here at the
-	// edge and injected into the mux — no package globals.
-	hub := signaling.NewHub(logger)
+	return p.serve(ctx)
+}
 
-	// Phase 4: optionally run the coordinator inside the server. It observes room
-	// membership/telemetry through the hub and pushes computed trees back through it
-	// — the two halves wired here at the edge, so neither package imports the other
-	// (the hub calls an Observer it defines; the coordinator sends through a Sender
-	// it defines, adapted to hub.SendTo below). Off by default: without -coordinate
-	// the server is the plain Phase 1–3 signaling relay.
-	if *coordinate {
-		coord := coordinator.New(logger, coordinator.Config{
-			MaxDepth:          *maxDepth,
-			StreamKbps:        *streamKbps,
-			DefaultUploadKbps: *defaultUpload,
-		}, hubSender{hub: hub})
-		hub.SetObserver(coord)
+// plane is every constructed dependency of the arbiter process, wired together.
+//
+// It holds the two configs it built from as well, and not only for the tests that
+// assert on them: they are logged at startup, because "which knobs is this process
+// actually running with" is the first question anyone asks of a control plane and the
+// flags alone do not answer it (several resolve to package defaults).
+type plane struct {
+	log      *slog.Logger
+	flags    *serverFlags
+	hub      *signaling.Hub
+	arb      *arbiter.Arbiter
+	coord    *coordinator.Coordinator // nil without -coordinate
+	dash     *dashboard.Server        // nil without -dashboard
+	ev       *evictor
+	roles    *roleTable
+	arbCfg   arbiter.Config
+	coordCfg coordinator.Config
+}
+
+// newPlane wires every seam. Read top to bottom, it is the whole system's object
+// graph: transport, then the two control planes, then the browser surface.
+//
+// The construction ORDER is forced by one cycle in the object graph that is not a
+// cycle in the package graph: the coordinator publishes into the dashboard, and the
+// dashboard snapshots the coordinator. publisherRef is the late binding that resolves
+// it, set once here before anything is running.
+func newPlane(log *slog.Logger, f *serverFlags, res resolved) (*plane, error) {
+	p := &plane{log: log, flags: f, ev: newEvictor(), roles: newRoleTable()}
+
+	// 1. Transport. It owns the origin allow-list for the WebSocket upgrade — the
+	//    same policy.Origins value the dashboard's CORS uses, injected in both places
+	//    rather than written down twice.
+	hub, err := signaling.NewHubWithConfig(f.hubConfig(log, res.origins))
+	if err != nil {
+		return nil, err
+	}
+	p.hub = hub
+
+	// 2. The liveness relationship neither package can check alone: the Hub's
+	//    socket-death window against the control plane's gone threshold.
+	if err := validateLivenessBudget(f.goneAfter, hub.LivenessBudget()); err != nil {
+		return nil, err
+	}
+
+	// 3. The dashboard is the Publisher for both control planes, but it cannot exist
+	//    until they do. Bind late.
+	pub := &publisherRef{}
+
+	// 4. The coordinator: telemetry in, a computed subnet out. It knows nothing of
+	//    the wire — it holds a Sender it declared, adapted here to the Hub.
+	if f.coordinate {
+		p.coordCfg = f.coordinatorConfig(hub.LivenessBudget())
+		p.coord = coordinator.New(log, p.coordCfg, hubSender{bus: hub}, pub)
+	}
+
+	// 5. The arbiter: meet registry, epoch minting, election. It runs unconditionally
+	//    because it is the sole minter of epochs, and without an epoch the coordinator
+	//    has no term to serve — even in the Phase 5 posture where the arbiter simply
+	//    announces itself.
+	p.arbCfg = f.arbiterConfig()
+	announcer := &hubAnnouncer{log: log, bus: hub, roles: p.roles}
+	if p.coord != nil {
+		announcer.term = p.coord
+	}
+	p.arb = arbiter.New(log, p.arbCfg, announcer, pub)
+
+	// 6. One Observer, fanned to both planes. This is what gives the arbiter a
+	//    liveness view of the coordinator without importing it.
+	obs := &planeObserver{log: log, arb: p.arb, roles: p.roles, relay: hub, roster: hub}
+	if p.coord != nil {
+		obs.coord = p.coord
+	}
+	hub.SetObserver(obs)
+
+	// 7. The browser surface. Demo is expressed as an ABSENT DEPENDENCY rather than a
+	//    boolean a handler must remember to check: with -demo off the routes are never
+	//    registered, so an unregistered route cannot be reached by a bug in a
+	//    permission check (§9.6).
+	if f.dashboard {
+		var subnet dashboard.SubnetSource
+		if p.coord != nil {
+			// Assigned through a branch, never directly: a nil *Coordinator stored in
+			// a non-nil interface is the classic Go typed-nil trap, and the dashboard
+			// tests Subnet == nil to decide whether a coordinator exists at all.
+			subnet = p.coord
+		}
+		var demo dashboard.DemoControl
+		if f.demo {
+			demo = &demoControl{meets: p.arb, roster: hub, ev: p.ev}
+		}
+		dash, err := dashboard.New(log, dashboard.Config{
+			Meets:     p.arb,
+			Subnet:    subnet,
+			Demo:      demo,
+			Origins:   res.origins,
+			PublicURL: f.publicURL,
+			Addr:      f.addr,
+		})
+		if err != nil {
+			return nil, err
+		}
+		p.dash = dash
+		pub.set(dash)
+	}
+
+	return p, nil
+}
+
+// demoEnabled reports whether the destructive demo surface exists. It reads the
+// FLAG that decided the dependency, which is the same fact the dashboard advertises
+// as demo_enabled from Config.Demo != nil — one decision, never two that can drift.
+func (p *plane) demoEnabled() bool { return p.flags.dashboard && p.flags.demo }
+
+// mux wires the HTTP routes.
+func (p *plane) mux() http.Handler {
+	mux := http.NewServeMux()
+	// "GET /healthz" is Go 1.22+ method-aware routing: the mux itself rejects a POST
+	// with 405, so the handler never has to check r.Method.
+	mux.HandleFunc("GET /healthz", healthzHandler(p.log))
+	// The WebSocket upgrade handshake is a GET, so the method-aware pattern fits; the
+	// hub owns everything past the upgrade. The wrapper exists only to give the demo
+	// surface a handle on this connection's lifetime — see serveWS.
+	mux.HandleFunc("GET /ws", p.serveWS)
+	if p.dash != nil {
+		// Mounted so requests keep their FULL path: the dashboard's patterns are
+		// absolute ("/api/meets"), so a StripPrefix here would 404 every route while
+		// the server looked perfectly healthy.
+		mux.Handle("/api/", p.dash.Handler())
+	}
+	return mux
+}
+
+// serveWS is the signaling upgrade, wrapped so this process owns each connection's
+// context.
+//
+// ServeWS derives its per-connection context from the REQUEST's, and cancelling that
+// context is exactly what tears a member down — both pumps unblock and the read loop
+// returns. Owning the request context is therefore how cmd/server obtains the ability
+// to evict a peer WITHOUT signaling exporting a way to close a socket, and it means
+// the demo eviction and a real socket death take the identical code path. A demo
+// control that exercised a different path would prove nothing.
+func (p *plane) serveWS(w http.ResponseWriter, r *http.Request) {
+	roomID := r.URL.Query().Get("room")
+	if roomID == "" {
+		roomID = defaultRoom
+	}
+	ctx, release := p.ev.track(roomID, r.URL.Query().Get("name"), r.Context())
+	defer release()
+	p.hub.ServeWS(w, r.WithContext(ctx))
+}
+
+// start launches the control-plane goroutines.
+//
+// They start HERE and not in newPlane for two reasons: nothing may be running while
+// the publisher is still being late-bound, and a test that only wants the object
+// graph should not have to spawn and reap two loops to get it.
+//
+// Both loops own all their state and return ctx.Err() on cancellation, so a
+// context.Canceled is the expected exit and not a fault worth logging as one.
+//
+// Starting them BEFORE the listener is not incidental either: every arbiter and
+// coordinator query round-trips through its owning goroutine, so a request served
+// before Run is up would block on a loop that has not started rather than fail.
+func (p *plane) start(ctx context.Context) {
+	go func() {
+		if err := p.arb.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			p.log.Error("arbiter stopped", slog.Any("error", err))
+		}
+	}()
+	if p.coord != nil {
 		go func() {
-			if err := coord.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				logger.Error("coordinator stopped", slog.Any("error", err))
+			if err := p.coord.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				p.log.Error("coordinator stopped", slog.Any("error", err))
 			}
 		}()
-		logger.Info("coordinator enabled",
-			slog.Int("max_depth", *maxDepth), slog.Int("stream_kbps", *streamKbps))
 	}
+}
+
+// serve starts the control planes and blocks until ctx ends or the listener fails.
+func (p *plane) serve(ctx context.Context) error {
+	p.start(ctx)
+	p.logStartup()
 
 	srv := &http.Server{
-		Addr:    *addr,
-		Handler: newMux(logger, hub),
-		// A minimal slowloris guard: don't let a client dribble headers forever
-		// and pin a connection. Cheap correctness habit, worth it even on a toy.
+		Addr:    p.flags.addr,
+		Handler: p.mux(),
+		// A minimal slowloris guard: do not let a client dribble headers forever and
+		// pin a connection.
 		ReadHeaderTimeout: 5 * time.Second,
+		// Every handler runs under a context derived from this one, which is what
+		// makes a shutdown reach the WebSocket pumps rather than waiting on them.
+		BaseContext: func(_ net.Listener) context.Context { return ctx },
 	}
 
-	// ListenAndServe blocks, so we run it on its own goroutine and let main
-	// block on the select below instead. The channel is buffered (capacity 1)
-	// on purpose: even if we've already returned via the ctx.Done() path and
-	// nobody is left to receive, the goroutine can still send its exit error and
-	// terminate — no goroutine leak.
+	// ListenAndServe blocks, so it runs on its own goroutine. The channel is buffered
+	// on purpose: even if we have already returned via the ctx.Done() path and nobody
+	// is left to receive, the goroutine can still send its exit error and terminate.
 	serveErr := make(chan error, 1)
 	go func() {
-		logger.Info("http server listening", slog.String("addr", *addr))
+		p.log.Info("http server listening", slog.String("addr", p.flags.addr))
 		serveErr <- srv.ListenAndServe()
 	}()
 
 	select {
 	case err := <-serveErr:
-		// ListenAndServe *always* returns a non-nil error. ErrServerClosed is
-		// the benign "you asked me to stop" sentinel; anything else (e.g. port
-		// already in use) is a real failure. errors.Is is the correct way to
-		// test against a sentinel through any wrapping.
+		// ListenAndServe always returns a non-nil error. ErrServerClosed is the benign
+		// "you asked me to stop" sentinel; anything else (e.g. the port is taken) is a
+		// real failure.
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return err
 		}
 		return nil
 	case <-ctx.Done():
-		logger.Info("shutdown signal received, draining connections")
-		// Shutdown stops accepting new connections and waits for in-flight ones,
-		// bounded by this timeout so a stuck client can't block exit forever.
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		p.log.Info("shutdown signal received, draining connections")
+		// Close the event streams first, with close code 1000, so a watching browser
+		// is told to reconnect with backoff rather than being cut off mid-frame and
+		// left to guess. Shutdown would otherwise wait out every live stream.
+		p.close()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			return fmt.Errorf("graceful shutdown: %w", err)
 		}
-		logger.Info("server stopped cleanly")
+		p.log.Info("server stopped cleanly")
 		return nil
 	}
 }
 
-// validateCoordinatorFlags rejects coordinator constraints that BuildTree cannot
-// satisfy, but only when the coordinator is actually enabled (the flags are inert
-// otherwise). Pulled out as a pure helper so it is unit-testable without starting a
-// server. These mirror overlay.BuildTree's own preconditions, checked here so the
-// failure is a clear startup error rather than a silent per-recompute warning.
-func validateCoordinatorFlags(coordinate bool, streamKbps, maxDepth int) error {
-	if !coordinate {
-		return nil
+// close releases what the plane owns. It is idempotent, because it runs both on the
+// shutdown path and from run's defer.
+func (p *plane) close() {
+	if p.dash != nil {
+		p.dash.Close()
 	}
-	if streamKbps <= 0 {
-		return fmt.Errorf("-stream-kbps must be > 0, got %d", streamKbps)
-	}
-	if maxDepth < 1 {
-		return fmt.Errorf("-max-depth must be >= 1, got %d", maxDepth)
-	}
-	return nil
 }
 
-// hubSender adapts the signaling Hub to coordinator.Sender: it marshals a computed
-// topology into a TypeTopology frame and delivers it to one peer by id. This is the
-// glue that keeps the coordinator ignorant of the wire (it holds a Sender, not a
-// Hub) and the Hub ignorant of the coordinator (it holds an Observer, not a
-// coordinator) — the seam lives here, in main, where both are already known.
-type hubSender struct {
-	hub *signaling.Hub
-}
-
-func (s hubSender) SendTopology(roomID, peerID string, topo *overlay.Topology) error {
-	payload, err := json.Marshal(topo)
-	if err != nil {
-		return fmt.Errorf("marshal topology: %w", err)
+// logStartup records the effective configuration once, at Info.
+//
+// Several knobs resolve to package defaults when a flag is zero, so the flag values
+// alone do not answer "what is this process actually running with" — and that is the
+// first question asked of any control plane whose behaviour looks wrong.
+func (p *plane) logStartup() {
+	p.log.Info("arbiter starting",
+		slog.Bool("coordinate", p.flags.coordinate),
+		slog.Bool("elect", p.flags.elect),
+		slog.Bool("dashboard", p.flags.dashboard),
+		slog.Bool("demo", p.demoEnabled()),
+		slog.String("arbiter_id", p.arbCfg.ArbiterID),
+		slog.String("allowed_origins", p.flags.allowedOrigins),
+		slog.Duration("socket_detection", p.hub.LivenessBudget()),
+	)
+	if p.coord != nil {
+		p.log.Info("coordinator enabled",
+			slog.Int("max_depth", p.coordCfg.MaxDepth),
+			slog.Int("stream_kbps", p.coordCfg.StreamKbps),
+			slog.Float64("stickiness_ms", p.coordCfg.StickinessMs),
+			slog.Duration("join_settle", p.coordCfg.JoinSettle),
+			slog.Duration("dwell", p.coordCfg.Dwell),
+			slog.Duration("gone_after", p.coordCfg.GoneAfter))
 	}
-	if !s.hub.SendTo(roomID, peerID, signaling.Message{
-		Type: signaling.TypeTopology, To: peerID, Payload: payload,
-	}) {
-		return fmt.Errorf("peer %q not present in room %q", peerID, roomID)
+	if p.demoEnabled() {
+		// Loud on purpose: these routes let an unauthenticated caller terminate a
+		// participant's connection and force a control-plane transition.
+		p.log.Warn("DESTRUCTIVE demo control routes are registered (-demo): " +
+			"an unauthenticated caller can evict a peer and force an election")
 	}
-	return nil
 }
 
-// newMux wires the HTTP routes. The logger and hub are injected so handlers can
-// share the binary's service-stamped logger and its single signaling hub.
-func newMux(logger *slog.Logger, hub *signaling.Hub) http.Handler {
-	mux := http.NewServeMux()
-	// "GET /healthz" is Go 1.22+ method-aware routing: the mux itself rejects a
-	// POST to /healthz with 405, so the handler never has to check r.Method.
-	mux.HandleFunc("GET /healthz", healthzHandler(logger))
-	// The WebSocket upgrade handshake is a GET, so the method-aware pattern fits;
-	// the hub owns everything past the upgrade.
-	mux.HandleFunc("GET /ws", hub.ServeWS)
-	return mux
-}
-
-// healthResponse is the JSON body returned by /healthz. The struct tags decide
-// the wire names, which lets the Go fields stay idiomatic (exported, CamelCase)
-// while the JSON stays lowercase. This tiny type is the seed of the wire
-// protocol we grow in Phase 1.
+// healthResponse is the JSON body returned by /healthz.
 type healthResponse struct {
 	Status  string `json:"status"`
 	Service string `json:"service"`
 }
 
-// healthzHandler returns an http.HandlerFunc. Returning a closure over logger
-// (instead of a plain function) is how we inject dependencies into a handler
-// without a global — the returned function "remembers" logger. Closures like
-// this are a workhorse from here on.
+// healthzHandler returns an http.HandlerFunc closed over logger — how a dependency is
+// injected into a handler without a global.
+//
+// It is the endpoint a hosted platform's health check calls, so it stays cheap and
+// dependency-free: it reports that the process is serving, deliberately not that the
+// control planes are healthy. A health check that fails when a meet is misconfigured
+// gets the container restarted for something a restart cannot fix.
 func healthzHandler(logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -225,15 +365,12 @@ func healthzHandler(logger *slog.Logger) http.HandlerFunc {
 			Status:  "ok",
 			Service: "conclave-server",
 		}); err != nil {
-			// The 200 status line is already flushed, so we cannot change the
-			// response now — the honest move is to record the failure and move
-			// on. slog.Any wraps an arbitrary value (here, the error). The key
-			// is "error" to match the logging field vocabulary in
-			// docs/design-system.md — key names are a contract, not a whim.
+			// The 200 status line is already flushed, so the response cannot change
+			// now — the honest move is to record the failure and move on.
 			logger.Error("encode healthz response", slog.Any("error", err))
 			return
 		}
-		logger.Info("served healthz",
+		logger.Debug("served healthz",
 			slog.String("remote", r.RemoteAddr),
 			slog.String("method", r.Method),
 			slog.String("path", r.URL.Path),

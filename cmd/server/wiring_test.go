@@ -142,21 +142,31 @@ func TestObserverFansOutToBothPlanes(t *testing.T) {
 	obs.Reparented("standup", "p1", []byte(`{}`))
 	obs.PeerLeft("standup", "p1")
 
-	want := []string{
-		"join:standup:p1", "metrics:standup:p1", "beat:standup:p1",
-		"reparent:standup:p1", "left:standup:p1",
-	}
+	// The two planes see DIFFERENT slices on purpose. The arbiter's is a liveness
+	// view — membership, telemetry, beats — and a self-promotion says nothing about
+	// whether a peer could coordinate, so Reparented is not part of it. Asserting the
+	// same list for both would force the arbiter to grow a method that ignores its
+	// argument, which is a worse lie than a narrower interface.
 	for _, side := range []struct {
 		name string
 		obs  *fakeObserver
-	}{{"arbiter", arb}, {"coordinator", coord}} {
+		want []string
+	}{
+		{"arbiter", arb, []string{
+			"join:standup:p1", "metrics:standup:p1", "beat:standup:p1", "left:standup:p1",
+		}},
+		{"coordinator", coord, []string{
+			"join:standup:p1", "metrics:standup:p1", "beat:standup:p1",
+			"reparent:standup:p1", "left:standup:p1",
+		}},
+	} {
 		got := side.obs.snapshot()
-		if len(got) != len(want) {
-			t.Fatalf("%s saw %v, want %v", side.name, got, want)
+		if len(got) != len(side.want) {
+			t.Fatalf("%s saw %v, want %v", side.name, got, side.want)
 		}
-		for i := range want {
-			if got[i] != want[i] {
-				t.Fatalf("%s call %d = %q, want %q", side.name, i, got[i], want[i])
+		for i := range side.want {
+			if got[i] != side.want[i] {
+				t.Fatalf("%s call %d = %q, want %q", side.name, i, got[i], side.want[i])
 			}
 		}
 	}

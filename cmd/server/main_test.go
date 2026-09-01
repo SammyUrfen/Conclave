@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // newTestPlane builds the real wiring from real flags, so these tests exercise what
@@ -26,6 +28,17 @@ func newTestPlane(t *testing.T, args ...string) *plane {
 		t.Fatalf("newPlane(%v): %v", args, err)
 	}
 	t.Cleanup(p.close)
+
+	// The control planes must be RUNNING before the dashboard can answer: every
+	// arbiter and coordinator query round-trips through its owning goroutine, so a
+	// handler served against a stopped loop blocks rather than errors. That is the
+	// same reason serve() starts them before the listener.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	p.start(ctx)
+	if err := p.arb.Sync(ctx); err != nil {
+		t.Fatalf("arbiter did not start: %v", err)
+	}
 	return p
 }
 
@@ -200,8 +213,14 @@ func TestWSRouteIsMounted(t *testing.T) {
 
 // TestRunFailsLoudOnBadConfig proves the whole startup gate short-circuits BEFORE a
 // listener is opened. Each case is a config that contradicts itself; none of them may
-// produce a running server. The test would hang, not fail, if run() started serving —
-// which is why every case here is one run() must reject.
+// produce a running server.
+//
+// run() blocks forever once it starts serving, so each case runs on its own goroutine
+// behind a deadline. That is not defensive padding: a gate that is missing turns this
+// from a failing test into a HANGING one, and a hang gets blamed on the harness while
+// a named failure gets fixed. The goroutine is abandoned on the timeout — acceptable
+// in a test that is already failing, and the alternative (a cancellable run) would
+// change production shape to suit the test.
 func TestRunFailsLoudOnBadConfig(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -220,11 +239,20 @@ func TestRunFailsLoudOnBadConfig(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Every case binds no port, so -addr is never reached; if one of them
-			// ever did start serving, that is the bug this test is here to catch.
-			err := run(append([]string{"-addr", "127.0.0.1:0"}, tt.args...))
+			// -addr binds an ephemeral port, so a case that wrongly gets past the
+			// gate serves rather than colliding with anything — which is exactly the
+			// bug this test is here to catch, and why the deadline exists.
+			errc := make(chan error, 1)
+			go func() { errc <- run(append([]string{"-addr", "127.0.0.1:0"}, tt.args...)) }()
+
+			var err error
+			select {
+			case err = <-errc:
+			case <-time.After(3 * time.Second):
+				t.Fatalf("run(%v) is still serving after 3s; want a startup error", tt.args)
+			}
 			if err == nil {
-				t.Fatalf("run(%v) started; want a startup error", tt.args)
+				t.Fatalf("run(%v) returned cleanly; want a startup error", tt.args)
 			}
 			if !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("run(%v) = %v, want an error naming %q", tt.args, err, tt.wantErr)

@@ -1,0 +1,67 @@
+# Publish web/ to GitHub Pages.
+#
+# There is NO BUILD STEP, and that is the design rather than an omission: web/ is
+# vanilla ES modules with hand-written CSS — no bundler, no npm, no transpile. The
+# directory that is committed is byte-for-byte the directory that is served, so what
+# you debug in a browser against a local file:// tree is what is live. Adding a build
+# would buy nothing here and would put a toolchain between the source and the artefact.
+#
+# One-time setup, done in the repository UI and NOT by this workflow: Settings → Pages
+# → Source → "GitHub Actions". Until that is set, deploy-pages fails with a "Pages is
+# not enabled" error, which is the correct failure — enabling a public site is an
+# owner's decision, not a workflow's.
+name: pages
+
+on:
+  push:
+    branches: [main]
+    # Only when the site or this workflow changes. A Go-only commit has nothing to
+    # publish, and a no-op deployment still replaces the live site — briefly, but for
+    # no reason.
+    paths:
+      - "web/**"
+      - ".github/workflows/pages.yml"
+  # Manual runs, for a first publish or after a settings change.
+  workflow_dispatch:
+
+permissions:
+  # The three the official Pages actions require, and nothing else:
+  contents: read # checkout
+  pages: write # create the deployment
+  id-token: write # OIDC — deploy-pages proves the artefact's provenance with it
+  # Notably absent: contents: write. This publishes through the Pages API rather than
+  # by pushing to a gh-pages branch, so the workflow never needs write access to the
+  # repository at all.
+
+# One live deployment at a time. cancel-in-progress is FALSE here, unlike ci.yml:
+# cancelling a deployment mid-flight can leave the site partially replaced, and the
+# cost of letting a superseded deploy finish is a few seconds of a stale site rather
+# than an inconsistent one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      # Surfaces the live URL on the run summary and in the repo's Environments tab.
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: configure pages
+        uses: actions/configure-pages@v5
+
+      - name: upload web/
+        uses: actions/upload-pages-artifact@v3
+        with:
+          # The site root is web/, so index.html lands at the top of the published
+          # site. Uploading the repository root instead would publish the Go source and
+          # bury index.html one path segment down.
+          path: web
+
+      - name: deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
