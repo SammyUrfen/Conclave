@@ -41,9 +41,49 @@ const (
 	TypeMetrics Type = "metrics"
 	// TypeTopology carries a coordinator-computed relay tree to a peer in
 	// Message.Payload (an opaque overlay.Topology the peer decodes and realises).
-	// Server → peer.
+	// It has TWO legitimate origins: the server (Phase 5, From == ServerID) and an
+	// elected coordinator peer (Phase 6, From == that peer's id). The Hub relays a
+	// peer-originated one without checking who sent it — see route.
 	TypeTopology Type = "topology"
+
+	// --- Phase 5/6 liveness and election plane. ---
+
+	// TypeHeartbeat carries a peer's 1 Hz liveness beat and its REALIZED topology
+	// state in Message.Payload (an opaque metrics.Heartbeat). Peer → server, where
+	// it terminates: like TypeMetrics it is consumed by the Observer, never relayed.
+	TypeHeartbeat Type = "heartbeat"
+	// TypeReparented reports that a peer changed its own parent without being told
+	// to — a backup promotion, successful or not — in Message.Payload (an opaque
+	// metrics.Reparented). Peer → server, terminating.
+	TypeReparented Type = "reparented"
+	// TypeCoordinator announces who holds the coordinator role for an epoch, in
+	// Message.Payload (an opaque arbiter.Announcement). Server → every member of the
+	// meet; a peer that sends one is refused, because the arbiter is the sole source
+	// of truth for this fact and a peer-minted announcement would defeat the fence.
+	TypeCoordinator Type = "coordinator"
+	// TypeMembership carries the meet's AUTHORITATIVE roster in Message.Peers.
+	// Server → every member, broadcast on every membership change.
+	//
+	// It exists for the Phase 6 coordinator, which is a PEER: such a coordinator has
+	// no Observer callbacks, so without this frame it would learn joins only
+	// implicitly (from a stranger's next heartbeat) and learn graceful leaves not at
+	// all — the join and leave threshold events would be unreachable, and a peer that
+	// quit cleanly would only be noticed by the multi-second "gone" backstop. The
+	// delta frames (TypePeerJoined / TypePeerLeft) still flow; this is the periodic
+	// snapshot that makes a missed delta self-correcting rather than permanent, and
+	// gives a newly elected coordinator ground truth without a handover protocol.
+	TypeMembership Type = "membership"
 )
+
+// ServerID is the reserved From value the Hub stamps on frames the server
+// ORIGINATES (as opposed to relays). It lets a peer apply one uniform fencing rule
+// in both phases: in Phase 5 the coordinator IS the server, so a topology arrives
+// with From == ServerID; in Phase 6 it arrives with From == the elected peer's id.
+// Without the reserved value a peer would need two different checks.
+//
+// It is prefixed with '_' because peer ids are "p1", "p2", … — a collision is
+// impossible by construction, and the prefix makes that obvious in a log line.
+const ServerID = "_server"
 
 // Peer identifies one room member on the wire: the server-assigned id (the
 // authoritative address used for routing) plus the peer's self-declared name (a

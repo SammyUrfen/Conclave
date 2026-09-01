@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SammyUrfen/conclave/internal/clock"
 	"github.com/SammyUrfen/conclave/internal/overlay"
 )
 
@@ -28,7 +29,7 @@ func TestReporterEmitsImmediatelyThenTicks(t *testing.T) {
 	}
 	sample := func() Report { return Report{Name: "n1", UploadKbps: 4000, NAT: overlay.NATDirect} }
 
-	r := NewReporter(discardLogger(), 15*time.Millisecond, sample, send)
+	r := NewReporter(discardLogger(), 15*time.Millisecond, clock.System(), sample, send)
 	ctx, cancel := context.WithCancel(context.Background())
 	go r.Run(ctx)
 
@@ -63,7 +64,7 @@ func TestReporterSurvivesSendError(t *testing.T) {
 		mu.Unlock()
 		return errors.New("channel down")
 	}
-	r := NewReporter(discardLogger(), 10*time.Millisecond, func() Report { return Report{Name: "n"} }, send)
+	r := NewReporter(discardLogger(), 10*time.Millisecond, clock.System(), func() Report { return Report{Name: "n"} }, send)
 	ctx, cancel := context.WithCancel(context.Background())
 	go r.Run(ctx)
 
@@ -75,7 +76,7 @@ func TestReporterSurvivesSendError(t *testing.T) {
 // TestReporterDefaultsInterval checks a non-positive interval falls back rather than
 // spinning (a zero ticker panics).
 func TestReporterDefaultsInterval(t *testing.T) {
-	r := NewReporter(discardLogger(), 0, func() Report { return Report{} }, func(Report) error { return nil })
+	r := NewReporter(discardLogger(), 0, clock.System(), func() Report { return Report{} }, func(Report) error { return nil })
 	if r.interval != DefaultInterval {
 		t.Errorf("interval = %v, want default %v", r.interval, DefaultInterval)
 	}
