@@ -40,8 +40,11 @@ func TestFlagDefaults(t *testing.T) {
 		{"-join-settle", f.joinSettle, 1500 * time.Millisecond},
 		{"-dwell", f.dwell, 10 * time.Second},
 		{"-recompute-cooldown", f.recomputeCooldown, 5 * time.Second},
-		{"-degraded-after", f.degradedAfter, 3 * time.Second},
-		{"-gone-after", f.goneAfter, 8 * time.Second},
+		// 0 is not "unset": coordinator.Config documents it as "derive this
+		// threshold per node from the cadence the peer DECLARED on the wire". A
+		// non-zero default here would make that derivation dead code in production.
+		{"-degraded-after", f.degradedAfter, time.Duration(0)},
+		{"-gone-after", f.goneAfter, time.Duration(0)},
 		{"-elect", f.elect, false},
 		{"-election-dwell", f.electionDwell, 20 * time.Second},
 		{"-min-term", f.minTerm, 60 * time.Second},
@@ -137,11 +140,24 @@ func TestResolveRejectsContradictoryConfig(t *testing.T) {
 		{name: "empty origins without dashboard", args: []string{"-allowed-origins", "", "-dashboard=false"}},
 		{name: "zero dwell", args: []string{"-dwell", "0"}, wantErr: "-dwell"},
 		{name: "negative join settle", args: []string{"-join-settle", "-1s"}, wantErr: "-join-settle"},
-		{name: "zero gone after", args: []string{"-gone-after", "0"}, wantErr: "-gone-after"},
 		{name: "zero min term", args: []string{"-min-term", "0"}, wantErr: "-min-term"},
-		// degraded must fire strictly before gone or the health FSM has no ordering.
-		{name: "degraded not before gone", args: []string{"-degraded-after", "9s"}, wantErr: "-degraded-after"},
-		{name: "degraded equals gone", args: []string{"-degraded-after", "8s"}, wantErr: "-degraded-after"},
+		// The two health thresholds are the exception to "every duration > 0": 0 is
+		// their documented "derive per node" value and the default. Negative has no
+		// meaning at all and must still be refused.
+		{name: "zero gone after is the derive sentinel", args: []string{"-gone-after", "0"}},
+		{name: "zero degraded after is the derive sentinel", args: []string{"-degraded-after", "0"}},
+		{name: "negative gone after", args: []string{"-gone-after", "-1s"}, wantErr: "-gone-after"},
+		{name: "negative degraded after", args: []string{"-degraded-after", "-1s"}, wantErr: "-degraded-after"},
+		// Ordering is only checkable when BOTH are explicit. With one derived, the
+		// comparison is between a fixed value and a per-peer one that startup cannot
+		// see — so the check applies to the pair, not to either alone.
+		{name: "both explicit and ordered", args: []string{"-degraded-after", "4s", "-gone-after", "9s"}},
+		{name: "both explicit, degraded past gone", args: []string{"-degraded-after", "9s", "-gone-after", "8s"}, wantErr: "-degraded-after"},
+		{name: "both explicit and equal", args: []string{"-degraded-after", "8s", "-gone-after", "8s"}, wantErr: "-degraded-after"},
+		// One explicit, one derived: no ordering claim is possible, so neither may be
+		// rejected on ordering grounds.
+		{name: "only degraded explicit", args: []string{"-degraded-after", "30s"}},
+		{name: "only gone explicit", args: []string{"-gone-after", "9s"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -218,7 +234,8 @@ func TestValidateLivenessBudget(t *testing.T) {
 		budget    time.Duration
 		wantErr   string
 	}{
-		{name: "shipped defaults agree", goneAfter: 8 * time.Second, budget: signaling.WSLivenessBudget},
+		{name: "shipped default derives", goneAfter: 0, budget: signaling.WSLivenessBudget},
+		{name: "explicit override agrees", goneAfter: 8 * time.Second, budget: signaling.WSLivenessBudget},
 		{name: "gone shorter than socket detection", goneAfter: 5 * time.Second,
 			budget: signaling.WSLivenessBudget, wantErr: "-gone-after"},
 		{name: "gone equal to socket detection", goneAfter: signaling.WSLivenessBudget,
@@ -228,7 +245,7 @@ func TestValidateLivenessBudget(t *testing.T) {
 		// so the check falls back to the default cadence rather than skipping.
 		{name: "derived threshold with default cadence", goneAfter: 0, budget: signaling.WSLivenessBudget},
 		{name: "derived threshold too slow a socket", goneAfter: 0,
-			budget: metrics.GoneAfter(metrics.HeartbeatInterval) + time.Second, wantErr: "socket liveness budget"},
+			budget: metrics.GoneAfter(metrics.HeartbeatInterval) + time.Second, wantErr: "-gone-after"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -233,7 +233,10 @@ func TestRunFailsLoudOnBadConfig(t *testing.T) {
 		{name: "empty origins with the dashboard on", args: []string{"-allowed-origins", ""}, wantErr: "-allowed-origins"},
 		{name: "impossible tree constraints", args: []string{"-coordinate", "-max-depth", "0"}, wantErr: "-max-depth"},
 		{name: "gone before the socket reaper", args: []string{"-gone-after", "5s"}, wantErr: "-gone-after"},
-		{name: "degraded after gone", args: []string{"-degraded-after", "20s"}, wantErr: "-degraded-after"},
+		// BOTH must be explicit for the ordering check to apply: with -gone-after left
+		// at its "derive per peer" default there is no fixed value to be out of order
+		// with, so -degraded-after alone is legal and is NOT a case for this table.
+		{name: "degraded after gone", args: []string{"-degraded-after", "20s", "-gone-after", "9s"}, wantErr: "-degraded-after"},
 		{name: "unusable public url", args: []string{"-public-url", "ftp://example.com"}, wantErr: "public-url"},
 		{name: "unknown flag", args: []string{"-nonsense"}, wantErr: "nonsense"},
 	}

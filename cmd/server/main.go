@@ -334,7 +334,8 @@ func (p *plane) logStartup() {
 			slog.Float64("stickiness_ms", p.coordCfg.StickinessMs),
 			slog.Duration("join_settle", p.coordCfg.JoinSettle),
 			slog.Duration("dwell", p.coordCfg.Dwell),
-			slog.Duration("gone_after", p.coordCfg.GoneAfter))
+			slog.String("degraded_after", thresholdLabel(p.coordCfg.DegradedAfter)),
+			slog.String("gone_after", thresholdLabel(p.coordCfg.GoneAfter)))
 	}
 	if p.demoEnabled() {
 		// Loud on purpose: these routes let an unauthenticated caller terminate a
@@ -342,6 +343,19 @@ func (p *plane) logStartup() {
 		p.log.Warn("DESTRUCTIVE demo control routes are registered (-demo): " +
 			"an unauthenticated caller can evict a peer and force an election")
 	}
+}
+
+// thresholdLabel renders a health threshold for the startup log.
+//
+// A bare "0" is accurate and tells an operator nothing — it reads as "unset" when it
+// actually means "derived per peer from the cadence each one declares", which is the
+// single most confusing number in this log precisely because it is the DEFAULT. The
+// value is a sentinel, so it is logged as what it means rather than as what it is.
+func thresholdLabel(d time.Duration) string {
+	if d <= 0 {
+		return "derived per peer"
+	}
+	return d.String()
 }
 
 // healthResponse is the JSON body returned by /healthz.
