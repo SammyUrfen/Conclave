@@ -57,6 +57,11 @@
 // and each relay forwards, toward each neighbour, exactly what is not already on
 // that neighbour's side of the cut.
 //
+// One edge deliberately sits outside the tree: the child that promoted this peer as
+// its backup parent. It is accepted on the coordinator's own backup assignment, and
+// it is held — exempt from the diff's ordinary "close what the tree does not name" —
+// until the coordinator rules on the promotion, one way or the other.
+//
 // The Router also reports its REALIZED overlay position (Realized) — the parent it
 // is actually attached to and the children it is actually serving, in topology
 // names — which is the ground truth a newly promoted coordinator rebuilds the

@@ -23,6 +23,12 @@ type liveState struct {
 	// flag because sessions are created at different moments: a peer promoted from
 	// leaf to relay has one edge built the old way and the rest built the new way.
 	relayEdge map[string]bool
+	// backupChild names the sessions that exist ONLY by the §7.5a backup warrant —
+	// a child that promoted us as its backup parent — mapped to the parent it was
+	// failing over FROM. Presence means "this edge is not in the tree on purpose",
+	// and the recorded parent is what tells a later push whether the coordinator has
+	// acted on that failure yet.
+	backupChild map[string]string
 	// peerRelay records what the PEER was when the session was built. It is the
 	// mirror of relayEdge and it exists for symmetry: a re-creation must be agreed by
 	// both ends or the one that rebuilds sits waiting for an offer the other end has
@@ -137,6 +143,9 @@ func diffTopology(self string, next *overlay.Topology, live liveState) topoDiff 
 		case !wanted[name]:
 			if d.reparent && name == d.oldParent {
 				continue // held open until the new parent carries media
+			}
+			if promotionPending(next, self, name, live.backupChild) {
+				continue // §7.5a: a promotion we accepted, not yet ruled on
 			}
 			d.remove = append(d.remove, name)
 		case next.Offers(self, name) != bakedRole,
@@ -318,4 +327,34 @@ func allNodes(t *overlay.Topology) []string {
 		nodes = append(nodes, t.Root)
 	}
 	return nodes
+}
+
+// promotionPending reports whether a live session the tree does not name is a
+// backup child we accepted (§7.5a) whose promotion the coordinator has not yet ruled
+// on — in which case dropping it as a stranger would take away the parent that peer
+// has only just failed over to.
+//
+// Both clauses are exits, and both are needed:
+//
+//   - The coordinator must still name us as that child's backup. That assignment IS
+//     the warrant the edge was accepted on; once it is withdrawn there is nothing
+//     left to stand on.
+//   - The child's parent-of-record must be unchanged since we accepted it. That is
+//     what distinguishes "the coordinator has not acted yet" from "the coordinator
+//     acted and placed this child elsewhere" — after which our edge is obsolete and
+//     holding it means uploading to a peer that is not ours.
+//
+// The third exit needs no code: when the coordinator RATIFIES, the edge becomes a
+// real tree edge, the child is wanted, and this is never consulted — the ordinary
+// diff takes over and re-creates the session for its now-real role.
+//
+// Note this cannot be derived from the pushed topology alone. "Has the coordinator
+// acted" is a question about change, so it needs a before as well as an after, and
+// the before is what the Router recorded when it accepted the edge.
+func promotionPending(next *overlay.Topology, self, name string, accepted map[string]string) bool {
+	from, ok := accepted[name]
+	if !ok {
+		return false
+	}
+	return next.BackupOf(name) == self && next.ParentOf(name) == from
 }

@@ -25,6 +25,7 @@ import (
 type meetFixture struct {
 	srv     *httptest.Server
 	routers map[string]*Router
+	clients map[string]*signaling.Client
 	coord   *signaling.Client
 	wg      *sync.WaitGroup
 	cancel  context.CancelFunc
@@ -50,7 +51,8 @@ func newMeetFixture(t *testing.T, ctx context.Context, room string, cfgs map[str
 
 	runCtx, cancel := context.WithCancel(ctx)
 	f := &meetFixture{srv: srv, routers: map[string]*Router{}, wg: &sync.WaitGroup{},
-		cancel: cancel, log: logger, ids: map[string]string{}}
+		cancel: cancel, log: logger, ids: map[string]string{},
+		clients: map[string]*signaling.Client{}}
 
 	// The coordinator joins first so it observes every peer-joined and can address
 	// the whole meet by name.
@@ -108,6 +110,7 @@ func newMeetFixture(t *testing.T, ctx context.Context, room string, cfgs map[str
 		cfg.Clock = scaledClock{factor: 4}
 		r := NewRouter(logger, client, cfg)
 		f.routers[name] = r
+		f.clients[name] = client
 		f.wg.Add(1)
 		go func() {
 			defer f.wg.Done()
@@ -371,6 +374,45 @@ func TestRouterPromotesBackupParent(t *testing.T) {
 	if got := f.routers["c"].currentTopo().BackupOf("c"); got != "" {
 		t.Errorf("local backup is still %q after promoting it; a retry would re-target the current parent", got)
 	}
+
+	// ---- the promotion window ----
+	//
+	// c is now attached to a by a warrant the TREE does not describe, and it stays
+	// that way until the coordinator ratifies. Any unrelated push arriving first
+	// makes a see c as a live neighbour the tree does not name — a stranger — and
+	// drop it. c would then lose the parent it just failed over to, for a reason
+	// that has nothing to do with it, inside the exact window failover exists to
+	// survive.
+	//
+	// The interleaving is constructed, not hoped for. b is taken off the wire first,
+	// so its peer-left removes it from every roster: that is what stops c from
+	// obediently re-parenting BACK to its dead primary when the push still names b as
+	// its parent, which would mask the thing under test.
+	if err := f.clients["b"].Close(); err != nil {
+		t.Fatalf("close b: %v", err)
+	}
+	waitFor(t, "b to leave every roster", 30*time.Second, func() bool {
+		return f.routers["a"].idForName("b") == "" && f.routers["c"].idForName("b") == ""
+	})
+
+	aID := f.idOf(t, "a")
+	before := f.routers["c"].Stats().Tracks[aID]
+
+	unrelated := tree("a", [2]string{"a", "b"}, [2]string{"a", "d"}, [2]string{"b", "c"})
+	unrelated.Backups = []overlay.Backup{{Node: "c", Parent: "a"}}
+	unrelated.Rev = 2 // a real push: same shape, later revision, nothing about c
+	f.push(t, unrelated)
+
+	// The promoted edge must still be there afterwards, and still carrying.
+	stableFor(t, "c to keep its promoted parent across an unrelated push", 3*time.Second, func() bool {
+		return len(f.routers["c"].Stats().Peers) == 1
+	})
+	if st := f.routers["c"].connectionStateByName("a"); st != webrtc.PeerConnectionStateConnected {
+		t.Fatalf("c's promoted edge is %s after an unrelated push, want connected", st)
+	}
+	waitFor(t, "media to keep flowing over the promoted edge", 30*time.Second, func() bool {
+		return f.routers["c"].Stats().Tracks[aID] >= before
+	})
 }
 
 // offererToward reports the baked-in offerer role of holder's live session toward
