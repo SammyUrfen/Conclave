@@ -104,11 +104,26 @@ func (n *Network) Len() int { return len(n.nodes) }
 // the projection — and thus the whole simulation — reproducible.
 //
 // This is the ONE place the injected faults meet the builder, which is why it is
-// worth naming what does and does not cross: an injected Degrade OVERRIDES the
-// measured round-trip (so a degraded link genuinely re-parents a child), while a
-// Partition does not appear at all — the overlay model has no way to say "these two
-// cannot be neighbours", and faking it through the RTT matrix would read as
-// "unknown", which the builder treats as a load-balancing tie. See Partition.
+// worth naming exactly what does and does not cross:
+//
+//   - Degrade's ROUND-TRIP overrides the measured baseline, so a degraded link
+//     genuinely re-parents a child on latency alone.
+//   - Degrade's LOSS crosses twice: as Node.LossPct, which derates the node's usable
+//     upload (retransmits really do consume the budget a relay would spend on
+//     children), and — once it reaches ImpairedLossPct — as Node.Impaired, which
+//     strips the node's incumbency protection and disqualifies it from taking new
+//     children, as root, and as a backup parent. The second is what makes a
+//     sustained-degradation scenario MOVE an impaired relay's children instead of
+//     producing a byte-identical tree.
+//   - Partition does not cross at all — the overlay model has no way to say "these
+//     two cannot be neighbours", and faking it through the RTT matrix would read as
+//     "unknown", which the builder treats as a load-balancing tie and which could
+//     make the unreachable parent MORE attractive. See Partition.
+//
+// The harness sets Impaired directly rather than modelling the dwell timer, because
+// the dwell is the coordinator's job (it is what turns a stream of bad samples into
+// the one-bit decision) and simnet's job is to state the decision's OUTCOME so the
+// graph layer can be tested against it.
 func (n *Network) OverlayNodes() []overlay.Node {
 	out := make([]overlay.Node, 0, len(n.order))
 	for _, name := range n.order {
@@ -117,6 +132,8 @@ func (n *Network) OverlayNodes() []overlay.Node {
 		if len(row) > 0 {
 			node.RTT = row
 		}
+		node.LossPct = n.NodeLossPct(name)
+		node.Impaired = node.Impaired || n.Impaired(name)
 		out = append(out, node)
 	}
 	return out
