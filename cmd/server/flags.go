@@ -110,10 +110,17 @@ func parseFlags(args []string, errOut io.Writer) (*serverFlags, error) {
 		"coordinator: how long metrics must stay bad before sustained degradation counts")
 	fs.DurationVar(&f.recomputeCooldown, "recompute-cooldown", coordinator.RecomputeCooldown,
 		"coordinator: minimum interval between two published trees for one meet")
-	fs.DurationVar(&f.degradedAfter, "degraded-after", metrics.DegradedAfter(metrics.HeartbeatInterval),
-		"coordinator: silence before a peer is marked degraded")
-	fs.DurationVar(&f.goneAfter, "gone-after", metrics.GoneAfter(metrics.HeartbeatInterval),
-		"coordinator: silence before a peer is declared gone (the repair backstop)")
+	// The two health thresholds default to 0, which is NOT "unset": coordinator.Config
+	// defines 0 as "derive this threshold per node from the cadence the peer DECLARED
+	// on the wire", and a non-zero default here would mean the server always passes a
+	// fixed value and that derivation never executes. The consequence is concrete: a
+	// peer running -heartbeat 5s would be declared gone after 8s of silence while it
+	// is beating perfectly. A non-zero value keeps its documented meaning as an
+	// explicit GLOBAL OVERRIDE of the per-peer derivation.
+	fs.DurationVar(&f.degradedAfter, "degraded-after", 0,
+		"coordinator: override the per-peer degraded threshold with a fixed silence; 0 ⇒ derive it from each peer's declared cadence")
+	fs.DurationVar(&f.goneAfter, "gone-after", 0,
+		"coordinator: override the per-peer gone threshold with a fixed silence; 0 ⇒ derive it from each peer's declared cadence")
 
 	fs.BoolVar(&f.elect, "elect", false,
 		"arbitrate the coordinator role among peers (Phase 6)")
@@ -222,8 +229,6 @@ func (f *serverFlags) validateTimings() error {
 		{"-join-settle", f.joinSettle},
 		{"-dwell", f.dwell},
 		{"-recompute-cooldown", f.recomputeCooldown},
-		{"-degraded-after", f.degradedAfter},
-		{"-gone-after", f.goneAfter},
 		{"-election-dwell", f.electionDwell},
 		{"-min-term", f.minTerm},
 	} {
@@ -231,10 +236,30 @@ func (f *serverFlags) validateTimings() error {
 			return fmt.Errorf("%s must be > 0, got %v", d.flag, d.val)
 		}
 	}
-	// The health FSM is an ordered walk healthy → degraded → gone. Equal thresholds
-	// collapse the middle state, and a reversed pair makes it unreachable — in both
-	// cases the dashboard would simply never show a peer degrading before it vanished.
-	if f.degradedAfter >= f.goneAfter {
+	// -degraded-after and -gone-after are the exception, and only in one direction:
+	// 0 is their documented "derive per node" value and their default, but NEGATIVE
+	// means nothing to the coordinator and would be read as 0 there — an operator who
+	// typed "-1s" would silently get the derivation they did not ask for.
+	for _, d := range []struct {
+		flag string
+		val  time.Duration
+	}{
+		{"-degraded-after", f.degradedAfter},
+		{"-gone-after", f.goneAfter},
+	} {
+		if d.val < 0 {
+			return fmt.Errorf("%s must be >= 0 (0 ⇒ derive from each peer's declared cadence), got %v",
+				d.flag, d.val)
+		}
+	}
+	// The health FSM is an ordered walk healthy → degraded → gone, so degraded must
+	// fire strictly first. The check applies ONLY when both are explicit: with either
+	// one derived, the comparison is between a fixed value and a per-peer one that no
+	// startup check can see, and rejecting on it would refuse configurations that are
+	// perfectly ordered for every peer that actually connects. The derived pair is
+	// ordered by construction anyway — metrics.DegradedAfter is 3 beats and
+	// metrics.GoneAfter is 8, of the same cadence.
+	if f.degradedAfter > 0 && f.goneAfter > 0 && f.degradedAfter >= f.goneAfter {
 		return fmt.Errorf("-degraded-after (%v) must be strictly less than -gone-after (%v)",
 			f.degradedAfter, f.goneAfter)
 	}
@@ -291,10 +316,20 @@ func validateCoordinatorFlags(f *serverFlags) error {
 // no use case behind it.
 func validateLivenessBudget(goneAfter, socketDetection time.Duration) error {
 	if goneAfter <= 0 {
-		// 0 means "derive per node from the cadence each peer declares", so the best
-		// a startup check can do is verify the DEFAULT cadence — which is exactly
-		// what metrics.ValidateLivenessBudget is for.
-		return metrics.ValidateLivenessBudget(metrics.HeartbeatInterval, socketDetection)
+		// 0 means "derive per node from the cadence each peer declares", so there is no
+		// fixed threshold to compare against and the best a startup check can do is
+		// verify the DEFAULT cadence — which is exactly what
+		// metrics.ValidateLivenessBudget is for.
+		//
+		// Its message is wrapped rather than returned bare because it names -heartbeat,
+		// which is a PEER flag: correct advice, useless to whoever is starting THIS
+		// process. Naming -gone-after gives them a remedy they can apply here, and
+		// keeping the wrapped cause preserves the other one for the peer's operator.
+		if err := metrics.ValidateLivenessBudget(metrics.HeartbeatInterval, socketDetection); err != nil {
+			return fmt.Errorf("%w; on this server, set -gone-after to at least %v",
+				err, socketDetection)
+		}
+		return nil
 	}
 	if socketDetection <= 0 {
 		return fmt.Errorf("the WebSocket liveness budget %v must be positive", socketDetection)
