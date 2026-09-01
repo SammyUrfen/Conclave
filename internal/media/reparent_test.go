@@ -301,13 +301,19 @@ func TestRouterAppliesTopologyDiff(t *testing.T) {
 // backup that forwards nothing — and this test's fixture gives the backup real
 // media to forward, so the two are distinguishable.
 func TestRouterPromotesBackupParent(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	reports := make(chan metrics.Reparented, 4)
 	f := newMeetFixture(t, ctx, "backup", map[string]RouterConfig{
 		"a": {},
 		"b": {},
+		// d hangs off the root and SENDS. It is what makes the ratification rule
+		// meaningful: a promotion reports OK only once media has actually arrived
+		// over the new edge, so the backup parent must have something real to
+		// forward. An earlier version of this fixture had none and only "passed"
+		// because mis-attributed forwarding looped c's own media back to it.
+		"d": {SendMedia: true},
 		// DisableBackup is left at its zero value on purpose: promotion must be ON
 		// for a caller that says nothing about it (§15.13).
 		"c": {SendMedia: true, OnReparented: func(r metrics.Reparented) {
@@ -319,12 +325,13 @@ func TestRouterPromotesBackupParent(t *testing.T) {
 	})
 
 	f.announce(t, 1)
-	topo := tree("a", [2]string{"a", "b"}, [2]string{"b", "c"})
+	topo := tree("a", [2]string{"a", "b"}, [2]string{"a", "d"}, [2]string{"b", "c"})
 	topo.Backups = []overlay.Backup{{Node: "c", Parent: "a"}}
 	f.push(t, topo)
 
-	waitFor(t, "the chain a→b→c to converge", 30*time.Second, func() bool {
-		return allConnected(f.routers["b"].Stats(), 2) &&
+	waitFor(t, "the tree to converge", 40*time.Second, func() bool {
+		return allConnected(f.routers["a"].Stats(), 2) &&
+			allConnected(f.routers["b"].Stats(), 2) &&
 			allConnected(f.routers["c"].Stats(), 1) &&
 			receivedAny(f.routers["a"].Stats())
 	})

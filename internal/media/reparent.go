@@ -61,6 +61,11 @@ const (
 	// evParentGrace fires when a parent edge has sat in `disconnected` for
 	// ParentDisconnectGrace without recovering or declaring itself failed.
 	evParentGrace
+	// evNegotiationFailed says a session has spent its whole retry ladder without
+	// completing an offer/answer exchange. Its PeerConnection is stuck in
+	// have-local-offer and can never offer again, so the edge is mute until it is
+	// re-created.
+	evNegotiationFailed
 )
 
 // routerEvent is one such happening. It carries names, not pointers, so handling it
@@ -156,6 +161,8 @@ func (r *Router) handleInternal(ctx context.Context, ev routerEvent) {
 		if r.rp != nil && r.rp.gen == ev.gen && r.rp.phase == rpAwaitingMedia {
 			r.reparentFailed(ctx, "new parent connected but carried no media")
 		}
+	case evNegotiationFailed:
+		r.onNegotiationExhausted(ctx, ev.peerName)
 	case evParentGrace:
 		// Still our parent, still not connected: the edge is not coming back.
 		if r.isParentEdge(ev.peerName) && r.connectionStateByName(ev.peerName) != webrtc.PeerConnectionStateConnected {
@@ -247,6 +254,23 @@ func (r *Router) startReparent(ctx context.Context, oldParent, newParent string,
 		r.reportReparent(oldParent, "", false, "no parent to move to")
 		return
 	}
+	// RESOLVE BEFORE DISTURBING ANYTHING. Superseding first and resolving second
+	// means an unresolvable name tears down the move already in flight and then
+	// returns, leaving r.rp non-nil, cancelled, naming a closed session, with no
+	// deadline armed and pendingParent stale. onParentLost then sees a move
+	// "already under way" and refuses to promote a backup — so the next parent death
+	// is unrecoverable until some later push happens to name a different parent.
+	// Failing to start must cost nothing.
+	peerID := r.idForName(newParent)
+	if peerID == "" {
+		// The new parent is not in the roster yet. maybeStartPeer picks it up when
+		// its peer-joined arrives, and the coordinator will push again; abandoning
+		// here keeps whatever we have, which is the one outcome that is never wrong.
+		r.log.Warn("re-parent target not in the roster yet", slog.String("new_parent", newParent))
+		r.reportReparent(oldParent, "", false, "new parent not present")
+		return
+	}
+
 	if r.rp != nil {
 		// Superseded. Close the pending session unless the new target is the same
 		// one, and retire its deadlines before they can abort the successor.
@@ -257,16 +281,6 @@ func (r *Router) startReparent(ctx context.Context, oldParent, newParent string,
 		if oldParent == "" {
 			oldParent = r.rp.oldParent
 		}
-	}
-
-	peerID := r.idForName(newParent)
-	if peerID == "" {
-		// The new parent is not in the roster yet. maybeStartPeer picks it up when
-		// its peer-joined arrives, and the coordinator will push again; abandoning
-		// here keeps the old parent, which is the one outcome that is never wrong.
-		r.log.Warn("re-parent target not in the roster yet", slog.String("new_parent", newParent))
-		r.reportReparent(oldParent, "", false, "new parent not present")
-		return
 	}
 
 	r.rpGen++
@@ -317,8 +331,11 @@ func (r *Router) commitReparent() {
 	r.hookReparent("committing", rp.oldParent)
 
 	if r.fwd != nil {
-		if sess := r.sessionByName(rp.newParent); sess != nil {
-			r.fwd.renameSource(rp.oldParent, rp.newParent, sess)
+		if next := r.sessionByName(rp.newParent); next != nil {
+			// Re-point every source that was arriving through the old parent. Source
+			// keys are origins, so they survive the move unchanged and the children
+			// keep the very same forwarded tracks.
+			r.fwd.rebindUpstreamSession(r.sessionByName(rp.oldParent), next)
 		}
 	}
 	if id := r.idForName(rp.oldParent); id != "" {
@@ -455,4 +472,35 @@ func (r *Router) hookReparent(phase, oldParent string) {
 		return
 	}
 	r.reparentHook(phase, r.hasSession(oldParent))
+}
+
+// onNegotiationExhausted re-creates an edge whose session gave up negotiating.
+//
+// Without this the failure is permanent AND silent: the pc sits in have-local-offer,
+// both serializer guards then refuse every future offer, and the diff has no reason
+// to touch the session — the neighbour is still live, still wanted, still the same
+// role — so no later topology push heals it either. Re-creating is the same cure the
+// recreate bucket applies for the other two ways a session can end up built wrong.
+//
+// A re-parent's pending target is deliberately left alone: its own
+// ReparentConnectTimeout already owns that outcome, and pulling the session out from
+// under the state machine would race it.
+func (r *Router) onNegotiationExhausted(ctx context.Context, name string) {
+	if r.rp != nil && r.rp.newParent == name {
+		r.log.Debug("negotiation exhausted on a pending new parent; the re-parent deadline owns it",
+			slog.String("peer_name", name))
+		return
+	}
+	topo := r.currentTopo()
+	if topo == nil || !neighborOf(topo, r.selfName, name) {
+		return // no longer ours to keep alive
+	}
+	id := r.idForName(name)
+	if id == "" {
+		return
+	}
+	r.log.Warn("re-creating a session that exhausted its negotiation ladder",
+		slog.String("peer_name", name))
+	r.stopPeer(id)
+	r.startPeer(ctx, id)
 }

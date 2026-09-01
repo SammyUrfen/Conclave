@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -509,6 +510,8 @@ func TestRemovalNudgeSurvivesTheAnswer(t *testing.T) {
 		t.Fatalf("new offerer: %v", err)
 	}
 	defer offerer.Close()
+	var handlerRuns atomic.Int64
+	offerer.negotiationProbe = func(bool) { handlerRuns.Add(1) }
 	answerer.Start(ctx)
 	offerer.Start(ctx)
 
@@ -520,12 +523,22 @@ func TestRemovalNudgeSurvivesTheAnswer(t *testing.T) {
 		o, _, _ := bTr.counts()
 		return o == 1
 	})
+	spent := handlerRuns.Load()
 
-	// Removed while the offer is in flight: the serializer defers the nudge, so the
-	// ONLY thing that can still carry this removal is the answer path.
+	// Removed while the offer is in flight, so the serializer defers.
 	if err := offerer.RemoveTrack(sender); err != nil {
 		t.Fatalf("RemoveTrack: %v", err)
 	}
+	// WAIT for RemoveTrack's own nudge to have run and been rejected before letting
+	// the answer through. Without this wait the test does not discriminate at all:
+	// that nudge is spawned, so its scheduling is a lottery, and on a fast machine it
+	// usually lands AFTER the answer has already returned the pc to stable — quietly
+	// covering for the answer path even when the answer path is wrong. Once it is
+	// spent, the answer path is provably the only thing left that can carry the
+	// removal.
+	waitFor(t, "the deferred nudge to be spent", 5*time.Second, func() bool {
+		return handlerRuns.Load() > spent
+	})
 	bTr.release()
 
 	waitFor(t, "the renegotiation the removal earned", 10*time.Second, func() bool {

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -163,10 +164,22 @@ type Router struct {
 // peerLink is the Router's per-peer bookkeeping: the Session, the inbox we feed
 // its routed frames into, and the cancel that tears its goroutines down.
 type peerLink struct {
-	session  *Session
-	inbox    chan signaling.Message
-	cancel   context.CancelFunc
-	received bool // has a remote media track arrived from this peer? (guarded by Router.mu)
+	session *Session
+	inbox   chan signaling.Message
+	cancel  context.CancelFunc
+	// received/tracks record what has arrived from this peer (guarded by Router.mu).
+	// The COUNT matters as well as the boolean: one edge legitimately carries several
+	// forwarded sources, and "did anything arrive" cannot tell a relay that is
+	// carrying all of them from one that is silently carrying only the first.
+	received bool
+	tracks   int
+	// relayEdge records whether this session was BUILT by the relay path
+	// (setupRelayEdge), and peerRelayEdge what the PEER was at that moment. They are
+	// the shape the session has, not the shape the current tree wants — the diff
+	// compares the two, because they diverge exactly when either end is promoted from
+	// leaf to relay or demoted back, and a re-creation has to be agreed by both.
+	relayEdge     bool
+	peerRelayEdge bool
 }
 
 // NewRouter constructs a Router over an already-dialed signaling client.
@@ -300,9 +313,13 @@ func (r *Router) Run(ctx context.Context) error {
 // currently running (≈ N-1 when sending in a full mesh). It is a read-only view for
 // tests and operators today, and the seed of the Phase 4 metrics plane.
 type Stats struct {
-	Peers       map[string]webrtc.PeerConnectionState // remote peer id → connection state
-	Received    map[string]bool                       // remote peer id → have we received a track from them
-	UploadPeers int                                   // live outbound media pumps
+	Peers    map[string]webrtc.PeerConnectionState // remote peer id → connection state
+	Received map[string]bool                       // remote peer id → have we received a track from them
+	// Tracks counts the DISTINCT remote tracks received per peer. One edge carries
+	// one forwarded track per source behind it, so this is what distinguishes a relay
+	// delivering every participant from one delivering only the first.
+	Tracks      map[string]int
+	UploadPeers int // live outbound media pumps
 }
 
 // Stats snapshots the current mesh state. Safe to call concurrently with Run.
@@ -310,6 +327,7 @@ func (r *Router) Stats() Stats {
 	r.mu.Lock()
 	peers := make(map[string]webrtc.PeerConnectionState, len(r.peers))
 	received := make(map[string]bool, len(r.peers))
+	tracks := make(map[string]int, len(r.peers))
 	for id, link := range r.peers {
 		if link.session != nil {
 			peers[id] = link.session.ConnectionState()
@@ -317,9 +335,10 @@ func (r *Router) Stats() Stats {
 			peers[id] = webrtc.PeerConnectionStateNew
 		}
 		received[id] = link.received
+		tracks[id] = link.tracks
 	}
 	r.mu.Unlock()
-	return Stats{Peers: peers, Received: received, UploadPeers: r.meter.livePeers()}
+	return Stats{Peers: peers, Received: received, Tracks: tracks, UploadPeers: r.meter.livePeers()}
 }
 
 // markReceived records that a media track has arrived from peerID. Called from the
@@ -328,6 +347,7 @@ func (r *Router) markReceived(peerID string) {
 	r.mu.Lock()
 	if link := r.peers[peerID]; link != nil {
 		link.received = true
+		link.tracks++
 	}
 	r.mu.Unlock()
 }
@@ -440,23 +460,24 @@ func (r *Router) applyTopology(ctx context.Context, from string, payload []byte)
 	r.log.Info("applying pushed topology",
 		slog.String("from", from), slog.Uint64("epoch", topo.Epoch), slog.Uint64("rev", topo.Rev),
 		slog.Bool("relay", topo.IsRelay(r.selfName)),
-		slog.Any("add", diff.add), slog.Any("remove", diff.remove), slog.Any("invert", diff.invert),
+		slog.Any("add", diff.add), slog.Any("remove", diff.remove), slog.Any("recreate", diff.recreate),
 		slog.Bool("reparent", diff.reparent))
 	if diff.empty() {
 		return
 	}
 
-	// (1) Inversions first: the session must be re-created before anything else
-	// decides what legs it carries. Tearing down and re-creating is the ONLY cure
-	// pion allows — an answerer has no way to add m-lines, so a mutable role would
-	// need a "please offer me" control frame, a new round trip, and a brand-new
-	// glare surface in a design built entirely on never having glare.
-	for _, name := range diff.invert {
+	// (1) Re-creations first: the session must be rebuilt before anything else
+	// decides what legs it carries. Tearing down is the ONLY cure pion allows for
+	// either reason (see topoDiff.recreate) — an answerer has no way to add m-lines,
+	// and a TrackRemote another reader already owns cannot be retro-fitted with a
+	// forward loop.
+	for _, name := range diff.recreate {
 		id := r.idForName(name)
 		if id == "" {
 			continue
 		}
-		r.log.Info("re-creating an edge whose offerer role inverted", slog.String("peer_name", name))
+		r.log.Info("re-creating an edge built for a shape that no longer holds",
+			slog.String("peer_name", name), slog.Bool("relay_now", topo.IsRelay(r.selfName)))
 		r.stopPeer(id)
 		r.startPeer(ctx, id)
 	}
@@ -538,7 +559,10 @@ func (r *Router) currentParent() string {
 // so a push that was partly applied (a neighbour that had not joined yet) converges
 // on the next one instead of drifting.
 func (r *Router) liveState() liveState {
-	st := liveState{roles: map[string]bool{}, parent: r.currentParent()}
+	st := liveState{
+		roles: map[string]bool{}, relayEdge: map[string]bool{}, peerRelay: map[string]bool{},
+		parent: r.currentParent(),
+	}
 	// A re-parent in flight means the tree already says our parent is the new one
 	// while reality is still the old one. The diff must see reality.
 	if r.rp != nil {
@@ -551,6 +575,8 @@ func (r *Router) liveState() liveState {
 			continue
 		}
 		st.roles[name] = link.session.Offerer()
+		st.relayEdge[name] = link.relayEdge
+		st.peerRelay[name] = link.peerRelayEdge
 	}
 	r.mu.Unlock()
 	if r.fwd != nil {
@@ -706,14 +732,17 @@ func (r *Router) startPeerOpt(ctx context.Context, peerID string, opts peerOpts)
 	}
 
 	session, err := NewSession(SessionConfig{
-		Log:           r.log,
-		SelfID:        selfID,
-		PeerID:        peerID,
-		Transport:     tr,
-		ICEServers:    r.cfg.ICEServers,
-		Offerer:       offererOverride,
-		Clock:         r.clk,
-		Spawn:         r.spawnTracked,
+		Log:        r.log,
+		SelfID:     selfID,
+		PeerID:     peerID,
+		Transport:  tr,
+		ICEServers: r.cfg.ICEServers,
+		Offerer:    offererOverride,
+		Clock:      r.clk,
+		Spawn:      r.spawnTracked,
+		OnNegotiationFailed: func() {
+			r.postEvent(routerEvent{kind: evNegotiationFailed, peerName: name})
+		},
 		OnRemoteTrack: r.remoteTrackSink(linkCtx, peerID),
 		OnState:       onState,
 	})
@@ -737,8 +766,16 @@ func (r *Router) startPeerOpt(ctx context.Context, peerID string, opts peerOpts)
 	//   leaf/mesh sender → add own camera (it folds into the answer)
 	//   offerer, no media → a recvonly transceiver so it still has something to offer
 	var track *webrtc.TrackLocalStaticSample
+	relayEdge := r.isRelayNow()
+	peerRelay := topo != nil && topo.IsRelay(peerName)
+	r.mu.Lock()
+	if link := r.peers[peerID]; link != nil {
+		link.relayEdge = relayEdge
+		link.peerRelayEdge = peerRelay
+	}
+	r.mu.Unlock()
 	switch {
-	case r.isRelayNow():
+	case relayEdge:
 		r.setupRelayEdge(session, topo, peerName)
 	case r.cfg.SendMedia:
 		track, err = session.AddVideoTrack("video", "conclave")
@@ -770,24 +807,32 @@ func (r *Router) startPeerOpt(ctx context.Context, peerID string, opts peerOpts)
 // — the relay is the sole offerer on the edge, so there is never a colliding offer
 // to reconcile (which pion could not roll back anyway).
 func (r *Router) setupRelayEdge(session *Session, topo *overlay.Topology, peerName string) {
-	// Receive peerName's own media; the reader is wired in remoteTrackSink.
+	// Receive whatever arrives over this edge; the reader is wired in
+	// remoteTrackSink.
 	if err := session.AddRecvOnlyVideo(); err != nil {
 		r.log.Warn("relay recvonly transceiver", slog.String("peer_name", peerName), slog.Any("error", err))
 	}
-	r.fwd.setUpstream(peerName, session)
+	// Every source that arrives THROUGH this neighbour points its upstream here, so
+	// a downstream keyframe request is translated and forwarded to the peer that can
+	// actually satisfy it. It is a set, not one entry: an edge toward the root
+	// carries the whole far side of the tree.
+	for _, src := range sourcesFrom(topo, r.selfName, peerName) {
+		r.fwd.setUpstream(src, session)
+	}
 
-	// This edge also carries every OTHER neighbour's media down to peerName.
-	for _, src := range topo.NeighborsOf(r.selfName) {
-		if src == peerName {
-			continue
-		}
-		fwdTrack, sender, err := session.AddForwardTrack(forwardTrackPrefix+src, "conclave")
+	// ...and this edge carries, toward peerName, every source that is not already on
+	// peerName's side of it. legsToward rather than a lookup in wantedLegs, because
+	// peerName is not always a topology neighbour: a peer that promoted us as its
+	// backup parent (§7.5a) is an edge the tree does not contain yet, and it still
+	// has to be fed.
+	for _, l := range legsToward(topo, r.selfName, peerName) {
+		fwdTrack, sender, err := session.AddForwardTrack(forwardTrackPrefix+l.src, "conclave")
 		if err != nil {
 			r.log.Error("add forward track",
-				slog.String("source", src), slog.String("child", peerName), slog.Any("error", err))
+				slog.String("source", l.src), slog.String("child", peerName), slog.Any("error", err))
 			continue
 		}
-		r.fwd.addOut(src, peerName, fwdTrack, sender)
+		r.fwd.addOut(l.src, peerName, fwdTrack, sender)
 	}
 }
 
@@ -830,7 +875,17 @@ func (r *Router) remoteTrackSink(ctx context.Context, peerID string) func(*webrt
 		r.mu.Lock()
 		peerName := r.nameByID[peerID]
 		r.mu.Unlock()
-		log := r.log.With(slog.String("peer_id", peerID),
+		// A track is identified by the peer whose media it CARRIES, not by the
+		// neighbour that handed it over. A relay names each forwarded track after its
+		// source (fwd-<name>), so one edge can carry several of them — which is what
+		// happens on every edge more than one hop from a sender. Falling back to the
+		// neighbour's name covers the other case: a peer's own camera track, which is
+		// named "video" and is by definition that peer's own media.
+		srcName := peerName
+		if id := track.ID(); strings.HasPrefix(id, forwardTrackPrefix) {
+			srcName = strings.TrimPrefix(id, forwardTrackPrefix)
+		}
+		log := r.log.With(slog.String("peer_id", peerID), slog.String("source", srcName),
 			slog.String("codec", track.Codec().MimeType), slog.Any("ssrc", track.SSRC()))
 		log.Info("remote track arrived")
 		r.markReceived(peerID)
@@ -844,7 +899,7 @@ func (r *Router) remoteTrackSink(ctx context.Context, peerID string) func(*webrt
 		// on the LIVE topology, not on holding a forwarder: a managed peer always
 		// holds one but is only a relay while the current tree gives it children.
 		if r.isRelayNow() {
-			r.fwd.forward(peerName, track)
+			r.fwd.forward(srcName, track)
 			return
 		}
 
@@ -932,15 +987,25 @@ func (r *Router) stopPeer(peerID string) []string {
 	// the forwardSource for its media AND hands back every downstream sender that
 	// was carrying it, so those tracks are actually removed from the surviving
 	// children instead of lingering as m-lines that will never carry a packet again.
+	// Sources are keyed by ORIGIN, so a departing neighbour takes with it every
+	// source that was arriving THROUGH it — which is its whole far side of the tree,
+	// not just its own media. Identifying them by the session that fed them uses
+	// reality rather than a topology that may already have moved on.
+	gone := map[string]bool{}
+	for _, src := range r.fwd.sourcesVia(link.session) {
+		gone[src] = true
+	}
 	var affected []string
 	for _, l := range r.fwd.legs() {
-		if l.src == peerName {
+		if gone[l.src] {
 			affected = append(affected, l.child)
 		}
 	}
 	r.fwd.removeChild(peerName)
-	for _, sender := range r.fwd.removeSource(peerName) {
-		r.removeSenderFromItsSession(sender)
+	for src := range gone {
+		for _, sender := range r.fwd.removeSource(src) {
+			r.removeSenderFromItsSession(sender)
+		}
 	}
 	r.log.Info("session stopped", slog.String("peer_id", peerID))
 	return affected

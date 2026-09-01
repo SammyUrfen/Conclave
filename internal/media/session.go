@@ -24,10 +24,16 @@ import (
 const NegotiationRetryDelay = 250 * time.Millisecond
 
 // NegotiationRetries bounds the retries after the initial attempt before the
-// Session gives up and logs at Error. Five retries is ~1.25s of waiting. Giving up
-// is safe rather than fatal: the coordinator re-pushes the topology on the next
-// threshold event, and applyTopology is idempotent, so a wedged session self-heals
-// on the next tree. Retrying forever would hide a real bug.
+// Session gives up. Five retries is ~1.25s of waiting on the error ladder.
+//
+// Giving up is NOT self-healing, and an earlier version of this comment claimed it
+// was. It is not: the pc is left in have-local-offer, both guards in
+// onNegotiationNeeded then refuse every future offer, and a coordinator re-push
+// changes nothing — the diff sees that neighbour as live, wanted and same-role, so
+// the session survives untouched and each new forwarded track lands on a pc that
+// will never offer again. Exhaustion therefore REPORTS itself through
+// SessionConfig.OnNegotiationFailed, and the owner re-creates the edge. Retrying
+// forever here would only hide the real fault.
 const NegotiationRetries = 5
 
 // NegotiationAnswerTimeout is how long the offerer waits for the answer before
@@ -76,6 +82,13 @@ type SessionConfig struct {
 	// microsecond instead of 1.25 real seconds. Nil ⇒ clock.System().
 	Clock clock.Clock
 
+	// OnNegotiationFailed fires ONCE when this session has spent its whole retry
+	// ladder without completing an offer/answer exchange. The Session cannot fix
+	// that itself — pion has no way back out of have-local-offer — so it tells the
+	// owner, which re-creates the edge. Nil ⇒ the failure is logged and nothing else
+	// happens, which is right for a Session constructed directly in a test.
+	OnNegotiationFailed func()
+
 	// Spawn runs a function as a goroutine the OWNER joins on shutdown — the Router
 	// passes its WaitGroup-tracked spawner. The Session uses it for the retry timer
 	// wait, which must not outlive the process it belongs to. Nil ⇒ a bare `go`,
@@ -103,12 +116,14 @@ type Session struct {
 	// offer, pion folds the answerer's own sendonly track into that m-line.
 	offerer bool
 
-	clk   clock.Clock
-	spawn func(func())
+	clk      clock.Clock
+	spawn    func(func())
+	onFailed func()
 	// done is closed by Close and is what retires a pending retry: a Session that
 	// has been torn down must not resurrect its negotiation a quarter second later.
-	done     chan struct{}
-	closeOne sync.Once
+	done       chan struct{}
+	closeOne   sync.Once
+	failedOnce sync.Once
 
 	// negotiationProbe, when non-nil, reports what the negotiation handler observed
 	// on entry. It exists for one test, which pins an ORDERING that is otherwise
@@ -204,14 +219,15 @@ func NewSession(cfg SessionConfig) (*Session, error) {
 			slog.String("peer_id", cfg.PeerID),
 			slog.Bool("offerer", offerer),
 		),
-		selfID:  cfg.SelfID,
-		peerID:  cfg.PeerID,
-		tr:      cfg.Transport,
-		pc:      pc,
-		offerer: offerer,
-		clk:     clk,
-		spawn:   spawn,
-		done:    make(chan struct{}),
+		selfID:   cfg.SelfID,
+		peerID:   cfg.PeerID,
+		tr:       cfg.Transport,
+		pc:       pc,
+		offerer:  offerer,
+		clk:      clk,
+		spawn:    spawn,
+		onFailed: cfg.OnNegotiationFailed,
+		done:     make(chan struct{}),
 	}
 
 	pc.OnICECandidate(s.onLocalCandidate)
@@ -443,11 +459,35 @@ func (s *Session) negotiate(attempt int) {
 	s.armAnswerDeadline(attempt)
 }
 
+// reportNegotiationFailed tells the owner, at most once per session, that this
+// session can no longer negotiate. Once, because the owner's response is to tear the
+// edge down and rebuild it, and a storm of callbacks would turn that into a loop.
+func (s *Session) reportNegotiationFailed() {
+	if s.onFailed == nil {
+		return
+	}
+	s.failedOnce.Do(s.onFailed)
+}
+
 // armAnswerDeadline re-sends an unanswered offer once the wait exceeds
 // NegotiationAnswerTimeout. It is a no-op on a healthy edge; see the constant for
 // the one case where a correct peer legitimately drops our offer.
 func (s *Session) armAnswerDeadline(attempt int) {
 	if attempt >= NegotiationRetries {
+		// The ladder is spent and the offer is still unanswered. Clearing the
+		// in-flight flag keeps the Session's view of itself honest — leaving it set
+		// meant the secondary guard ALSO blocked every future offer, so the session
+		// was mute for two independent reasons instead of one — and reporting is
+		// what turns a permanent silence into one re-created edge. (Clearing alone
+		// would not unwedge it: the pc is in have-local-offer, so the primary
+		// SignalingState guard still refuses, correctly.)
+		s.mu.Lock()
+		s.negotiating = false
+		s.negGen++
+		s.mu.Unlock()
+		s.log.Error("no answer after the full retry ladder; this session can no longer offer",
+			slog.Int("attempts", attempt+1))
+		s.reportNegotiationFailed()
 		return
 	}
 	s.mu.Lock()
@@ -484,8 +524,9 @@ func (s *Session) negotiationFailed(attempt int, what string, cause error) {
 	s.mu.Unlock()
 
 	if attempt >= NegotiationRetries {
-		s.log.Error("giving up on negotiation",
+		s.log.Error("giving up on negotiation; this session can no longer offer",
 			slog.String("op", what), slog.Int("attempts", attempt+1), slog.Any("error", cause))
+		s.reportNegotiationFailed()
 		return
 	}
 	s.log.Warn("negotiation attempt failed; retrying",
@@ -591,19 +632,35 @@ func (s *Session) onRemoteDescription(msg signaling.Message) {
 		s.mu.Lock()
 		s.negotiating = false
 		s.negGen++
-		pending := s.pendingLocalChange
 		s.mu.Unlock()
-		if pending {
-			// A removal landed while this offer was in flight. pion will not
-			// re-fire for it, so we must.
-			s.spawn(s.onNegotiationNeeded)
-		}
 
 		if err := s.pc.SetRemoteDescription(desc); err != nil {
 			s.log.Error("set remote description (answer)", slog.Any("error", err))
 			return
 		}
 		s.flushPending()
+
+		// The removal nudge goes HERE — after the pc has returned to `stable` — and
+		// it runs INLINE. Both halves matter.
+		//
+		// Issued before SetRemoteDescription it raced it: the handler read the
+		// signaling state while the pc could still be in have-local-offer, deferred,
+		// and left pendingLocalChange set. pion provably never re-fires for a
+		// removal, so nothing picked it up and the departed source's m-line lingered
+		// as exactly the stale sendrecv this mechanism exists to clear.
+		//
+		// Inline rather than spawned because a goroutine reintroduces the same race
+		// in miniature — its scheduling decides which state it observes — and there
+		// is nothing to gain from it: this already IS the session's own consume
+		// goroutine, the one answerOffer runs CreateAnswer/SetLocalDescription on a
+		// few lines up. (RemoveTrack's own nudge stays spawned; that one is called
+		// from the Router's Run loop and must not do pion work on it.)
+		s.mu.Lock()
+		pending := s.pendingLocalChange
+		s.mu.Unlock()
+		if pending {
+			s.onNegotiationNeeded()
+		}
 	default:
 		s.log.Warn("unexpected remote description type", slog.String("sdp_type", desc.Type.String()))
 	}

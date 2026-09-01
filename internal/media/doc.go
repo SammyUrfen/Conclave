@@ -51,6 +51,12 @@
 // AdoptCoordinator, so this package never learns the arbiter's types — may raise a
 // peer's epoch.
 //
+// A source is identified by the peer that ORIGINATED it, never by the neighbour
+// that handed it over. One edge therefore carries as many forwarded tracks as there
+// are participants behind it — which is every edge more than one hop from a sender —
+// and each relay forwards, toward each neighbour, exactly what is not already on
+// that neighbour's side of the cut.
+//
 // The Router also reports its REALIZED overlay position (Realized) — the parent it
 // is actually attached to and the children it is actually serving, in topology
 // names — which is the ground truth a newly promoted coordinator rebuilds the

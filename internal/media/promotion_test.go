@@ -6,20 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SammyUrfen/conclave/internal/metrics"
 	"github.com/SammyUrfen/conclave/internal/overlay"
 )
-
-// drain empties a report channel so a later assertion sees only new reports.
-func drain(ch chan metrics.Reparented) {
-	for {
-		select {
-		case <-ch:
-		default:
-			return
-		}
-	}
-}
 
 // TestDiffTopologyLeafBecomesRelay is the CRITICAL case, and the names are chosen to
 // land on the FAILING side of the comparison that hid it.
@@ -52,7 +40,10 @@ func TestDiffTopologyLeafBecomesRelay(t *testing.T) {
 				parent: "dave",
 				roles:  map[string]bool{"dave": false},
 				// The edge was built while alice was a LEAF: no setupRelayEdge ran.
+				// dave was already the relay and still is, so the ONLY thing that
+				// changed on this edge is alice's own shape.
 				relayEdge: map[string]bool{"dave": false},
+				peerRelay: map[string]bool{"dave": true},
 			},
 			want: topoDiff{add: []string{"bob"}, recreate: []string{"dave"}},
 		},
@@ -67,6 +58,7 @@ func TestDiffTopologyLeafBecomesRelay(t *testing.T) {
 				parent:    "dave",
 				roles:     map[string]bool{"dave": false},
 				relayEdge: map[string]bool{"dave": false},
+				peerRelay: map[string]bool{"dave": true},
 			},
 			want: topoDiff{add: []string{"bob"}, recreate: []string{"dave"}},
 		},
@@ -80,6 +72,7 @@ func TestDiffTopologyLeafBecomesRelay(t *testing.T) {
 				parent:    "dave",
 				roles:     map[string]bool{"dave": false, "bob": true},
 				relayEdge: map[string]bool{"dave": true, "bob": true},
+				peerRelay: map[string]bool{"dave": true, "bob": false},
 			},
 			want: topoDiff{remove: []string{"bob"}, recreate: []string{"dave"}},
 		},
@@ -94,6 +87,7 @@ func TestDiffTopologyLeafBecomesRelay(t *testing.T) {
 				parent:    "dave",
 				roles:     map[string]bool{"dave": false, "bob": true},
 				relayEdge: map[string]bool{"dave": true, "bob": true},
+				peerRelay: map[string]bool{"dave": true, "bob": false},
 				legs:      []leg{{src: "bob", child: "dave"}},
 			},
 			want: topoDiff{},
@@ -143,9 +137,14 @@ func TestForwardLegsCarryEveryTransitSource(t *testing.T) {
 
 	t.Run("the root sends each side only what it cannot already see", func(t *testing.T) {
 		want := []leg{
+			// Down to alice: the two leaves on the other side of the root.
 			{src: "fred", child: "alice"},
 			{src: "zoe", child: "alice"},
+			// Out to each leaf: the other leaf, AND bob — who is two hops away
+			// behind alice and has no other route to them.
+			{src: "bob", child: "zoe"},
 			{src: "fred", child: "zoe"},
+			{src: "bob", child: "fred"},
 			{src: "zoe", child: "fred"},
 		}
 		got := wantedLegs(topo, "dave")
@@ -233,66 +232,57 @@ func TestForwarderTwoSourcesOverOneEdge(t *testing.T) {
 func TestStartReparentLeavesAnInFlightMoveAlone(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("an unresolvable target does not disturb a move in flight", func(t *testing.T) {
-		r := NewRouter(discardLog(), nil, RouterConfig{SelfName: "c", Managed: true})
-		r.topo = tree("a", [2]string{"a", "b"}, [2]string{"b", "c"})
-		r.learnPeer("p-a", "a")
-		r.setParent("b", "")
+	// The zombie only forms when a move is ALREADY in flight and the next target
+	// cannot be resolved: superseding first tears the live one down (closing its
+	// session and cancelling its deadlines) and the early return then leaves r.rp
+	// non-nil, cancelled, naming a closed session, with nothing left that can ever
+	// resume it. onParentLost sees a move "already under way" and declines to
+	// promote a backup, so the next parent death is unrecoverable.
+	//
+	// Note what does NOT discriminate: r.rp is non-nil either way, and it even points
+	// at the same object. The difference is whether that object is still ALIVE — its
+	// context uncancelled and its session open — so those are what the test asserts.
+	r := NewRouter(discardLog(), nil, RouterConfig{SelfName: "c", Managed: true})
+	r.topo = tree("a", [2]string{"a", "b"}, [2]string{"b", "c"})
+	r.learnPeer("p-a", "a")
+	linkStaticPeer(t, r, "p-a", "a")
+	r.setParent("b", "")
 
-		r.startReparent(ctx, "b", "a", false) // resolvable: a is in the roster
-		if r.rp == nil {
-			t.Fatal("no re-parent started for a resolvable target")
-		}
-		inFlight := r.rp
+	r.startReparent(ctx, "b", "a", false) // resolvable: a is in the roster
+	if r.rp == nil {
+		t.Fatal("no re-parent started for a resolvable target")
+	}
+	inFlight, liveCtx := r.rp, r.rpCtx
 
-		r.startReparent(ctx, "b", "ghost", false) // NOT in the roster
-		if r.rp != inFlight {
-			t.Fatalf("an unresolvable target replaced the in-flight move: rp = %+v", r.rp)
-		}
-		if _, _, _ = r.Realized(); r.pendingParent != "a" {
-			t.Errorf("pendingParent = %q, want a — the in-flight target must survive", r.pendingParent)
-		}
-	})
+	r.startReparent(ctx, "b", "ghost", false) // NOT in the roster
 
-	t.Run("a failed start leaves no zombie blocking failover", func(t *testing.T) {
-		reports := make(chan metrics.Reparented, 4)
-		r := NewRouter(discardLog(), nil, RouterConfig{
-			SelfName: "c", Managed: true,
-			OnReparented: func(rep metrics.Reparented) { reports <- rep },
-		})
-		r.topo = &overlay.Topology{
-			Epoch: 1, Rev: 1, Root: "a",
-			Edges:   []overlay.Edge{{Parent: "a", Child: "b"}, {Parent: "b", Child: "c"}},
-			Backups: []overlay.Backup{{Node: "c", Parent: "a"}},
-		}
-		r.setParent("b", "")
+	if r.rp != inFlight {
+		t.Errorf("the in-flight move was replaced: rp = %+v", r.rp)
+	}
+	if liveCtx.Err() != nil {
+		t.Error("the in-flight move's deadlines were retired by a start that then failed: " +
+			"nothing can resume it, and onParentLost will decline to promote a backup " +
+			"because it still looks like a move is under way")
+	}
+	if !r.hasSession("a") {
+		t.Error("the in-flight move's session was closed by a start that then failed")
+	}
+	if r.pendingParent != "a" {
+		t.Errorf("pendingParent = %q, want a — the in-flight target must survive", r.pendingParent)
+	}
 
-		r.startReparent(ctx, "b", "ghost", false) // nothing resolves; nothing in flight
-		drain(reports)
-		if r.rp != nil {
-			t.Fatalf("a failed start left a zombie re-parent: %+v", r.rp)
-		}
-		if r.pendingParent != "" {
-			t.Errorf("pendingParent = %q after a failed start, want empty", r.pendingParent)
-		}
-
-		// The proof that the zombie MATTERS: with one left behind, onParentLost sees
-		// a move already under way and refuses to promote the backup, so the parent
-		// dying is unrecoverable. It must instead reach the backup path.
-		r.onParentLost(ctx, "b")
-		select {
-		case rep := <-reports:
-			if rep.Reason == "" || rep.From != "b" {
-				t.Errorf("unexpected failover report: %+v", rep)
-			}
-			if got := r.currentTopo().BackupOf("c"); got != "" {
-				t.Errorf("backup %q was not consumed; the promotion never ran", got)
-			}
-		default:
-			t.Fatal("parent loss produced no failover attempt at all: a dangling re-parent " +
-				"is still swallowing it")
-		}
-	})
+	// Control: with nothing in flight, a failed start must leave nothing behind at
+	// all, so failover stays reachable.
+	clean := NewRouter(discardLog(), nil, RouterConfig{SelfName: "c", Managed: true})
+	clean.topo = tree("a", [2]string{"a", "b"}, [2]string{"b", "c"})
+	clean.setParent("b", "")
+	clean.startReparent(ctx, "b", "ghost", false)
+	if clean.rp != nil {
+		t.Fatalf("a failed start with nothing in flight left a zombie: %+v", clean.rp)
+	}
+	if clean.pendingParent != "" {
+		t.Errorf("pendingParent = %q after a failed start, want empty", clean.pendingParent)
+	}
 }
 
 // TestRouterPromotesLeafToRelay is the CRITICAL and the multi-source MAJOR end to
