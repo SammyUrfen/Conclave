@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/SammyUrfen/conclave/internal/arbiter"
+	"github.com/SammyUrfen/conclave/internal/policy"
 )
 
 // TestListMeets pins GET /api/meets against §9.3 and §9.4b: the row schema, the
@@ -173,7 +175,8 @@ func TestCreateMeet(t *testing.T) {
 		if join["ws_url"] != "ws://localhost:9000/ws?room=standup" {
 			t.Errorf("join.ws_url = %v", join["ws_url"])
 		}
-		if join["peer_command"] != "peer -call -managed -server http://localhost:9000 -room standup -name YOUR_NAME" {
+		wantCmd := "peer -call -managed -server http://localhost:9000 -room standup -name " + joinNamePlaceholder
+		if join["peer_command"] != wantCmd {
 			t.Errorf("join.peer_command = %v", join["peer_command"])
 		}
 	})
@@ -271,11 +274,65 @@ func TestJoinURLDerivation(t *testing.T) {
 			if join["ws_url"] != tt.wantWS {
 				t.Errorf("ws_url = %v, want %v", join["ws_url"], tt.wantWS)
 			}
-			wantCmd := "peer -call -managed -server " + tt.wantHTTP + " -room m1 -name YOUR_NAME"
+			// Built from the constant, not a literal, so the placeholder cannot drift
+			// back to a value policy.ValidPeerName rejects without a test noticing.
+			wantCmd := "peer -call -managed -server " + tt.wantHTTP + " -room m1 -name " + joinNamePlaceholder
 			if join["peer_command"] != wantCmd {
 				t.Errorf("peer_command = %v, want %v", join["peer_command"], wantCmd)
 			}
 		})
+	}
+}
+
+// TestJoinCommandIsValidInput pins that the rendezvous this endpoint hands a human is a
+// command that WORKS when pasted unchanged.
+//
+// joinurl.go interpolates the meet id and the name placeholder into a shell command with
+// NO escaping, relying entirely on policy's patterns to make that safe — so every value
+// it emits must satisfy the pattern the receiving surface enforces. The name placeholder
+// is the one that bit: the hub validates -name against policy.ValidPeerName, which is
+// lowercase-only, so an uppercase YOUR_NAME is rejected the moment it is used as
+// intended. A copy button that hands out a failing command is worse than no button.
+func TestJoinCommandIsValidInput(t *testing.T) {
+	meets := &fakeMeets{created: arbiter.Meet{ID: "standup", CreatedAt: testAt}}
+	_, ts := newTestServer(t, Config{Meets: meets})
+	_, body := doJSON(t, ts, http.MethodPost, "/api/meets", `{"id":"standup"}`, nil)
+	join, ok := body["join"].(map[string]any)
+	if !ok {
+		t.Fatalf("no join block: %v", body)
+	}
+	cmd, _ := join["peer_command"].(string)
+	fields := strings.Fields(cmd)
+	got := map[string]string{}
+	for i := 0; i+1 < len(fields); i++ {
+		if strings.HasPrefix(fields[i], "-") {
+			got[fields[i]] = fields[i+1]
+		}
+	}
+
+	name := got["-name"]
+	if name == "" {
+		t.Fatalf("peer_command has no -name value: %q", cmd)
+	}
+	if !policy.ValidPeerName(name) {
+		t.Errorf("peer_command -name %q fails policy.ValidPeerName (%s) — pasting this "+
+			"command verbatim is rejected by the hub", name, policy.PeerNamePattern)
+	}
+	if room := got["-room"]; !policy.ValidMeetID(room) {
+		t.Errorf("peer_command -room %q fails policy.ValidMeetID", room)
+	}
+	// Still obviously a placeholder: a valid-but-plausible real name would be worse,
+	// because a user would paste it without noticing they had joined as someone else.
+	if !strings.Contains(name, "-") && !strings.Contains(name, "_") {
+		t.Errorf("-name %q does not read as a placeholder", name)
+	}
+	// Every interpolated value must be shell-safe on its own terms, since nothing here
+	// quotes them.
+	for flag, v := range got {
+		if strings.ContainsAny(v, " \t\"'$`;&|<>()") {
+			t.Errorf("peer_command %s value %q contains shell metacharacters and is "+
+				"interpolated unescaped", flag, v)
+		}
 	}
 }
 
@@ -346,9 +403,13 @@ func TestListBodyIsStableJSON(t *testing.T) {
 		},
 		ended: []arbiter.EndedMeet{{ID: "gone", EndedAt: testAt}},
 	}
-	_, ts := newTestServer(t, Config{Meets: meets})
+	clk := newFixedClock()
+	_, ts := newTestServer(t, Config{Meets: meets, Clock: clk})
 	var first string
 	for i := 0; i < 20; i++ {
+		// Past the read bound each time, so these are 20 real assemblies of the body
+		// rather than 19 reads of one cached string.
+		clk.Advance(snapshotMinInterval)
 		_, body := doJSON(t, ts, http.MethodGet, "/api/meets", "", nil)
 		raw, err := json.Marshal(body)
 		if err != nil {

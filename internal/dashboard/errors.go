@@ -29,6 +29,14 @@ const (
 	// bad_request would contradict its own status line. Both are non-breaking for the
 	// frontend, which branches only on the codes it knows and otherwise renders
 	// `message`. Flagged for the spec owner.
+	// codeForbiddenOrigin is returned on a REJECTED WEBSOCKET UPGRADE (403). It is not
+	// reachable from the REST surface, which deliberately serves a non-matching origin
+	// the normal body without the allow header so a probing page learns nothing
+	// (§9.8). An upgrade has no such option — there is no useful "succeed but let the
+	// browser block it" for a socket — so it fails loudly and names the flag to change,
+	// which v2.6 requires a client to surface as a configuration error.
+	codeForbiddenOrigin = "forbidden_origin" // 403, upgrade only
+
 	codeNotFound         = "not_found"          // 404, no such route
 	codeMethodNotAllowed = "method_not_allowed" // 405
 )

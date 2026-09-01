@@ -88,6 +88,9 @@ type subscription struct {
 	// produced counts frames minted for this connection, delivered OR dropped.
 	// Guarded by Server.mu.
 	produced uint64
+	// lastResync is when this connection's last resync was honoured, for
+	// resyncMinInterval. Guarded by Server.mu.
+	lastResync time.Time
 	// stop is closed by Server.Close to bring the stream down with code 1000.
 	stop chan struct{}
 }
@@ -132,23 +135,31 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// A WebSocket upgrade is NOT subject to CORS — the browser sends Origin and it is
-	// the server's job to check it. The SAME allow-list drives this and the REST
-	// surface, injected from one parsed value, because a security control that exists
-	// in two places is one that will diverge (§2.4).
+	// the server's job to check it. The check runs HERE, before Accept, and Accept is
+	// told to skip its own: see allowUpgradeOrigin for why the library's version is
+	// not usable.
 	//
-	// A non-matching origin is refused by Accept with an HTTP 403 on the HANDSHAKE, so
-	// NO WebSocket is established and there is NO close code — 1008 is unreachable here
-	// and v2.4's table was wrong to list it (corrected in §15.14). Do not "improve"
-	// this by accepting the upgrade and then closing with 1008: that would turn a
-	// configuration error the client can name (-allowed-origins) into a close event
-	// indistinguishable from a policy violation mid-stream.
+	// A rejection is an HTTP 403 on the HANDSHAKE, so NO WebSocket is established and
+	// there is NO close code — 1008 is unreachable here and v2.4's table was wrong to
+	// list it (corrected in §15.14). Do not "improve" this by accepting the upgrade and
+	// then closing with 1008: that would turn a configuration error the client can name
+	// (-allowed-origins) into a close event indistinguishable from a policy violation
+	// mid-stream.
+	if !s.allowUpgradeOrigin(r) {
+		s.log.Warn("event stream upgrade refused: origin not allowed",
+			slog.String("origin", r.Header.Get("Origin")), slog.String("host", r.Host))
+		s.writeError(w, http.StatusForbidden, codeForbiddenOrigin,
+			"this origin is not in the server's -allowed-origins list",
+			map[string]any{"origin": r.Header.Get("Origin")})
+		return
+	}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		OriginPatterns: s.origins.Patterns(),
+		// The origin decision was made above, by the one matcher this process has.
+		InsecureSkipVerify: true,
 	})
 	if err != nil {
 		// Accept has already written the rejection.
-		s.log.Warn("event stream upgrade refused", slog.Any("error", err),
-			slog.String("origin", r.Header.Get("Origin")))
+		s.log.Warn("event stream upgrade failed", slog.Any("error", err))
 		return
 	}
 	defer conn.CloseNow()
@@ -168,9 +179,19 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sub, ok := s.subscribe(id)
-	if !ok {
+	sub, admit := s.subscribe(id)
+	switch admit {
+	case admitOK:
+	case admitShuttingDown:
 		_ = conn.Close(websocket.StatusNormalClosure, "server shutting down")
+		return
+	case admitAtCapacity:
+		// 1013 "try again later" rather than 1008: retrying LATER genuinely can help,
+		// and the client's unrecognised-code branch already reconnects with backoff,
+		// which is exactly the right behaviour. 1008 would tell it to stop forever.
+		s.log.Warn("event stream refused: meet at subscriber capacity",
+			slog.String("meet_id", id), slog.Int("cap", maxSubscribersPerMeet))
+		_ = conn.Close(websocket.StatusTryAgainLater, "too many viewers for this meet")
 		return
 	}
 	defer s.unsubscribe(sub)
@@ -338,13 +359,16 @@ func (s *Server) finish(st *stream) {
 // delivered as a delta even though the snapshot already reflects it — a duplicate. Every
 // delta is idempotent under that: each carries an ABSOLUTE value (a full tree, a health
 // verdict, a cumulative refusal total), never an increment to be applied.
-func (s *Server) subscribe(meetID string) (*subscription, bool) {
+func (s *Server) subscribe(meetID string) (*subscription, admission) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return nil, false
+		return nil, admitShuttingDown
 	}
 	ms := s.streamLocked(meetID)
+	if len(ms.subs) >= maxSubscribersPerMeet {
+		return nil, admitAtCapacity
+	}
 	sub := &subscription{
 		meetID: meetID,
 		ch:     make(chan frameItem, eventBuffer),
@@ -353,7 +377,7 @@ func (s *Server) subscribe(meetID string) (*subscription, bool) {
 	sub.produced = 1
 	sub.first = frameItem{seq: 1, snapshot: true, at: s.clk.Now()}
 	ms.subs[sub] = struct{}{}
-	return sub, true
+	return sub, admitOK
 }
 
 // unsubscribe drops a connection. It does NOT close sub.stop: Close owns that channel,
@@ -384,8 +408,16 @@ func (s *Server) mintPong(sub *subscription) {
 func (s *Server) mintSnapshot(sub *subscription) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := s.clk.Now()
+	// Rate limit, and DROP rather than queue: a suppressed request was never a frame,
+	// so it burns no sequence number and cannot manufacture a gap that would provoke
+	// the very resync it just refused.
+	if !sub.lastResync.IsZero() && now.Sub(sub.lastResync) < resyncMinInterval {
+		return
+	}
+	sub.lastResync = now
 	s.streamLocked(sub.meetID)
-	s.enqueueLocked(sub, frameItem{snapshot: true, at: s.clk.Now()})
+	s.enqueueLocked(sub, frameItem{snapshot: true, at: now})
 }
 
 // enqueueLocked mints one frame for one subscription. Caller holds mu.
@@ -568,4 +600,42 @@ func frameForEvent(ev coordinator.Event) (string, any) {
 	default:
 		return "", nil
 	}
+}
+
+// admission is the outcome of asking to open an event stream. It is an enum rather than
+// a bool because the two refusals need DIFFERENT close codes, and a caller handed a bare
+// false would have to guess which.
+type admission int
+
+const (
+	admitOK admission = iota
+	admitShuttingDown
+	admitAtCapacity
+)
+
+// allowUpgradeOrigin is the upgrade-time origin decision, delegated in full to
+// policy.Origins.AllowUpgrade — the SAME call internal/signaling's /ws upgrade makes, so
+// the two endpoints cannot diverge.
+//
+// # Why AcceptOptions.OriginPatterns is not used
+//
+// coder/websocket's authenticateOrigin returns ALLOW when r.Host equals the Origin's
+// host, BEFORE consulting OriginPatterns and comparing hosts only, ignoring the scheme.
+// That is a second matcher carrying a rule policy.Origins does not have, and it is
+// exploitable: an attacker who points a name they control at this server's address gets
+// a victim's browser to send Host: evil.com and Origin: http://evil.com, the shortcut
+// fires, and the upgrade succeeds against an allow-list naming neither — reaching a
+// loopback or LAN server the attacker cannot dial, which is the very reachability
+// assumption that makes an unauthenticated dashboard defensible. It also let a plaintext
+// origin claim a host the allow-list permits only over https. policy.Origins.Patterns()
+// carries a doc block saying not to gate an upgrade with it.
+//
+// So the library's check is switched off (InsecureSkipVerify) and the decision is made
+// here. Note the consequence, which is the hole closing rather than a regression: a page
+// served from the ARBITER'S OWN ORIGIN is no longer auto-allowed and must be listed in
+// -allowed-origins. Self-origin auto-allow IS the rebinding vector. The default list
+// covers localhost and 127.0.0.1, so the intended Pages-plus-local-server setup is
+// unaffected; a hosted deployment that serves its own dashboard must list its origin.
+func (s *Server) allowUpgradeOrigin(r *http.Request) bool {
+	return s.origins.AllowUpgrade(r.Header.Get("Origin"))
 }

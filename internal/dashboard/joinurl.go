@@ -72,16 +72,29 @@ func wsSchemeOf(httpBase string) string {
 	return "ws://" + strings.TrimPrefix(httpBase, "http://")
 }
 
+// joinNamePlaceholder is the -name value handed to a human to replace.
+//
+// It MUST satisfy policy.ValidPeerName, which is lowercase-only: the hub validates
+// -name at its boundary, so the previous "YOUR_NAME" produced a command that was
+// rejected the instant it was pasted unchanged — a copy button handing out a failing
+// command. It also has to still READ as a placeholder, because one that looked like a
+// real name would be pasted without noticing.
+const joinNamePlaceholder = "your-name"
+
 // joinFor builds the rendezvous for one meet.
 //
 // The meet id is query-escaped even though policy.MeetIDPattern already excludes every
 // character that would need it. The escaping is not redundant defence-in-depth theatre:
 // it is what keeps the guarantee local, so a future widening of the pattern cannot turn
 // this line into an injection point silently.
+//
+// PeerCommand, by contrast, interpolates into a SHELL COMMAND with no quoting, and its
+// safety rests entirely on policy.MeetIDPattern and policy.ValidPeerName excluding every
+// shell metacharacter. Do not loosen either pattern without escaping here first.
 func (s *Server) joinFor(meetID string) joinInfo {
 	return joinInfo{
 		WSURL: s.wsBase + "/ws?room=" + url.QueryEscape(meetID),
 		PeerCommand: "peer -call -managed -server " + s.httpBase +
-			" -room " + meetID + " -name YOUR_NAME",
+			" -room " + meetID + " -name " + joinNamePlaceholder,
 	}
 }
