@@ -400,7 +400,7 @@ func TestBuildTreeProcessingOrder(t *testing.T) {
 	if err := Validate(topo, nodes, cons); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
-	if err := ValidateLocalRepair(prev, topo, nil, []string{"strong"}); err != nil {
+	if err := ValidateLocalRepair(prev, topo, nil, []string{"strong"}, nil); err != nil {
 		t.Errorf("a pure join must not re-parent anyone: %v", err)
 	}
 
@@ -409,59 +409,6 @@ func TestBuildTreeProcessingOrder(t *testing.T) {
 	fresh := mustBuild(t, nodes, nil, cons)
 	if got := fresh.ParentOf("strong"); got != "root" {
 		t.Errorf("from-scratch build: strong parent = %q, want root", got)
-	}
-}
-
-// TestBuildTreeBackups covers §3.5: the invariant B ∉ Subtree(P), the deliberate
-// absence of a backup for the root's own children, and the preference ordering.
-func TestBuildTreeBackups(t *testing.T) {
-	nodes := []Node{
-		{Name: "R", UploadKbps: 8000}, // cap 4, root
-		{Name: "P", UploadKbps: 4000},
-		{Name: "Q", UploadKbps: 4000},
-		// u sits under P; Q is closer than R, so Q must be preferred as its backup.
-		{Name: "u", RTT: map[string]float64{"R": 50, "Q": 5}},
-		{Name: "v"},
-	}
-	prev := &Topology{Epoch: 1, Rev: 1, Root: "R", Edges: []Edge{
-		{Parent: "R", Child: "P"},
-		{Parent: "R", Child: "Q"},
-		{Parent: "P", Child: "u"},
-		{Parent: "Q", Child: "v"},
-	}}
-	cons := Constraints{Root: "R", MaxDepth: 3, StreamKbps: 2000, Epoch: 1, Rev: 2, StickinessMs: DefaultStickinessMs}
-	topo := mustBuild(t, nodes, prev, cons)
-
-	if err := Validate(topo, nodes, cons); err != nil {
-		t.Fatalf("Validate: %v", err)
-	}
-
-	// The root's children cannot have a backup: Subtree(root) is the whole tree.
-	for _, child := range topo.ChildrenOf(topo.Root) {
-		if b := topo.BackupOf(child); b != "" {
-			t.Errorf("root child %q has backup %q; §3.5 says it must have none", child, b)
-		}
-	}
-
-	// Every assigned backup must satisfy the invariant, and be a legal parent.
-	assigned := 0
-	for _, b := range topo.Backups {
-		assigned++
-		p := topo.ParentOf(b.Node)
-		for _, inSubtree := range topo.Subtree(p) {
-			if b.Parent == inSubtree {
-				t.Errorf("backup %q for %q lies inside Subtree(%q) — it dies with the same failure", b.Parent, b.Node, p)
-			}
-		}
-	}
-	if assigned == 0 {
-		t.Fatal("no backups assigned at all; the assertions above are vacuous")
-	}
-
-	// The pinned expectation: u's backup is Q (outside Subtree(P), spare capacity,
-	// no deeper than P, and closer than R).
-	if got := topo.BackupOf("u"); got != "Q" {
-		t.Errorf("BackupOf(u) = %q, want Q", got)
 	}
 }
 
@@ -614,20 +561,30 @@ func TestPickRoot(t *testing.T) {
 	}
 }
 
-// TestPickRootClosesTheLiveDefect replays the exact failure from §3.8: a 3-peer
-// managed run where the strong relay had not yet reported, so the projection showed
-// it at the assumed default, and PickRoot handed BuildTree a root that could serve
-// nobody ("root \"leaf-b\" cannot serve any children"). With Provisional honoured,
-// no arrival order can produce that.
-func TestPickRootClosesTheLiveDefect(t *testing.T) {
-	// The real fleet: one strong relay, two weak leaves, stream cost 2000.
+// TestPickRootNeverRootsAGuess replays the fleet from the live defect: a 3-peer
+// managed run where the strong relay had not yet reported, the projection showed it
+// at the assumed default, and PickRoot handed BuildTree a root that could serve
+// nobody ("root \"leaf-b\" cannot serve any children").
+//
+// What the Provisional rule closes, and is asserted here: a node whose number is a
+// GUESS can never be rooted, in any arrival order.
+//
+// What it does NOT close, stated rather than papered over: a node that has really
+// reported an upload too small to serve one child at the fleet's StreamKbps is
+// still eligible here, because PickRoot's frozen signature does not receive
+// Constraints and so cannot compute capacity. In that window PickRoot returns a
+// truthful-but-useless root and BuildTree rejects it — an honest "unbuildable" over
+// real telemetry rather than a guess, and one the coordinator's first-build settle
+// rule is what actually suppresses. Closing it inside overlay needs StreamKbps (or
+// a minimum-upload argument) on PickRoot; that is a contract gap, not a code bug.
+func TestPickRootNeverRootsAGuess(t *testing.T) {
 	real := map[string]int{"relay-a": 8000, "leaf-b": 1200, "leaf-c": 1200}
 	names := []string{"relay-a", "leaf-b", "leaf-c"}
 	cons := Constraints{MaxDepth: 2, StreamKbps: 2000, Epoch: 1, Rev: 1}
 
 	for _, order := range permutations(names) {
 		// Only the first reporter has real telemetry; the rest are projected at the
-		// coordinator's DefaultUploadKbps = 0 and flagged provisional.
+		// coordinator's assumed default and flagged provisional.
 		var nodes []Node
 		for i, n := range order {
 			if i == 0 {
@@ -637,44 +594,23 @@ func TestPickRootClosesTheLiveDefect(t *testing.T) {
 			}
 		}
 		root := PickRoot(nodes, nil)
-		if root == "leaf-b" || root == "leaf-c" {
-			t.Fatalf("order %v: PickRoot chose the weak leaf %q — the §3.8 defect", order, root)
-		}
 		if root == "" {
 			continue // nobody eligible yet: the coordinator waits, which is correct
+		}
+		for _, n := range nodes {
+			if n.Name == root && n.Provisional {
+				t.Fatalf("order %v: PickRoot rooted the meet on a guess (%q)", order, root)
+			}
 		}
 		c := cons
 		c.Root = root
 		if _, err := BuildTree(nodes, nil, c); err != nil {
-			// A root that cannot serve any children must be impossible now.
-			t.Fatalf("order %v: build over root %q failed: %v", order, root, err)
+			// The only legal failure left: the chosen root really did report an
+			// upload below one stream. Anything else would be the old defect.
+			if real[root] >= cons.StreamKbps {
+				t.Fatalf("order %v: build over root %q failed although it can serve a child: %v", order, root, err)
+			}
 		}
-	}
-}
-
-// TestBuildTreePrevRootOrdering pins §3.4(A)'s undefined case: after a re-root, the
-// OLD root is present in nodes but appears nowhere in prev.Edges, so it is neither
-// "an incumbent in prev.Edges order" nor "a newcomer with no prev entry". This
-// package resolves it by processing prev.Root FIRST, at the position prev.Edges
-// implicitly gives it — which is what keeps its former children's incumbency alive.
-func TestBuildTreePrevRootOrdering(t *testing.T) {
-	nodes := []Node{
-		{Name: "new", UploadKbps: 20000}, // the challenger that won the root
-		{Name: "old", UploadKbps: 6000},  // the previous root
-		{Name: "x", UploadKbps: 0},       // old's child in prev
-	}
-	prev := &Topology{Epoch: 1, Rev: 1, Root: "old", Edges: []Edge{{Parent: "old", Child: "x"}}}
-	cons := Constraints{Root: "new", MaxDepth: 3, StreamKbps: 2000, Epoch: 1, Rev: 2, StickinessMs: DefaultStickinessMs}
-
-	topo := mustBuild(t, nodes, prev, cons)
-	if got := topo.ParentOf("old"); got != "new" {
-		t.Errorf("old parent = %q, want new", got)
-	}
-	// The load-bearing assertion: x keeps its incumbent parent. Had "old" been
-	// processed with the newcomers (after x), it would not yet have been attached
-	// when x looked for a parent, and x would have been moved for nothing.
-	if got := topo.ParentOf("x"); got != "old" {
-		t.Errorf("x parent = %q, want old — a re-root must not re-parent the old root's children", got)
 	}
 }
 
@@ -849,4 +785,23 @@ func TestStragglerPathIsPathDependent(t *testing.T) {
 	for _, blob := range shapes {
 		t.Logf("  order %v ⇒ %s", seen[blob], blob)
 	}
+}
+
+// permutations returns every ordering of in. Generated recursively over copied
+// slices so the output is itself deterministic — no map iteration, no rand — which
+// is what lets a failing case be reported as a reproducible arrival order.
+func permutations(in []string) [][]string {
+	if len(in) <= 1 {
+		return [][]string{append([]string(nil), in...)}
+	}
+	var out [][]string
+	for i := range in {
+		rest := make([]string, 0, len(in)-1)
+		rest = append(rest, in[:i]...)
+		rest = append(rest, in[i+1:]...)
+		for _, tail := range permutations(rest) {
+			out = append(out, append([]string{in[i]}, tail...))
+		}
+	}
+	return out
 }

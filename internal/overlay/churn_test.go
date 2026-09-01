@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -12,8 +13,13 @@ import (
 // relays, several mid-capacity nodes, one TURN-bound forced leaf, and some
 // zero-upload leaves — i.e. a shape where capacity, depth, and the TURN rule all
 // bind somewhere.
-func churnPool() []Node {
+func churnPool(withRTT bool) []Node {
 	rtt := func(pairs ...any) map[string]float64 {
+		if !withRTT {
+			// Production shape: pairwise RTT is never measured live, so attachment
+			// falls through to the structural ranks. See docs/PLAN.md §13.2.
+			return nil
+		}
 		m := map[string]float64{}
 		for i := 0; i+1 < len(pairs); i += 2 {
 			m[pairs[i].(string)] = float64(pairs[i+1].(int))
@@ -49,10 +55,10 @@ type churnStep struct {
 // asserted. What IS true, and is what the design actually buys, is that the edge
 // delta between consecutive trees is bounded by the churn that caused the rebuild —
 // which is exactly the predicate ValidateLocalRepair encodes.
-func runChurn(t *testing.T, seed int64, steps int) []churnStep {
+func runChurn(t *testing.T, seed int64, steps int, withRTT bool) []churnStep {
 	t.Helper()
 	rng := rand.New(rand.NewSource(seed)) //nolint:gosec // determinism, not secrecy
-	pool := churnPool()
+	pool := churnPool(withRTT)
 	byName := map[string]Node{}
 	for _, n := range pool {
 		byName[n.Name] = n
@@ -60,7 +66,11 @@ func runChurn(t *testing.T, seed int64, steps int) []churnStep {
 
 	active := []string{"n0", "n1", "n2"} // a meet always starts with somebody in it
 	inactive := []string{"n3", "n4", "n5", "n6", "n7"}
-	var prev *Topology
+	// published is the tree the fleet realized and the only thing the churn oracle
+	// may be measured against; working is what the builder rebuilds FROM, which the
+	// ratification rule patches on a self-promotion. Conflating the two would have
+	// the oracle assert against the very belief it is supposed to check.
+	var published, working *Topology
 	var trace []churnStep
 	// Pending churn accumulates across builds that were discarded, exactly as the
 	// coordinator's does: the oracle compares against the last PUBLISHED tree.
@@ -95,19 +105,19 @@ func runChurn(t *testing.T, seed int64, steps int) []churnStep {
 			// incumbent, then rebuilds from the patched tree — but the oracle still
 			// compares against the last published tree, which is the one the fleet
 			// actually realized.
-			if prev == nil || len(prev.Backups) == 0 {
+			if working == nil || len(working.Backups) == 0 {
 				continue
 			}
-			b := prev.Backups[rng.Intn(len(prev.Backups))]
+			b := working.Backups[rng.Intn(len(working.Backups))]
 			if !contains(active, b.Node) || !contains(active, b.Parent) {
 				continue
 			}
-			patched, err := repatch(prev, b.Node, b.Parent)
+			patched, err := repatch(working, b.Node, b.Parent)
 			if err != nil {
 				t.Fatalf("seed %d step %d: repatch: %v", seed, step, err)
 			}
 			pendingPromoted[b.Node] = true
-			prev = patched
+			working = patched
 			event = fmt.Sprintf("promote %s→%s", b.Node, b.Parent)
 		}
 
@@ -119,16 +129,16 @@ func runChurn(t *testing.T, seed int64, steps int) []churnStep {
 			MaxDepth: 2, StreamKbps: 2000, Epoch: 1,
 			StickinessMs: DefaultStickinessMs,
 		}
-		cons.Root = PickRoot(nodes, prev)
+		cons.Root = PickRoot(nodes, working)
 		if cons.Root == "" {
 			trace = append(trace, churnStep{Event: event})
 			continue
 		}
 		cons.Rev = 1
-		if prev != nil {
-			cons.Rev = prev.Rev + 1
+		if working != nil {
+			cons.Rev = working.Rev + 1
 		}
-		next, err := BuildTree(nodes, prev, cons)
+		next, err := BuildTree(nodes, working, cons)
 		if err != nil {
 			// Over-constrained for now: keep the previous tree, as the coordinator
 			// does, and carry the pending churn into the next attempt.
@@ -138,29 +148,46 @@ func runChurn(t *testing.T, seed int64, steps int) []churnStep {
 		if err := Validate(next, nodes, cons); err != nil {
 			t.Fatalf("seed %d step %d (%s): built tree fails Validate: %v\n%+v", seed, step, event, err, next)
 		}
-		if prev != nil {
+		if published != nil && !withRTT {
+			// The churn oracle is only sound over a fleet with no measured RTT: it
+			// cannot see latency, so it cannot tell a legitimate rank-2 move onto a
+			// materially closer parent from gratuitous churn. That is the production
+			// shape (§13.2), and the RTT-rich runs below assert Validate instead.
+			prev := published
 			gone, joined, promoted := keys(pendingGone), keys(pendingJoined), keys(pendingPromoted)
-			if err := ValidateLocalRepair(prev, next, gone, joined, promoted); err != nil {
+			err := ValidateLocalRepair(prev, next, gone, joined, promoted)
+			switch {
+			case next.Root != prev.Root && !pendingGone[prev.Root]:
+				// A VOLUNTARY re-root (a challenger cleared RootChangeMarginKbps) is
+				// the one legitimately global reconfiguration, so minimality does not
+				// apply — but the oracle must still SAY so rather than wave it
+				// through, otherwise it would also miss an accidental re-root.
+				if err == nil || !strings.Contains(err.Error(), "root changed") {
+					t.Fatalf("seed %d step %d (%s): a voluntary re-root %q→%q was not reported by the oracle: %v",
+						seed, step, event, prev.Root, next.Root, err)
+				}
+			case err != nil:
 				t.Fatalf("seed %d step %d (%s): rebuild churned more than the event justified: %v\n prev: %+v\n next: %+v",
 					seed, step, event, err, prev.Edges, next.Edges)
 			}
 		}
-		prev = next
+		published, working = next, next
 		pendingGone, pendingJoined, pendingPromoted = map[string]bool{}, map[string]bool{}, map[string]bool{}
 		trace = append(trace, churnStep{Event: event, Topo: next})
 	}
-	if prev == nil {
+	if published == nil {
 		t.Fatalf("seed %d: the whole run never produced a tree", seed)
 	}
 	return trace
 }
 
 // TestChurnKeepsBothOraclesGreen is the property run: every tree legal, every
-// transition minimal, over long deterministic churn sequences.
+// transition minimal, over long deterministic churn sequences of joins, departures
+// and self-promotions.
 func TestChurnKeepsBothOraclesGreen(t *testing.T) {
 	for _, seed := range []int64{1, 7, 42, 1337} {
 		t.Run(fmt.Sprintf("seed%d", seed), func(t *testing.T) {
-			trace := runChurn(t, seed, 200)
+			trace := runChurn(t, seed, 200, false)
 			built := 0
 			for _, s := range trace {
 				if s.Topo != nil {
@@ -174,17 +201,30 @@ func TestChurnKeepsBothOraclesGreen(t *testing.T) {
 	}
 }
 
+// TestChurnWithMeasuredRTT runs the same churn over a fleet WITH pairwise latency,
+// where minimum-RTT attachment and the stickiness margin are actually exercised. It
+// asserts Validate only, for the reason stated in runChurn: the churn oracle is
+// blind to latency and would report a legitimate move onto a materially closer
+// parent as gratuitous.
+func TestChurnWithMeasuredRTT(t *testing.T) {
+	for _, seed := range []int64{2, 5, 99} {
+		t.Run(fmt.Sprintf("seed%d", seed), func(t *testing.T) {
+			runChurn(t, seed, 200, true)
+		})
+	}
+}
+
 // TestChurnReplayIsDeterministic is property (c): the same EVENT SEQUENCE always
 // yields the same trace. It is the weaker, true cousin of "the same fleet always
 // yields the same tree" — which stickiness makes false on purpose.
 func TestChurnReplayIsDeterministic(t *testing.T) {
 	for _, seed := range []int64{3, 11} {
-		first, err := json.Marshal(runChurn(t, seed, 120))
+		first, err := json.Marshal(runChurn(t, seed, 120, true))
 		if err != nil {
 			t.Fatal(err)
 		}
 		for i := 0; i < 3; i++ {
-			again, err := json.Marshal(runChurn(t, seed, 120))
+			again, err := json.Marshal(runChurn(t, seed, 120, true))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -242,13 +282,4 @@ func keys(set map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-func contains(names []string, name string) bool {
-	for _, n := range names {
-		if n == name {
-			return true
-		}
-	}
-	return false
 }

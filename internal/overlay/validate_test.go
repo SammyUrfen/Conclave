@@ -182,6 +182,7 @@ func TestValidateCatches(t *testing.T) {
 			mutate: func(nodes []Node, c *Constraints, top *Topology) {
 				// u gains a child (depth 3, still legal). Its backup v sits at depth
 				// 2, so promoting u under v would put u at 3 and w at 4.
+				nodes[3].UploadKbps = 4000 // u now has a child of its own
 				nodes[4].UploadKbps = 4000 // v must be able to parent at all
 				top.Edges = append(top.Edges, Edge{Parent: "u", Child: "w"})
 				top.Backups = []Backup{{Node: "u", Parent: "v"}}

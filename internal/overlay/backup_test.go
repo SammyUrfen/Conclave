@@ -10,7 +10,7 @@ func backupFleet() ([]Node, *Topology, Constraints) {
 		{Name: "P", UploadKbps: 4000},
 		{Name: "Q", UploadKbps: 4000},
 		// u sits under P; Q is closer than R, so Q must be preferred as its backup.
-		{Name: "u", RTT: map[string]float64{"R": 50, "Q": 5}},
+		{Name: "u", RTT: map[string]float64{"P": 10, "R": 50, "Q": 5}},
 		{Name: "v"},
 	}
 	prev := &Topology{Epoch: 1, Rev: 1, Root: "R", Edges: []Edge{
@@ -124,7 +124,7 @@ func TestBackupRespectsPromotedSubtreeHeight(t *testing.T) {
 		{Name: "S", UploadKbps: 4000},
 		// Q is at depth 2 and is by far the closest — it must still be rejected.
 		{Name: "Q", UploadKbps: 4000},
-		{Name: "u", UploadKbps: 4000, RTT: map[string]float64{"R": 50, "S": 20, "Q": 1}},
+		{Name: "u", UploadKbps: 4000, RTT: map[string]float64{"P": 5, "R": 50, "S": 20, "Q": 1}},
 		{Name: "w", UploadKbps: 0},
 	}
 	prev := &Topology{Epoch: 1, Rev: 1, Root: "R", Edges: []Edge{
