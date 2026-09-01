@@ -1,6 +1,6 @@
 # PLAN.md — the Phase 5–6 architecture contract
 
-> **Status: v2.5, FROZEN**, 2026-09-01. v1 was frozen the same day, reviewed adversarially by
+> **Status: v2.6, FROZEN**, 2026-09-01. v1 was frozen the same day, reviewed adversarially by
 > two independent reviewers (12 critical + ~15 major findings), and amended in place. **§15 is
 > the amendment log — read it first if you built against v1**, because several frozen names
 > changed. v2 also reconciles the document with what WI-0 actually shipped; where the shipped
@@ -1489,6 +1489,21 @@ type Heartbeat struct {
 	// IntervalMs is the cadence THIS peer beats at (SHIPPED, WI-0). Read it through
 	// Heartbeat.Interval(), never directly — see the cadence rule in §5.3.
 	IntervalMs uint64 `json:"interval_ms,omitempty"`
+	// StaleRejected is how many control-plane instructions this peer has REFUSED under
+	// its fence since it last joined (media.Router.StaleRejected()). RATIFIED, §15.14.
+	//
+	// It rides the heartbeat rather than the Report because it is CONTROL state, not
+	// telemetry: this frame already carries the peer's fence (Epoch, Rev), and the counter
+	// is literally that same fence's refusal count, so the two are always consistent by
+	// construction. Report's 3s cadence would also be the wrong rhythm for something an
+	// operator watches during a handover.
+	//
+	// CUMULATIVE and MONOTONIC within a session, reset on rejoin exactly like Seq — because
+	// the fence itself resets on TypeJoined (§5.7 rule 6), and a counter that survived would
+	// be reporting refusals made under a fence that no longer exists. The coordinator
+	// therefore emits EventStale on an INCREASE, never per heartbeat, and keeps the latest
+	// value in RoomSnapshot so a fresh subscriber's first frame is already correct.
+	StaleRejected uint64 `json:"stale_rejected,omitempty"`
 }
 
 // ChildLink is one realized downstream edge: the neighbour's name and the pion
@@ -1994,10 +2009,24 @@ type Event struct {
 	At         time.Time // from the injected clock, never time.Now()
 	Epoch      uint64
 	Rev        uint64
-	Node       string   // the node this event is about
+	Node       string   // the node this event is about (its stable NAME)
+	// NodeID is the server-assigned peer id for Node. Populated on member/health/reparent/
+	// stale events. Added in v2.6: §9.4 mandated an `id` in member_joined/member_left with
+	// no source, and the coordinator already holds it (nodeState.id) — a plumbing gap, not
+	// a missing fact. It also lets the UI join a delta against nodes[] on the same
+	// server-authoritative key the snapshot uses, rather than on a peer-supplied name.
+	NodeID     string
 	Parent     string   // new parent (reparent/failover)
 	PrevParent string   // parent that was lost (reparent/failover)
-	Health     Health   // EventHealth
+	Health     Health   // EventHealth: the new value
+	// PrevHealth is the value Health transitioned FROM. Added in v2.6 for the same reason
+	// as NodeID: the coordinator is the thing performing the transition, so it knows this;
+	// having the dashboard remember it in-process was wrong across a restart and wrong for
+	// a fresh subscriber, whose first transition would report "".
+	PrevHealth Health
+	// Count is a monotonic total carried by counting events. EventStale sets it to the
+	// peer's cumulative StaleRejected; Reason carries no numbers.
+	Count      uint64
 	Present    bool     // EventMember
 	Orphans    []string // EventFailover: the subtree that had to move
 	Reroot     bool     // EventFailover: the root itself was lost
@@ -2013,6 +2042,9 @@ type RoomSnapshot struct {
 	RoomID  string
 	Epoch   uint64
 	Rev     uint64
+	// StaleRejected is the meet-wide total across members — what §9.5's epoch panel shows
+	// beside the epoch, and the visible proof that the fence is doing work (§6.5).
+	StaleRejected uint64
 	Topo    *overlay.Topology
 	Members []MemberSnapshot
 	At      time.Time
@@ -2028,6 +2060,8 @@ type MemberSnapshot struct {
 	Parent      string   // realized, from the last heartbeat
 	Children    []string // realized, from the last heartbeat
 	Backup      string   // assigned by the current tree
+	// StaleRejected is this member's latest reported refusal count (§15.14).
+	StaleRejected uint64
 	LastBeatSeq uint64
 	LastBeatAt  time.Time
 }
@@ -3740,7 +3774,7 @@ Response `200` — the same object the WS stream sends as its first `snapshot` f
       "depth": 0,
       "upload_kbps": 8000, "nat": "direct",
       "rtt_server_ms": 12.5, "loss_pct": 0.2, "cpu_pct": 31.0,
-      "fitness": 0.71,
+      "fitness_lower_bound": 0.71,
       "last_beat_seq": 412, "last_beat_unix_ms": 1756684812100
     },
     {
@@ -3751,7 +3785,7 @@ Response `200` — the same object the WS stream sends as its first `snapshot` f
       "children": [], "depth": 1,
       "upload_kbps": 1000, "nat": "direct",
       "rtt_server_ms": 240.0, "loss_pct": 6.1, "cpu_pct": 55.0,
-      "fitness": 0.29,
+      "fitness_lower_bound": 0.29,
       "last_beat_seq": 407, "last_beat_unix_ms": 1756684808900
     }
   ],
@@ -3808,15 +3842,15 @@ Every frame on `/api/meets/{id}/events` has exactly this shape:
 | `kind` | `data` | Emitted by |
 |---|---|---|
 | `snapshot` | The full `GET /api/meets/{id}` body. | connect, and `resync` |
-| `member_joined` | `{"id","name"}` | `coordinator.EventMember` (Present) |
-| `member_left` | `{"id","name"}` | `coordinator.EventMember` (!Present) |
-| `health_changed` | `{"name","health","prev_health"}` | `coordinator.EventHealth` |
+| `member_joined` | `{"id","name"}` — `id` from `Event.NodeID` (added v2.6; §9.4 previously mandated a field with no source) | `coordinator.EventMember` (Present) |
+| `member_left` | `{"id","name"}` — same | `coordinator.EventMember` (!Present) |
+| `health_changed` | `{"name","health","prev_health"}` — `prev_health` from `Event.PrevHealth` (added v2.6). The dashboard MUST NOT remember it in-process: that is wrong across a restart and wrong for a fresh subscriber, whose first transition would report `""` | `coordinator.EventHealth` |
 | `topology` | `{"root","edges":[…],"backups":[…],"depth","relays":[…],"outcome","reason"}` — `outcome` is `built` or `relaxed`; on `relaxed`, `reason` carries the sticky attempt's error (§5.9a) | `coordinator.EventTopology` |
-| `reparent` | `{"name","from","to","self_promoted":true,"reason"}` | `coordinator.EventReparent` |
+| `reparent` | `{"name","from","to","reason"}` — **`self_promoted` REMOVED (v2.6)**: `EventReparent` is emitted only from the self-promotion path by construction, since a coordinator-decided move arrives as `failover` + `topology`. A field that can only ever hold one value states something false about the type — the same trap as `Meet.EndedAt` (§15.12) and the impairment void (§15.11). If a coordinator-decided reparent ever needs its own event, add the KIND then. | `coordinator.EventReparent` |
 | `failover` | `{"name","orphans":[…],"reroot":false,"reason"}` | `coordinator.EventFailover` |
 | `election` | `{"epoch","coordinator","prev","reason"}` — `coordinator` is `""` when `reason` is `vacated` (§6.8) | `arbiter.Publisher.PublishElection` |
 | `announce_repair` | `{"name","peer_epoch","meet_epoch","resolved"}` — emitted on ENTERING and LEAVING the lagging state, never per heartbeat (§6.8) | `arbiter.Publisher.PublishRepair` |
-| `stale_rejected` | `{"name","epoch","rev","reason"}` | `coordinator.EventStale` |
+| `stale_rejected` | `{"name","epoch","rev","total","reason"}` — `total` is `Event.Count`, the peer's cumulative refusals this session. Emitted on an **increase**, never per heartbeat (§15.14) | `coordinator.EventStale` |
 | `settling` | `{"waiting":[…],"reason"}` | `coordinator.EventSettling` |
 | `unbuildable` | `{"reason"}` | `coordinator.EventUnbuildable` |
 | `demo` | `{"action","target","by"}` | the demo surface (§9.6) |
@@ -3855,15 +3889,41 @@ change; `details` is an object and may be `{}`, never absent. Frozen `code` set:
 | `no_candidate` | 409 | Forced election found no eligible peer |
 | `demo_disabled` | 404 | Never returned — the routes are unregistered (§9.6). Listed so nobody adds it. |
 | `too_many_meets` | 429 | `MaxMeets` reached |
+| `not_found` | 404 | Unknown `/api/` path — a ROUTING failure (RATIFIED v2.6) |
+| `method_not_allowed` | 405 | Known path, wrong method (RATIFIED v2.6) |
 | `internal` | 500 | Anything else |
 
+The last two were added by WI-7 and are **ratified**. They are an additive extension to a
+frozen set, which is non-breaking for a client that already handles unknown codes. More to the
+point, WI-7 was right to refuse to reuse `meet_not_found` or `bad_request`: those are
+*semantic* failures about a meet or a body, while these are *routing* failures about a URL.
+Collapsing them would make a typo'd path indistinguishable from a real missing meet — which is
+exactly the diagnosis an operator needs the code to make for them.
+
 **Units and ranges, frozen.** `*_kbps` = kbit/s, integer. `*_ms` = milliseconds, float.
-`loss_pct` and `cpu_pct` = percent on **0–100**, float, 1 decimal. `fitness` = **0–1**, float,
-3 decimals. `*_unix_ms` = integer milliseconds since the Unix epoch, UTC. `depth` = integer
+`loss_pct` and `cpu_pct` = percent on **0–100**, float, 1 decimal. **`fitness_lower_bound`** =
+**0–1**, float, 3 decimals — see below. `*_unix_ms` = integer milliseconds since the Unix epoch, UTC. `depth` = integer
 hops from root; **`-1` means "not in the tree"** and the UI must render it as "unattached",
 never as a number. `epoch`/`rev`/`seq` = unsigned integers, and the client must treat them as
 opaque and **compare only for equality/ordering** (they can exceed 2^53 in principle; parse as
 `BigInt` or compare as strings — do not do arithmetic on them).
+
+**`fitness_lower_bound` is named for what it is (v2.6).** `arbiter.Fitness.UptimeSec` is not
+reachable from `coordinator.MemberSnapshot` — the coordinator does not expose a join time — so
+the dashboard passes 0 and the displayed figure is short by **up to the 0.15 uptime weight**
+(§6.1). WI-7 refused to invent an uptime, which was right.
+
+The key is renamed rather than footnoted, because a number that is quietly 0.15 too low is
+"invisibly wrong" — the same failure class as the reap-time `EndedAt` (§15.12), and the
+lesson there was that a wrong value beats a late one only when it announces itself. The UI
+must label it "≥" and must not present it as the arbiter's score.
+
+> **The proper fix, if fitness ever becomes load-bearing in the UI:** have the **arbiter**
+> expose the score it actually computed, per node. It is the only component that holds every
+> input (`Live` is its own verdict, §6.1/M4), and the dashboard recomputing from a
+> `MemberSnapshot` is a second implementation of a decision the arbiter owns — approximate
+> even with a join time added. Not taken now: §13.1 already records that the fitness inputs
+> are unmeasured in production, so a more precise number would be more precisely fictional.
 
 **Frozen enum value sets** (the UI must handle an unknown value by rendering it verbatim in a
 neutral style, never by crashing):
@@ -3890,9 +3950,17 @@ Close codes the server may send:
 |---|---|---|
 | `1000` normal | Server shutting down | Reconnect with backoff |
 | `1001` going away | Meet deleted | Stop; navigate to the meet list |
-| `1008` policy violation | Origin rejected, or malformed `op` | **Stop. Do not reconnect** — retrying cannot help |
+| `1008` policy violation | **Malformed `op` only.** | **Stop. Do not reconnect** — retrying cannot help |
 | `1011` internal error | Server fault | Reconnect with backoff |
 | `4404` | Meet not found at upgrade time | Stop; navigate to the meet list |
+
+> **An origin rejection produces NO close code (CORRECTED, v2.6).** v2.4's table listed
+> "origin rejected" under `1008`, which is unreachable: `websocket.Accept` refuses the
+> *handshake* with an HTTP **403**, so no WebSocket is ever established and the client sees a
+> failed upgrade, not a close event. The client must therefore treat **upgrade failure** and
+> **close** as two distinct paths: a 403 on upgrade means the server does not allow this
+> origin (§9.8) and retrying cannot help, so surface it as a configuration error naming the
+> `-allowed-origins` flag rather than entering the backoff ladder.
 
 **Reconnect backoff (client, frozen):** 500 ms, 1 s, 2 s, 4 s, 8 s, then every 15 s, each with
 ±20% jitter; reset to 500 ms after a connection survives 30 s. On every successful reconnect
@@ -4849,7 +4917,72 @@ in `Router.StaleRejected`. The **authorization** half (`Fence.Accept`, plus `Res
 announced coordinator is not. Recorded here so no reader takes §6.5 as fully realised, and so
 the follow-up is visible rather than assumed.
 
-### 15.14 Where I think a reviewer is wrong
+### 15.14 v2.6 — the `EventStale` wire gap, and nine §9 corrections
+
+**RATIFIED: `metrics.Heartbeat.StaleRejected uint64`.** `coordinator.EventStale` was declared
+and consumed end-to-end by the dashboard, but **nothing published it** — `media.Router` counted
+refusals, `cmd/peer` logged the total once at shutdown, and the chain ended there, so the panel
+read 0 forever. WI-5's carrier is the right one and its four arguments all hold:
+
+- the heartbeat already carries that peer's fence (`Epoch`, `Rev`), and this counter is that
+  same fence's refusal count — so the two are consistent **by construction** rather than by
+  two frames happening to agree;
+- it is **control state, not telemetry**, so `Report`'s 3s cadence is the wrong rhythm for
+  something an operator watches during a handover;
+- no new type, which keeps §8's "the frame already exists" discipline — the same reasoning
+  that let §15.10 close the C5 membership seam with `TypePeerJoined` rather than a new frame;
+- cumulative and monotonic, **reset on rejoin exactly like `Seq`** — which is not a stylistic
+  echo but a requirement: the fence itself resets on `TypeJoined` (§5.7 rule 6), so a counter
+  that survived would report refusals made under a fence that no longer exists.
+
+**Ownership ratified as coordinator-emitted, not arbiter-emitted**, for WI-5's reason: §6.8
+deliberately pairs the peer-side symptom (`stale_rejected`) with the server-side cause
+(`announce_repair`) as two views of one fault, and routing this through the arbiter's
+`Publisher` would duplicate a coordinator event kind and collapse that pairing. It also needs
+no change in Phase 6, where heartbeats reach an elected coordinator under §8 routing rule 2.
+
+Emission follows the transition-not-sample discipline used in §5.3 and §6.8: `EventStale` fires
+on an **increase**, carrying the new total in `Event.Count`, never once per heartbeat.
+`RoomSnapshot.StaleRejected` (meet total) and `MemberSnapshot.StaleRejected` (per node) make a
+fresh subscriber's first frame correct without replay.
+
+**Nine §9 corrections.**
+
+| Finding | Ruling |
+|---|---|
+| `member_joined`/`member_left` mandated `id` with no source in `coordinator.Event`. | **Added `Event.NodeID`** rather than dropping `id`. The coordinator already holds it (`nodeState.id`) — a plumbing gap, not a missing fact — and it lets a delta be joined against `nodes[]` on the same server-authoritative key the snapshot uses, instead of on a peer-supplied name. |
+| `health_changed.prev_health` had no source; the dashboard remembered it in-process. | **Added `Event.PrevHealth`.** The coordinator performs the transition, so it knows this. In-process memory was wrong across a restart and wrong for a fresh subscriber, whose first transition reported `""`. |
+| `fitness` is a lower bound — `UptimeSec` is unreachable from `MemberSnapshot`. | **Renamed the wire key to `fitness_lower_bound`.** WI-7 was right to refuse to invent an uptime. Renamed rather than footnoted because a value quietly 0.15 too low is *invisibly wrong* — the `EndedAt` lesson (§15.12). Recorded the proper fix (have the **arbiter** expose the score it actually computed) and why it is not taken now: §13.1 already says the inputs are unmeasured, so more precision would be more precisely fictional. |
+| Close code `1008` for "origin rejected" is unreachable. | **Corrected.** `websocket.Accept` refuses the handshake with HTTP **403**, so no socket exists and there is no close code. `1008` keeps the malformed-`op` case. Added the rule that clients must treat **upgrade failure** and **close** as distinct paths, surfacing a 403 as a configuration error naming `-allowed-origins`. |
+| The frozen `code` set covered no routing failure. | **Ratified `not_found` (404) and `method_not_allowed` (405).** Additive and non-breaking. WI-7 was right not to reuse `meet_not_found`/`bad_request`: those are semantic failures about a meet or a body, these are routing failures about a URL, and collapsing them would make a typo'd path indistinguishable from a genuinely missing meet. |
+| `reparent.self_promoted` is constant `true`. | **Removed.** `EventReparent` is emitted only from the self-promotion path by construction; a coordinator-decided move arrives as `failover` + `topology`. Third instance of this trap, after `Meet.EndedAt` (§15.12) and the impairment void (§15.11). If a coordinator-decided reparent ever needs an event, add the **kind**, not a discriminator field that only ever takes one value. |
+
+### 15.15 Process finding: a ratified change that is not routed
+
+`arbiter.Meet.EndedAt` survived three rounds after v2.4 deleted it, because v2.4 landed after
+WI-5 had finished and the delta was never forwarded. That much is an ordinary miss. The
+instructive part is the **second-order failure it produced**:
+
+`ListEndedMeets` had been returning **reap order**, which *accidentally* satisfied §8.1's
+newest-first rule — but only while `EndedAt` **was** reap time. So correcting the timestamp
+(§15.12 item 2) silently broke the ordering, and the dashboard iterates `ended` exactly as
+given. Two specifications had been agreeing **by coincidence**, and fixing one of them was
+what revealed the other had never been implemented. WI-5 also corrected its own earlier report,
+which had claimed v2.4 item 5 was done when it had only coincidentally held.
+
+> **A contract change that is ratified but not routed is indistinguishable from one that was
+> never made** — and worse, it can leave *coincidental* correctness that fails later, so the
+> defect surfaces as a second, unrelated-looking bug rather than as the missing edit.
+
+The check this argues for is not "did the edit land". It is: **when a value's meaning changes,
+ask what depended on the old meaning's incidental properties.** Reap-time `EndedAt` happened to
+be monotonic in insertion order; wall-clock `EndedAt` is not. Nothing in either specification
+said the ordering depended on that, which is precisely why it went unnoticed.
+
+Recorded here rather than in a limitations section because it is a **process** finding, and the
+process is part of what this document is for.
+
+### 15.16 Where I think a reviewer is wrong
 
 - **"`Supersedes` should be deleted."** Not taken. It is genuinely needed for *ordering* —
   the coordinator sequencing its own trees, the dashboard detecting a stale snapshot. The
@@ -4862,5 +4995,5 @@ the follow-up is visible rather than assumed.
 
 ---
 
-*This document is FROZEN at v2.5. Amendments go through the owner, in this file, recorded in
+*This document is FROZEN at v2.6. Amendments go through the owner, in this file, recorded in
 §15. Implementers: build what is written, and report what is wrong.*
