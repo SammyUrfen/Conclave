@@ -365,13 +365,16 @@ func TestCoordinatorConfigExcludesPerNodeFields(t *testing.T) {
 // TestZeroIsAChoiceNotAnAbsence is the fix for a defect the announcement must not
 // inherit.
 //
-// coordinator.Config uses 0 to mean "use the package default" for StickinessMs, Dwell,
-// RecomputeCooldown and JoinSettle. But 0 is ALSO a meaningful value for every one of
-// them — memoryless re-parenting, no hysteresis, no anti-thrash floor, build
-// immediately — so an operator asking for one silently gets the other. (That is live on
-// the server today: -stickiness-ms 0 is documented and validated as "memoryless" and
-// yields 25.) It is the same shape as a boolean whose polarity is inverted: a value that
-// carries meaning colliding with a convention that treats it as absent.
+// coordinator.Config uses 0 to mean "use the package default" — still, today, for Dwell,
+// RecomputeCooldown and JoinSettle. But 0 is ALSO a meaningful value for each of them —
+// no hysteresis, no anti-thrash floor, build immediately — so an operator asking for one
+// silently gets the other. It is the same shape as a boolean whose polarity is inverted:
+// a value that carries meaning colliding with a convention that treats it as absent.
+//
+// StickinessMs is where that bit for real (-stickiness-ms 0 was validated as memoryless
+// and yielded 25) and it has since been fixed at the source with a *float64. The wire
+// does not inherit that pointer: here every value is already resolved, so absence has
+// nothing left to mean.
 //
 // The announcement must not bake that ambiguity into a wire format, where every future
 // reader would have to know which of the two a 0 meant. The representation chosen is
