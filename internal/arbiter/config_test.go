@@ -16,6 +16,7 @@ import (
 // neighbour's value or a coincidental default.
 func tuning() arbiter.CoordinatorConfig {
 	return arbiter.CoordinatorConfig{
+		Resolved:            true,
 		MaxDepth:            3,
 		StreamKbps:          1500,
 		DefaultUploadKbps:   250,
@@ -170,6 +171,15 @@ func TestCoordinatorConfigValidate(t *testing.T) {
 		wantErr string
 	}{
 		{name: "fully populated", mutate: func(*arbiter.CoordinatorConfig) {}},
+		{
+			// The quiet failure. An operator who tuned only the fields that fail
+			// LOUDLY leaves the rest at Go's zero, which every consumer would read as
+			// "use the default" — silently retuning the meet on handover. Resolved is
+			// what makes "I chose these values" distinguishable from "I forgot".
+			name:    "unresolved",
+			mutate:  func(c *arbiter.CoordinatorConfig) { c.Resolved = false },
+			wantErr: "resolved",
+		},
 		{
 			name:    "zero StreamKbps",
 			mutate:  func(c *arbiter.CoordinatorConfig) { c.StreamKbps = 0 },
@@ -338,5 +348,133 @@ func TestCoordinatorConfigExcludesPerNodeFields(t *testing.T) {
 		if _, ok := ct.FieldByName(banned); ok {
 			t.Errorf("CoordinatorConfig.%s: not a property of the meet", banned)
 		}
+	}
+}
+
+// TestZeroIsAChoiceNotAnAbsence is the fix for a defect the announcement must not
+// inherit.
+//
+// coordinator.Config uses 0 to mean "use the package default" for StickinessMs, Dwell,
+// RecomputeCooldown and JoinSettle. But 0 is ALSO a meaningful value for every one of
+// them — memoryless re-parenting, no hysteresis, no anti-thrash floor, build
+// immediately — so an operator asking for one silently gets the other. (That is live on
+// the server today: -stickiness-ms 0 is documented and validated as "memoryless" and
+// yields 25.) It is the same shape as a boolean whose polarity is inverted: a value that
+// carries meaning colliding with a convention that treats it as absent.
+//
+// The announcement must not bake that ambiguity into a wire format, where every future
+// reader would have to know which of the two a 0 meant. The representation chosen is
+// that ABSENCE IS NOT REPRESENTABLE PER FIELD: every value is the resolved effective
+// one, and a single struct-level Resolved flag distinguishes a configuration someone
+// filled in from one nobody did.
+func TestZeroIsAChoiceNotAnAbsence(t *testing.T) {
+	// memoryless is a deliberately-chosen configuration whose values are all the ones
+	// a zero-means-default convention would silently overwrite.
+	memoryless := func() arbiter.CoordinatorConfig {
+		c := tuning()
+		c.StickinessMs = 0
+		c.DwellMs, c.RecomputeCooldownMs, c.JoinSettleMs = 0, 0, 0
+		return c
+	}
+
+	t.Run("a deliberately zero config is valid", func(t *testing.T) {
+		if err := memoryless().Validate(); err != nil {
+			t.Fatalf("Validate() = %v, want nil — every one of these zeros is a real choice", err)
+		}
+	})
+
+	t.Run("the arbiter announces the chosen zeros, not defaults", func(t *testing.T) {
+		cfg := electing()
+		cfg.CoordinatorConfig = memoryless()
+		h := newHarness(t, cfg)
+		h.join("m", "p1", strong("alice"))
+
+		got := h.lastAnn("m").Config
+		if got != memoryless() {
+			t.Fatalf("Config = %+v, want %+v", got, memoryless())
+		}
+		// Named individually so a failure says which knob was overwritten.
+		if got.StickinessMs != 0 {
+			t.Errorf("StickinessMs = %v, want 0 (memoryless), not a substituted default", got.StickinessMs)
+		}
+		if got.DwellMs != 0 || got.RecomputeCooldownMs != 0 || got.JoinSettleMs != 0 {
+			t.Errorf("durations = %d/%d/%d, want all 0 as chosen",
+				got.DwellMs, got.RecomputeCooldownMs, got.JoinSettleMs)
+		}
+	})
+
+	t.Run("a chosen zero survives the wire distinguishably from an unset config", func(t *testing.T) {
+		chosen, err := json.Marshal(memoryless())
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		unset, err := json.Marshal(arbiter.CoordinatorConfig{})
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		if string(chosen) == string(unset) {
+			t.Fatal("a deliberately-zero config is byte-identical to an unset one; the " +
+				"wire cannot express the difference")
+		}
+		var back arbiter.CoordinatorConfig
+		if err := json.Unmarshal(chosen, &back); err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if !back.Resolved || back.StickinessMs != 0 {
+			t.Errorf("round-tripped = %+v, want Resolved with a zero StickinessMs", back)
+		}
+	})
+
+	t.Run("the loud fields alone are not enough", func(t *testing.T) {
+		// Exactly the shipped hazard: an operator sets what BuildTree hard-errors on
+		// and leaves everything else at Go's zero. It must not read as a valid
+		// configuration, because every quiet field would then be defaulted by the
+		// receiver and the meet retuned on handover.
+		partial := arbiter.CoordinatorConfig{MaxDepth: 2, StreamKbps: 2000}
+		if err := partial.Validate(); err == nil {
+			t.Fatal("Validate accepted a config with only the loud fields set")
+		}
+	})
+
+	t.Run("derive-per-node thresholds need no present flag", func(t *testing.T) {
+		// DegradedAfterMs/GoneAfterMs are the genuine exception the ruling allows to
+		// stay bare: there 0 ALREADY means "derive per node from the cadence each peer
+		// declared", and an explicit zero threshold would be nonsense (every peer
+		// instantly gone). So the two meanings do not collide and there is no
+		// tri-state to express.
+		c := tuning()
+		c.DegradedAfterMs, c.GoneAfterMs = 0, 0
+		if err := c.Validate(); err != nil {
+			t.Fatalf("Validate() = %v, want nil", err)
+		}
+		if c.DegradedAfter() != 0 || c.GoneAfter() != 0 {
+			t.Error("a zero threshold became non-zero; 'derive per node' would be lost")
+		}
+	})
+}
+
+// TestResolvedIsRequiredToAnnounceUsefully ties the flag to the symptom: an arbiter
+// handed an unresolved config announces one, and a peer building a coordinator from it
+// would run with defaults nobody chose.
+func TestResolvedIsRequiredToAnnounceUsefully(t *testing.T) {
+	cfg := electing()
+	cfg.CoordinatorConfig = arbiter.CoordinatorConfig{MaxDepth: 2, StreamKbps: 2000}
+	h := newHarness(t, cfg)
+	h.join("m", "p1", strong("alice"))
+
+	got := h.lastAnn("m").Config
+	if got.Resolved {
+		t.Error("Resolved = true on a config the operator never filled in")
+	}
+	if err := got.Validate(); err == nil {
+		t.Error("Validate accepted the announced config; startup had nothing to fail on")
+	}
+	// The arbiter still announces it rather than refusing: an arbiter that will not
+	// start is worse than one that says why every meet is misconfigured.
+	if h.meet("m").Coordinator != "alice" {
+		t.Error("the election was blocked by a bad config; it should warn, not refuse")
+	}
+	if n := h.logs.count("coordinator configuration is unusable"); n != 1 {
+		t.Errorf("warnings = %d, want exactly 1 at construction", n)
 	}
 }
