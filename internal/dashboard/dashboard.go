@@ -35,6 +35,43 @@ const APIVersion = 1
 // is written.
 const eventBuffer = 32
 
+// snapshotMinInterval is the minimum spacing between two reads of the SAME meet's
+// control state out of the coordinator (and of the meet list out of the arbiter).
+//
+// Both reads round-trip a single Run goroutine that also drives heartbeats, dwell
+// timers and rebuilds, and both are reachable unauthenticated — GET /api/meets/{id}
+// needs no socket at all. Without a bound, request rate IS control-plane load, which
+// undoes the care the coordinator took to move its outbound sends off that goroutine.
+//
+// 250 ms is chosen against the rate the underlying state can actually change:
+// metrics.HeartbeatInterval is 1 s, so telemetry advances at 1 Hz and a view bounded to
+// 250 ms behind can never be the reason a dashboard looks stale. It converts an
+// unbounded amplifier into at most 4 round-trips per second per meet, and the cost is
+// visible rather than hidden — every snapshot carries at_unix_ms, so a client can see
+// exactly how old the answer is.
+const snapshotMinInterval = 250 * time.Millisecond
+
+// resyncMinInterval is the minimum spacing between two honoured {"op":"resync"} frames
+// on ONE connection. A legitimate client sends one per seq-gap episode; a loop of them
+// costs a frame, an encode and a sequence number each. Excess requests are DROPPED
+// rather than closing the socket, because a client hitting genuine repeated gaps is
+// recovering, not misbehaving — and 1 s still lets it recover promptly.
+const resyncMinInterval = time.Second
+
+// maxSubscribersPerMeet caps live event streams per meet.
+//
+// The resource being bounded is not memory: Publish walks every subscriber of a meet
+// under this package's mutex, ON THE COORDINATOR'S RUN GOROUTINE, so subscriber count is
+// per-event work on the control plane and an unbounded set is attacker-chosen work
+// there. 64 is far above any plausible number of operators watching one demo meet and
+// far below anything that could make a fan-out noticeable.
+//
+// Deliberately NOT a per-IP cap as well: an attacker with a handful of addresses defeats
+// one trivially, while a legitimate audience behind a single NAT or corporate proxy
+// shares an address and would be locked out. The per-meet cap bounds the actual resource
+// without that false positive.
+const maxSubscribersPerMeet = 64
+
 // maxTrackedMeets bounds the per-meet stream state (subscriber set, stale-rejection
 // count, last-seen epoch/rev, per-node health history) this package keeps.
 //
