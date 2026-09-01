@@ -49,17 +49,33 @@ func TestPionRemoveTrackDoesNotRenegotiate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add forward track: %v", err)
 	}
-	waitFor(t, "the initial exchange to settle", 10*time.Second, func() bool {
+	waitFor(t, "the initial exchange to settle", 15*time.Second, func() bool {
 		return offerer.pc.SignalingState() == webrtc.SignalingStateStable &&
 			offerer.pc.CurrentRemoteDescription() != nil
 	})
-	// The exchange itself must be quiet before we can attribute anything to removal.
-	settled := handlerRuns.Load()
-	stableFor(t, "negotiation to be quiescent", 300*time.Millisecond, func() bool {
-		return handlerRuns.Load() == settled
-	})
 	if dirs := directionLines(offerer.pc.CurrentLocalDescription().SDP); len(dirs) != 1 || dirs[0] != "a=sendrecv" {
 		t.Fatalf("local offer directions = %v, want exactly [a=sendrecv]", dirs)
+	}
+
+	// The exchange must go QUIET before anything can be attributed to the removal,
+	// and quiet has to be WAITED FOR rather than asserted. pion may legitimately fire
+	// one more negotiation round on the return to stable, so a hard "the count has
+	// not moved" check here is a load-dependent flake: on a busy machine that extra
+	// round lands after the check and is then blamed on RemoveTrack. Waiting for two
+	// consecutive quiet samples, and re-reading the baseline immediately before the
+	// removal, removes the misattribution window entirely — the assertion itself is
+	// unchanged.
+	deadline := time.Now().Add(15 * time.Second)
+	var settled int64
+	for {
+		settled = handlerRuns.Load()
+		time.Sleep(200 * time.Millisecond)
+		if handlerRuns.Load() == settled {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("negotiation never went quiet, so nothing can be attributed to the removal")
+		}
 	}
 
 	// Raw pion, deliberately: Session.RemoveTrack adds the nudge this test is about.

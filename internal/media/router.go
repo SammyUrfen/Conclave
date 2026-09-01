@@ -188,6 +188,29 @@ func NewRouter(log *slog.Logger, client *signaling.Client, cfg RouterConfig) *Ro
 		nameByID: make(map[string]string),
 		idByName: make(map[string]string),
 	}
+	// Seed the realized parent for a STATIC tree. In managed mode this field is
+	// maintained by applyTopology and the re-parent state machine, but neither runs
+	// with a hand-authored -topology: applyTopology returns early for a non-managed
+	// Router, so nothing would ever write it and it would stay "".
+	//
+	// The consequence is not a missing value, it is a WRONG EDGE. Realized sorts
+	// each session into parent / pending / child, and with an empty parent the real
+	// parent falls through to the child arm — so a static leaf reports "no parent"
+	// and names its own parent as its child, and anything rebuilding a tree from
+	// that heartbeat points it backwards. Every field is populated and well-formed,
+	// which is what makes it silent.
+	//
+	// Seeding here is safe without setParent's lock: NewRouter runs before any
+	// goroutine exists, and a static topology never changes, so this is written once
+	// and read-only thereafter. (Rejected: making Realized fall back to
+	// topo.ParentOf when the field is empty. It would paper over an uninitialised
+	// field with a second source of truth, and the whole value of the
+	// parent/pending/child split is that ONE field is authoritative about what is
+	// realized — a fallback to what the tree *says* is exactly the intent-not-fact
+	// answer this method exists to avoid.)
+	if cfg.Topology != nil {
+		r.parentInUse = cfg.Topology.ParentOf(cfg.SelfName)
+	}
 	// Create the forwarder now if this peer is (static tree) or may become (managed)
 	// a relay. Building it up front — rather than lazily when a pushed topology first
 	// promotes a managed leaf — keeps r.fwd write-once and so free of any read/write
