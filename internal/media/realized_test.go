@@ -194,3 +194,54 @@ func TestRouterRealizedReportsUnconnectedEdges(t *testing.T) {
 			"pending new parent must not be", children, want)
 	}
 }
+
+// TestRouterRealizedChildOrder makes the ordering guarantee a DETERMINISTIC
+// assertion rather than a probabilistic one.
+//
+// The integration test above pins the order too, but with two children an unsorted
+// implementation still passes about half the time — Go randomises map iteration per
+// range, so a two-element map is a coin flip. Here the peer map holds five children
+// inserted in reverse order and Realized is called many times: an implementation
+// that returns map order has a 1/120 chance of looking sorted on any one call, so
+// across the repeats it is caught with certainty, while a sorted implementation
+// passes every time.
+//
+// Ordering is not cosmetic. A new coordinator rebuilds Topology.Edges from these
+// frames, and edge order is a replayed invariant of the stability-preserving builder
+// — so an unordered slice here would make the first tree of every epoch depend on
+// nothing but the hash seed.
+func TestRouterRealizedChildOrder(t *testing.T) {
+	r := NewRouter(discardLog(), nil, RouterConfig{SelfName: "b", Managed: true})
+	r.mu.Lock()
+	r.parentInUse = "a"
+	r.mu.Unlock()
+
+	// Inserted in descending order, so "insertion order" and "sorted" disagree.
+	for _, name := range []string{"e", "d", "c", "b2", "a2"} {
+		tr, _ := newGatedPair("p-"+name, "self")
+		sess, err := NewSession(SessionConfig{
+			Log: discardLog(), SelfID: "self", PeerID: "p-" + name, Transport: tr,
+		})
+		if err != nil {
+			t.Fatalf("new session for %s: %v", name, err)
+		}
+		t.Cleanup(func() { _ = sess.Close() })
+		r.learnPeer("p-"+name, name)
+		r.mu.Lock()
+		r.peers["p-"+name] = &peerLink{session: sess, cancel: func() {}}
+		r.mu.Unlock()
+	}
+
+	want := []string{"a2", "b2", "c", "d", "e"}
+	const repeats = 30 // (1/120)^-1 per call; 30 makes a map-order implementation certain to fail
+	for i := 0; i < repeats; i++ {
+		_, _, children := r.Realized()
+		got := make([]string, 0, len(children))
+		for _, ch := range children {
+			got = append(got, ch.Name)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("call %d: children = %v, want %v (ascending by name)", i, got, want)
+		}
+	}
+}
