@@ -305,7 +305,8 @@ func TestAdoptAnnouncementAuthorizes(t *testing.T) {
 
 	t.Run("adopting authorizes exactly the named coordinator", func(t *testing.T) {
 		var f overlay.Fence
-		if !adoptAnnouncement(testLogger(), "relay", f.AdoptAnnouncement, announcement(2, "relay", "p3")) {
+		adopted, _ := adoptAnnouncement(testLogger(), selfID("p3"), f.AdoptAnnouncement, announcement(2, "relay", "p3"))
+		if !adopted {
 			t.Fatal("a fresh announcement was not adopted")
 		}
 		if ok, reason := f.Accept("p3", push(2, 1)); !ok {
@@ -330,11 +331,11 @@ func TestAdoptAnnouncementAuthorizes(t *testing.T) {
 
 	t.Run("a stale or duplicate epoch is not adopted", func(t *testing.T) {
 		var f overlay.Fence
-		adoptAnnouncement(testLogger(), "relay", f.AdoptAnnouncement, announcement(5, "relay", "p3"))
-		if adoptAnnouncement(testLogger(), "relay", f.AdoptAnnouncement, announcement(5, "leaf-a", "p7")) {
+		adoptAnnouncement(testLogger(), selfID("p3"), f.AdoptAnnouncement, announcement(5, "relay", "p3"))
+		if dup, _ := adoptAnnouncement(testLogger(), selfID("p3"), f.AdoptAnnouncement, announcement(5, "leaf-a", "p7")); dup {
 			t.Error("a duplicate epoch was adopted; a peer must not be re-pointed inside a term")
 		}
-		if adoptAnnouncement(testLogger(), "relay", f.AdoptAnnouncement, announcement(4, "leaf-a", "p7")) {
+		if stale, _ := adoptAnnouncement(testLogger(), selfID("p3"), f.AdoptAnnouncement, announcement(4, "leaf-a", "p7")); stale {
 			t.Error("a stale epoch was adopted")
 		}
 		if f.CoordinatorID != "p3" {
@@ -344,14 +345,124 @@ func TestAdoptAnnouncementAuthorizes(t *testing.T) {
 
 	t.Run("a malformed body is dropped, not fatal", func(t *testing.T) {
 		called := false
-		got := adoptAnnouncement(testLogger(), "relay",
+		got, _ := adoptAnnouncement(testLogger(), selfID("p3"),
 			func(uint64, string) bool { called = true; return true },
 			[]byte("{not json"))
 		if got || called {
 			t.Error("a malformed announcement must not reach the fence")
 		}
 	})
+
+	// Self-recognition is by SERVER-ASSIGNED ID, never by -name. An announcement
+	// names the coordinator by id, so a peer comparing it against its own name could
+	// never recognise itself and would silently decline the job it was just given.
+	t.Run("self-recognition is by id", func(t *testing.T) {
+		cases := []struct {
+			name     string
+			id       string
+			wantSelf bool
+		}{
+			{name: "this peer was named", id: "p3", wantSelf: true},
+			{name: "another peer was named", id: "p7"},
+			// SelfID is "" until the joined frame lands; "not me" is the safe
+			// answer in that window, not a match against the empty coordinator id
+			// of a vacancy announcement.
+			{name: "before the joined frame", id: ""},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				var f overlay.Fence
+				_, self := adoptAnnouncement(testLogger(), selfID(tc.id), f.AdoptAnnouncement,
+					announcement(1, "relay", "p3"))
+				if self != tc.wantSelf {
+					t.Errorf("self = %v, want %v", self, tc.wantSelf)
+				}
+			})
+		}
+	})
 }
+
+// selfID builds the id provider adoptAnnouncement takes, so a test can pin the
+// window before the joined frame lands as easily as a steady-state id.
+func selfID(id string) func() string { return func() string { return id } }
+
+// TestRealizedBeat pins the heartbeat's REALIZED half: what this peer has actually
+// connected, which is what a coordinator promoted mid-call rebuilds the previous
+// tree from (§6.6). Every field must pass through verbatim — a beat that reports
+// intent instead of fact re-introduces the divergence rebuild-from-peers exists to
+// avoid.
+func TestRealizedBeat(t *testing.T) {
+	tests := []struct {
+		name string
+		src  fakeOverlay
+		want metrics.Heartbeat
+	}{
+		{
+			name: "a relay reports its parent and its children",
+			src: fakeOverlay{
+				fence:  overlay.Fence{Epoch: 4, CoordinatorID: "p1", Rev: 9},
+				parent: "root", state: "connected",
+				children: []metrics.ChildLink{{Name: "leaf-a", State: "connected"}, {Name: "leaf-b", State: "connecting"}},
+			},
+			want: metrics.Heartbeat{
+				Epoch: 4, Rev: 9, Parent: "root", ParentState: "connected",
+				Children: []metrics.ChildLink{{Name: "leaf-a", State: "connected"}, {Name: "leaf-b", State: "connecting"}},
+			},
+		},
+		{
+			name: "a leaf reports no children",
+			src:  fakeOverlay{fence: overlay.Fence{Epoch: 4, Rev: 9}, parent: "relay", state: "connecting"},
+			want: metrics.Heartbeat{Epoch: 4, Rev: 9, Parent: "relay", ParentState: "connecting"},
+		},
+		{
+			// The pending target of a re-parent in flight is neither parent nor
+			// child, and media reports it as neither. cmd/peer must NOT invent it:
+			// filling it in as a child would hand the coordinator an edge pointing
+			// the wrong way — our future parent listed as our current child.
+			name: "a re-parent in flight still reports the OLD parent",
+			src: fakeOverlay{
+				fence:  overlay.Fence{Epoch: 5, Rev: 2},
+				parent: "old-relay", state: "disconnected",
+				children: []metrics.ChildLink{{Name: "leaf-c", State: "connected"}},
+			},
+			want: metrics.Heartbeat{
+				Epoch: 5, Rev: 2, Parent: "old-relay", ParentState: "disconnected",
+				Children: []metrics.ChildLink{{Name: "leaf-c", State: "connected"}},
+			},
+		},
+		{
+			name: "the root has no parent",
+			src:  fakeOverlay{fence: overlay.Fence{Epoch: 1, Rev: 1}, children: []metrics.ChildLink{{Name: "relay", State: "connected"}}},
+			want: metrics.Heartbeat{Epoch: 1, Rev: 1, Children: []metrics.ChildLink{{Name: "relay", State: "connected"}}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := realizedBeat(&tt.src); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("realizedBeat =\n\t%+v\nwant\n\t%+v", got, tt.want)
+			}
+		})
+	}
+}
+
+// fakeOverlay is a stand-in for media.Router's two read-only accessors. The
+// compile-time assertion below is what keeps the fake honest: if the real Router's
+// signatures drift, cmd/peer stops building rather than quietly beating stale data.
+type fakeOverlay struct {
+	fence    overlay.Fence
+	parent   string
+	state    string
+	children []metrics.ChildLink
+}
+
+func (f *fakeOverlay) Fence() overlay.Fence { return f.fence }
+func (f *fakeOverlay) Realized() (string, string, []metrics.ChildLink) {
+	return f.parent, f.state, f.children
+}
+
+var _ overlayReporter = (*fakeOverlay)(nil)
+var _ overlayReporter = (*media.Router)(nil)
 
 func TestShouldBeat(t *testing.T) {
 	tests := []struct {
@@ -620,6 +731,22 @@ func recvBeat(t *testing.T, ch <-chan metrics.Heartbeat) metrics.Heartbeat {
 	}
 }
 
+// waitForSlow is waitFor with a deadline sized for real ICE on loopback rather than
+// for a goroutine handoff. Split from waitFor so the fast assertions keep a tight
+// deadline: a 30 s budget everywhere would turn a genuine hang into a slow test
+// instead of a failure.
+func waitForSlow(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
 // waitFor polls cond until it holds or the deadline passes. Polling is the right
 // tool for the handful of assertions here that straddle a goroutine boundary the
 // virtual clock does not itself synchronise (a ticker being armed, a queue
@@ -749,6 +876,12 @@ func (o *captureObserver) count(t signaling.Type) int {
 	return len(o.seen[t])
 }
 
+func (o *captureObserver) all(t signaling.Type) [][]byte {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([][]byte(nil), o.seen[t]...)
+}
+
 func (o *captureObserver) last(t signaling.Type) []byte {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -769,4 +902,167 @@ func (o *captureObserver) Heartbeat(_, _ string, payload []byte) {
 }
 func (o *captureObserver) Reparented(_, _ string, payload []byte) {
 	o.record(signaling.TypeReparented, payload)
+}
+
+// TestPeerReportsRealizedTreeOnTheWire is the end-to-end proof for the REALIZED half
+// of the heartbeat — the last piece of §6.6.
+//
+// It drives the real Phase 5 path: three MANAGED peers join, the test plays arbiter
+// (broadcasting a coordinator announcement) and coordinator (pushing a tree), the
+// peers fence it, apply it, negotiate real PeerConnections, and then the assertions
+// read what the server's Observer actually received. The relay must name both its
+// children, ascending BY NAME, and each leaf must name the relay as its parent with
+// a genuine pion connection state.
+//
+// Nothing here is mocked at the wire, because "the realized fields never leave the
+// process" is precisely the bug being excluded — and it is the bug that makes a
+// Phase 6 handover report ReasonNoRealizedState and degrade to a full rebuild
+// instead of reconstructing the tree it already had.
+func TestPeerReportsRealizedTreeOnTheWire(t *testing.T) {
+	const room = "realized-test"
+
+	obs := &captureObserver{}
+	hub := signaling.NewHub(testLogger())
+	hub.SetObserver(obs)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /ws", hub.ServeWS)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	// Cancel BEFORE joining, in one defer: the peers only return once their context
+	// is cancelled, so the reverse order would deadlock every failure path.
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
+
+	// leaf-b first, then leaf-a, then the relay: joining out of alphabetical order is
+	// what makes the ordering assertion mean something.
+	for _, name := range []string{"leaf-b", "leaf-a", "relay"} {
+		opts, err := parseArgs([]string{
+			"-call", "-managed", "-name", name,
+			"-server", srv.URL, "-room", room, "-heartbeat", "50ms",
+		})
+		if err != nil {
+			t.Fatalf("parseArgs(%s): %v", name, err)
+		}
+		wg.Add(1)
+		go func() { defer wg.Done(); _ = runCall(ctx, testLogger(), opts.cfg) }()
+	}
+
+	waitForSlow(t, "all three peers to join the meet", func() bool {
+		return len(hub.Roster(room)) == 3
+	})
+
+	// The test is the arbiter. Without this the peers' fences stay at the zero value
+	// and reject every push — the exact silent failure §6.5 describes — so the
+	// announcement is load-bearing here, not scene-setting.
+	ann, err := json.Marshal(arbiter.Announcement{
+		RoomID: room, Epoch: 1, Coordinator: "", CoordinatorID: signaling.ServerID,
+		Reason: arbiter.ReasonBootstrap,
+	})
+	if err != nil {
+		t.Fatalf("marshal announcement: %v", err)
+	}
+	if n := hub.SendRoom(room, signaling.Message{Type: signaling.TypeCoordinator, Payload: ann}); n != 3 {
+		t.Fatalf("announcement reached %d peers, want 3", n)
+	}
+
+	// The test is also the coordinator: relay is the root, serving both leaves.
+	tree, err := json.Marshal(overlay.Topology{
+		Epoch: 1, Rev: 1, Root: "relay",
+		Edges: []overlay.Edge{{Parent: "relay", Child: "leaf-a"}, {Parent: "relay", Child: "leaf-b"}},
+	})
+	if err != nil {
+		t.Fatalf("marshal topology: %v", err)
+	}
+	for _, p := range hub.Roster(room) {
+		if !hub.SendTo(room, p.ID, signaling.Message{Type: signaling.TypeTopology, Payload: tree}) {
+			t.Fatalf("could not push the tree to %s", p.Name)
+		}
+	}
+
+	// Real ICE on loopback needs a moment; at a 50 ms cadence the heartbeat carrying
+	// the settled state follows promptly once the edges connect.
+	waitForSlow(t, "every peer to report a connected realized tree", func() bool {
+		relay, ok := lastHeartbeatFrom(t, obs, "relay")
+		if !ok || len(relay.Children) != 2 {
+			return false
+		}
+		for _, c := range relay.Children {
+			if c.State != connectedState {
+				return false
+			}
+		}
+		for _, leaf := range []string{"leaf-a", "leaf-b"} {
+			hb, ok := lastHeartbeatFrom(t, obs, leaf)
+			if !ok || hb.Parent != "relay" || hb.ParentState != connectedState {
+				return false
+			}
+		}
+		return true
+	})
+
+	relay := mustHeartbeatFrom(t, obs, "relay")
+	wantChildren := []metrics.ChildLink{
+		{Name: "leaf-a", State: connectedState},
+		{Name: "leaf-b", State: connectedState},
+	}
+	if !reflect.DeepEqual(relay.Children, wantChildren) {
+		t.Errorf("relay children = %+v, want %+v (by NAME, ascending)", relay.Children, wantChildren)
+	}
+	if relay.Parent != "" || relay.ParentState != "" {
+		t.Errorf("the root reported a parent: %q/%q", relay.Parent, relay.ParentState)
+	}
+	// The fence half rides the same frame: a coordinator uses it to spot a peer
+	// running behind and re-push to it specifically.
+	if relay.Epoch != 1 || relay.Rev != 1 {
+		t.Errorf("relay reported epoch/rev %d/%d, want 1/1", relay.Epoch, relay.Rev)
+	}
+
+	for _, leaf := range []string{"leaf-a", "leaf-b"} {
+		hb := mustHeartbeatFrom(t, obs, leaf)
+		if hb.Parent != "relay" {
+			t.Errorf("%s parent = %q, want relay (by NAME, not a runtime id)", leaf, hb.Parent)
+		}
+		if hb.ParentState != connectedState {
+			t.Errorf("%s parent_state = %q, want %q", leaf, hb.ParentState, connectedState)
+		}
+		if len(hb.Children) != 0 {
+			t.Errorf("%s reported children %+v; a leaf has none", leaf, hb.Children)
+		}
+	}
+}
+
+// connectedState is pion's PeerConnectionState string for a live edge. Spelled once
+// so the assertions read as intent rather than as a magic literal repeated six times.
+const connectedState = "connected"
+
+// lastHeartbeatFrom returns the most recent heartbeat whose body names peer. The
+// Observer is keyed by the server-assigned id, so the NAME in the payload is what
+// identifies the sender here — which is also the property under test.
+func lastHeartbeatFrom(t *testing.T, obs *captureObserver, name string) (metrics.Heartbeat, bool) {
+	t.Helper()
+	frames := obs.all(signaling.TypeHeartbeat)
+	for i := len(frames) - 1; i >= 0; i-- {
+		var hb metrics.Heartbeat
+		if err := json.Unmarshal(frames[i], &hb); err != nil {
+			continue
+		}
+		if hb.Name == name {
+			return hb, true
+		}
+	}
+	return metrics.Heartbeat{}, false
+}
+
+func mustHeartbeatFrom(t *testing.T, obs *captureObserver, name string) metrics.Heartbeat {
+	t.Helper()
+	hb, ok := lastHeartbeatFrom(t, obs, name)
+	if !ok {
+		t.Fatalf("no heartbeat from %q reached the server", name)
+	}
+	return hb
 }
