@@ -77,14 +77,23 @@ type Backup struct {
 	Parent string `json:"parent"`
 }
 
-// StaticEpoch is the epoch stamped on a hand-authored topology file. It is
-// deliberately the MAXIMUM uint64 rather than 1: a static-tree peer is not
-// participating in the election plane at all, and stamping it max means no
-// coordinator push can ever supersede the operator's explicit file (Supersedes
-// returns false for every real epoch). A peer run with -topology is pinned, by
-// definition. Using 1 instead would let a coordinator on the same server silently
-// overwrite the operator's tree, which is a surprising and hard-to-debug
-// interaction between two modes that are supposed to be independent.
+// StaticEpoch is the epoch stamped on a hand-authored topology file: a SENTINEL marking
+// "this tree came from an operator, not from a coordinator".
+//
+// CORRECTED RATIONALE. An earlier draft justified the max-uint64 value by claiming no
+// coordinator push could ever "supersede" it. That reasoning was wrong, because it read
+// Supersedes as an authorization predicate. What actually protects a static peer is
+// STRUCTURAL and has nothing to do with this constant: a static peer is not managed, so
+// its apply path returns early on every pushed topology, and it never adopts an arbiter
+// announcement, so its Fence stays at the zero value and Fence.Accept rejects
+// everything. The file cannot be overridden because the code path that would override it
+// does not run.
+//
+// The value is kept at max-uint64 for three smaller, honest reasons: it satisfies
+// Validate's Epoch ≥ 1 check; it is instantly recognisable in a log line as
+// "operator-authored" rather than looking like a plausible term number; and if a static
+// tree is ever ORDERED against a computed one (legitimately, for display), the
+// operator's file sorts newest, which is the right display default.
 const StaticEpoch uint64 = ^uint64(0)
 
 // LoadTopology reads and validates a hand-authored tree file (the Phase 3 static
@@ -310,17 +319,41 @@ func (t *Topology) Subtree(name string) []string {
 	return out
 }
 
+// Height returns the number of hops from name down to its deepest descendant — 0 for a
+// leaf, and the same -1 sentinel Depth uses when name is not attached to the tree.
+//
+// It exists for the backup-legality rule, which must bound the depth of the WHOLE
+// subtree that moves on a promotion, not just the promoted node: promoting u under B
+// puts u at Depth(B)+1 and u's deepest descendant at Depth(B)+1+Height(u). Checking only
+// Depth(B) < MaxDepth would let a relay with children be promoted one level deeper and
+// push its own children past the bound.
+func (t *Topology) Height(name string) int {
+	sub := t.Subtree(name)
+	if len(sub) == 0 {
+		return -1
+	}
+	base := t.Depth(name)
+	h := 0
+	for _, n := range sub { // Subtree is BFS-ordered, so this is deterministic
+		if d := t.Depth(n) - base; d > h {
+			h = d
+		}
+	}
+	return h
+}
+
 // Supersedes reports whether t is strictly newer than prev under the lexicographic
 // (Epoch, Rev) order. A nil prev is superseded by anything.
 //
-// It is an ORDERING predicate and nothing more. It does NOT answer "may I accept
-// this topology" — that is a separate authorization question, because only the
-// arbiter may raise an epoch, so a peer must additionally check the sender against
-// the coordinator announced for the epoch it currently believes in, and REJECT a
-// topology carrying a higher epoch than that. Answering authorization here would
-// require the arbiter's announcement, which overlay cannot see and must stay pure
-// of; conflating the two would mean any actor could stamp a huge epoch and be
-// universally adopted.
+// ***It is an ORDERING predicate, NOT an AUTHORIZATION predicate.*** It answers "which
+// of these two trees is more recent". It does NOT answer "may I apply this one".
+// Conflating the two is a privilege-escalation bug: a peer that stamped
+// Epoch = MaxUint64-1 on a self-computed tree would supersede everything, and if
+// Supersedes gated application it would be universally obeyed. Authorization is
+// Fence.Accept, and only that.
+//
+// Call sites, exhaustively: the coordinator, ordering its own successive trees; the
+// dashboard, detecting that a snapshot it holds is stale. NEVER the peer's apply path.
 func (t *Topology) Supersedes(prev *Topology) bool {
 	if prev == nil {
 		return true

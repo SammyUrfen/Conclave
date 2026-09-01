@@ -528,8 +528,12 @@ func TestPickRoot(t *testing.T) {
 			want: "clean",
 		},
 		{
+			// b's budget was raised from 1000 to 4000 when RULING E made eligibility
+			// "can serve one stream": at 1000 kbit/s against a 2000 kbit/s stream cost
+			// the row's answer would now correctly be "", which tests the budget rule
+			// rather than the TURN rule this row is about.
 			name:  "TURN-bound nodes cannot root",
-			nodes: []Node{{Name: "a", UploadKbps: 9000, NAT: NATRelayed}, {Name: "b", UploadKbps: 1000}},
+			nodes: []Node{{Name: "a", UploadKbps: 9000, NAT: NATRelayed}, {Name: "b", UploadKbps: 4000}},
 			want:  "b",
 		},
 		{

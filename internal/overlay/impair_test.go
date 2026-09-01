@@ -149,6 +149,45 @@ func TestImpairmentIsASoftFilter(t *testing.T) {
 	}
 }
 
+// TestImpairedIncumbentGetsNoProtection isolates rank 1's impairment clause, which is
+// otherwise INVISIBLE: whenever a healthy candidate exists, rank 0b has already removed
+// the impaired incumbent from the candidate set, so rank 1 never sees it. The clause is
+// observable in exactly one situation — when EVERY candidate is impaired and rank 0b
+// re-admits them all. There, incumbency is still void, so rank 2 picks the best of a bad
+// set rather than defending a parent that has been bad for a full dwell.
+//
+// The RTT margin is deliberately NOT cleared here (90 vs 100 is inside
+// DefaultStickinessMs), so the only thing that can move u is the impairment clause.
+func TestImpairedIncumbentGetsNoProtection(t *testing.T) {
+	fleet := func(impaired bool) []Node {
+		return []Node{
+			{Name: "R", UploadKbps: 8000, Impaired: impaired},
+			{Name: "P", UploadKbps: 8000, Impaired: impaired},
+			{Name: "u", RTT: map[string]float64{"R": 90, "P": 100}},
+		}
+	}
+	prev := &Topology{Epoch: 1, Rev: 1, Root: "R", Edges: []Edge{
+		{Parent: "R", Child: "P"},
+		{Parent: "P", Child: "u"},
+	}}
+	cons := Constraints{Root: "R", MaxDepth: 3, StreamKbps: 2000, Epoch: 1, Rev: 2, StickinessMs: DefaultStickinessMs}
+
+	// Control: healthy incumbents keep u, because a 10 ms win is inside the margin.
+	healthy := mustBuild(t, fleet(false), prev, cons)
+	if got := healthy.ParentOf("u"); got != "P" {
+		t.Fatalf("control: u parent = %q, want P (a 10ms win is inside StickinessMs)", got)
+	}
+
+	nodes := fleet(true)
+	next := mustBuild(t, nodes, prev, cons)
+	if err := Validate(next, nodes, cons); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if got := next.ParentOf("u"); got != "R" {
+		t.Errorf("u parent = %q, want R: an impaired incumbent keeps no protection even when every candidate is impaired", got)
+	}
+}
+
 // TestImpairedNodeIsNeverRooted covers the other two disqualifications an impaired node
 // carries: it may not be root, and it may not be anyone's backup parent.
 func TestImpairedNodeIsNeverRooted(t *testing.T) {

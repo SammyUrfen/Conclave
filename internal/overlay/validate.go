@@ -168,13 +168,17 @@ func validateBackups(t *Topology, byName map[string]Node, c Constraints, parent 
 					i, b.Node, b.Parent, primary)
 			}
 		}
+		if byName[b.Parent].Impaired {
+			return fmt.Errorf("validate: backup %d: %q's backup %q is impaired; insurance written against a degraded relay is not insurance",
+				i, b.Node, b.Parent)
+		}
 		if capacityOf(byName[b.Parent], c) == 0 {
 			return fmt.Errorf("validate: backup %d: %q's backup %q cannot parent anyone (TURN-bound or too little upload)",
 				i, b.Node, b.Parent)
 		}
 		// A promotion sinks the promoted node's WHOLE subtree, so bounding the
 		// backup's own depth is not enough.
-		if d := t.Depth(b.Parent) + 1 + backupHeight(t, b.Node); d > c.MaxDepth {
+		if d := t.Depth(b.Parent) + 1 + t.Height(b.Node); d > c.MaxDepth {
 			return fmt.Errorf("validate: backup %d: promoting %q under %q would put its subtree at depth %d, past MaxDepth %d",
 				i, b.Node, b.Parent, d, c.MaxDepth)
 		}
@@ -193,47 +197,96 @@ func validateBackups(t *Topology, byName map[string]Node, c Constraints, parent 
 	return nil
 }
 
+// Churn describes what happened between two trees. It is a struct rather than a list of
+// []string parameters because the justification classes have already grown twice
+// (promotion, then impairment) and a fifth is plausible: widening a struct is a
+// non-event, widening a signature churns every call site.
+type Churn struct {
+	// Gone departed or were declared gone.
+	Gone []string
+	// Joined arrived.
+	Joined []string
+	// Promoted RE-PARENTED THEMSELVES onto their assigned backup after a parent or edge
+	// failure, and told the coordinator so. Without this class the oracle contradicts
+	// the ratification rule: a peer whose parent was healthy but whose EDGE to it failed
+	// shows a changed parent that neither Gone nor Joined can explain, and a correct
+	// repair is flagged as a defect.
+	Promoted []string
+	// Impaired had their degradation dwell fire this round. Their children lose
+	// incumbency protection by design, so those moves are justified.
+	Impaired []string
+}
+
 // ValidateLocalRepair asserts that next differs from prev only where it had to.
 //
-// gone is the set of node names that departed (or were declared gone) between the
-// two builds; joined is the set that arrived; promoted is the set that re-parented
-// THEMSELVES onto their precomputed backup after a parent or edge failure and told
-// the coordinator so. The property: every node present in BOTH prev and next whose
-// parent CHANGED must be justified — orphaned by something in gone, self-promoted,
-// or its previous parent must have become unusable in next.
+// ***prev MUST BE THE LAST PUBLISHED TREE*** — the tree peers were actually running —
+// NOT the coordinator's patched working copy. Two reasons, the second decisive:
 //
-// prev is the LAST PUBLISHED tree, not the coordinator's patched working copy. That
-// choice matters: the ratification rule has the coordinator patch a self-promotion
-// into its working copy before rebuilding, and validating against the patched copy
-// would make the patch itself unexaminable — the oracle would be asserting against
-// the very belief it is supposed to check. The published tree is what the fleet
-// actually realized, so it is what "did this transition move more peers than it had
-// to?" must be measured from; `promoted` supplies the missing justification.
+//  1. An oracle fed the patched copy is asserting against the very belief it exists to
+//     check. The promotion has already been baked in, so the promoted node shows no
+//     parent change at all, and the oracle can confirm only that the coordinator
+//     believes what it believes.
+//  2. THE PUBLISHED TREE IS THE ONLY ARTIFACT THAT STILL CARRIES THE BACKUP ASSIGNMENT
+//     the promotion must be checked against. Given it, the oracle asserts that a
+//     promoted node moved to *the backup it was actually assigned*. The patched copy has
+//     already overwritten that evidence, so this check is not merely weaker there — it
+//     is impossible.
 //
-// This is deliberately a separate function from Validate: Validate answers "is this
-// tree legal?", which is a property of one tree; this answers "was this change
-// minimal?", which is a property of a TRANSITION. Conflating them would make
-// Validate need a prev it does not otherwise want, and would make the churn
-// assertion silently skippable.
+// There is no double-counting with Churn.Promoted: prev supplies the BEFORE state and
+// the backup assignment; Promoted supplies the justification CLASS for a change that
+// Gone and Joined cannot explain. Different roles, both needed.
 //
-// KNOWN LIMIT, stated because an oracle that hides its blind spot is worse than one
-// that names it: without the fleet's telemetry (which the signature deliberately
-// does not take, so the assertion stays a pure function of the two trees) this
-// cannot see a node whose CAPACITY SHRANK between builds. It therefore assumes
-// capacities are unchanged, which holds for the churn it exists to check — joins,
-// departures, and promotions. A transition driven by a telemetry change is not a
-// local repair and must not be asserted with this.
-func ValidateLocalRepair(prev, next *Topology, gone, joined, promoted []string) error {
+// It takes nodes and Constraints for the same reason Validate does. Minimality is defined
+// relative to the builder's PREFERENCE ORDERING, and rank 2 of that ordering is
+// RTT-aware. An oracle that cannot see RTT cannot evaluate rank 2, so it cannot answer
+// its own question — it flags a legitimate move onto a materially closer parent as
+// gratuitous. That is not a weaker oracle; it is an oracle answering a narrower question
+// than the one it claims to.
+//
+// A node u present in BOTH prev and next whose parent changed P → Q is JUSTIFIED iff any:
+//
+//  1. P is in Churn.Gone, or P is absent from next's node set;
+//  2. u is in Churn.Promoted. When the assigned backup B = prev.BackupOf(u) is still
+//     present and eligible in next, the STRICT form applies — Q must EQUAL B, because a
+//     promoted node must land on the backup it was given, not on an arbitrary node. When
+//     B is absent or ineligible in next (a correlated failure took the backup down too),
+//     the strict form cannot hold, so u falls through to the rules below and the oracle
+//     stays sound instead of firing falsely on a correct repair;
+//  3. P became ineligible in next: TURN-bound, out of capacity, past MaxDepth, or
+//     impaired;
+//  4. the move is what rank 1 permits: rtt(u,Q) + c.StickinessMs < rtt(u,P).
+//
+// LIMIT, stated so nobody over-trusts it: this checks a NECESSARY condition, not a
+// sufficient one. It asserts every move was PERMITTED by the ordering; it does not assert
+// the result was optimal, and it deliberately does NOT assert the converse — that a node
+// which could have improved did move. Greedy makes no such promise (an eligible closer
+// parent may have been filled by an earlier node), so asserting it would fail on correct
+// output.
+//
+// This is deliberately separate from Validate: Validate answers "is this tree legal?", a
+// property of one tree; this answers "was this change minimal?", a property of a
+// TRANSITION. Conflating them would make Validate need a prev it does not otherwise want.
+func ValidateLocalRepair(prev, next *Topology, nodes []Node, c Constraints, ch Churn) error {
 	if prev == nil {
 		return fmt.Errorf("validate local repair: prev is nil; there is no transition to check (a first build has no minimality property)")
 	}
 	if next == nil {
 		return fmt.Errorf("validate local repair: next is nil")
 	}
-	goneSet, joinedSet, promotedSet := setOf(gone), setOf(joined), setOf(promoted)
+	if !next.Supersedes(prev) {
+		return fmt.Errorf("validate local repair: next (epoch %d, rev %d) does not advance prev (epoch %d, rev %d)",
+			next.Epoch, next.Rev, prev.Epoch, prev.Rev)
+	}
+
+	byName := make(map[string]Node, len(nodes))
+	for _, n := range nodes {
+		byName[n.Name] = n
+	}
+	goneSet, joinedSet := setOf(ch.Gone), setOf(ch.Joined)
+	promotedSet, impairedSet := setOf(ch.Promoted), setOf(ch.Impaired)
 	prevNodes, nextNodes := nodeSetOf(prev), nodeSetOf(next)
 
-	for _, g := range gone {
+	for _, g := range ch.Gone {
 		if nextNodes[g] {
 			return fmt.Errorf("validate local repair: departed node %q is still in the new tree", g)
 		}
@@ -251,15 +304,31 @@ func ValidateLocalRepair(prev, next *Topology, gone, joined, promoted []string) 
 
 	// Orphans: everything the departed nodes took down with them.
 	orphan := map[string]bool{}
-	for _, g := range gone {
+	for _, g := range ch.Gone {
 		for _, n := range prev.Subtree(g) {
 			orphan[n] = true
 		}
 	}
 
-	prevChildren := map[string]int{}
-	for _, e := range prev.Edges {
-		prevChildren[e.Parent]++
+	// ineligible reports whether p could not have taken u in next, which is
+	// justification 3. Capacity is judged against the INCUMBENT occupants only: a
+	// newcomer sitting in u's old slot is precisely the displacement the processing
+	// order forbids, so it must not count as a reason u had to leave.
+	ineligible := func(p, u string) bool {
+		node, known := byName[p]
+		if !known {
+			return true
+		}
+		if node.Impaired || impairedSet[p] {
+			return true
+		}
+		if capacityOf(node, c) == 0 {
+			return true
+		}
+		if next.Depth(p) >= c.MaxDepth {
+			return true
+		}
+		return incumbentOccupants(next, p, u, prevNodes, joinedSet)+1 > capacityOf(node, c)
 	}
 
 	for _, e := range prev.Edges { // slice order: a failure is reported reproducibly
@@ -271,22 +340,32 @@ func ValidateLocalRepair(prev, next *Topology, gone, joined, promoted []string) 
 		if now == was {
 			continue
 		}
+		if promotedSet[u] {
+			// Justification 2. The strict form applies only while the assigned backup
+			// could actually have been taken.
+			backup := prev.BackupOf(u)
+			if backup != "" && nextNodes[backup] && !ineligible(backup, u) {
+				if now != backup {
+					return fmt.Errorf("validate local repair: %q self-promoted onto %q but its assigned backup was %q, which was still available",
+						u, now, backup)
+				}
+				continue
+			}
+			// Correlated failure: the backup is gone or unusable, so fall through to
+			// the general rules rather than firing falsely on a correct repair.
+		}
 		switch {
 		case orphan[u]:
 			// Its parent (or an ancestor) is gone; it had to move.
-		case promotedSet[u]:
-			// It moved itself onto its warm backup and the coordinator ratified it.
-		case !nextNodes[was]:
+		case !nextNodes[was] || goneSet[was]:
 			// Its old parent is no longer in the fleet.
-		case next.Depth(was) > prev.Depth(was):
-			// Its old parent sank deeper, so keeping u there may breach MaxDepth.
-		case incumbentOccupants(next, was, u, prevNodes, joinedSet)+1 > prevChildren[was]:
-			// Its old parent has no demonstrated room left: the slots it holds in
-			// next are all taken by nodes that were already in the fleet, so u
-			// could not have stayed without exceeding what that parent ever served.
+		case ineligible(was, u):
+			// Its old parent could not have taken it in the new tree.
+		case rttTo(byName[u], now)+c.StickinessMs < rttTo(byName[u], was):
+			// Justification 4: rank 1 permits a materially closer parent to win.
 		default:
-			return fmt.Errorf("validate local repair: %q moved from %q to %q, but %q survived with room for it (gratuitous re-parent)",
-				u, was, now, was)
+			return fmt.Errorf("validate local repair: %q moved from %q to %q, but %q survived eligible with room for it and was not beaten by %.0fms (gratuitous re-parent)",
+				u, was, now, was, c.StickinessMs)
 		}
 	}
 	return nil

@@ -25,17 +25,21 @@ package overlay
 //
 // Selection among valid candidates, in this exact order:
 //
-//	rank 0  hard: B ∉ Subtree(P); B can parent at all; B's committed load leaves
-//	        room within BackupOvershootAllowance; and promoting u under B keeps u's
-//	        WHOLE SUBTREE within MaxDepth — u's children sink with it, so checking
-//	        only B's own depth would let a promotion push a grandchild out of bounds;
+//	rank 0   hard: B ∉ Subtree(P); B is not Impaired (insurance written against a node
+//	         already classified as degraded is not insurance); B can parent at all;
+//	rank 0b  hard depth bound on the WHOLE moving subtree:
+//	         Depth(B) + 1 + Height(u) ≤ MaxDepth — u's children sink with it, so
+//	         checking only B's own depth would let a promotion push a grandchild out of
+//	         bounds;
+//	rank 0c  hard fan-in bound: B's committed load stays within
+//	         capacityOf(B) + BackupOvershootAllowance;
 //	rank 1  B has spare primary capacity — a failover into spare capacity is
 //	        non-disruptive;
 //	rank 2  B is no deeper than the parent it replaces — keeps u's subtree from
 //	        sinking on failover;
 //	rank 3  minimum RTT from u — the failover target should also be a good parent;
-//	rank 4  fewest committed children, then name ascending — balance, then
-//	        determinism.
+//	rank 4   fewest primary children, then fewest backups already assigned to B, then
+//	         name ascending — balance, then determinism.
 func assignBackups(t *Topology, byName map[string]Node, c Constraints, order []string) []Backup {
 	if len(t.Edges) == 0 {
 		return nil
@@ -45,10 +49,10 @@ func assignBackups(t *Topology, byName map[string]Node, c Constraints, order []s
 	// repeated walks: parents precede children, so one forward pass fixes depth and
 	// one backward pass fixes the height of each node's subtree.
 	depth := map[string]int{t.Root: 0}
-	committed := map[string]int{}
+	children := map[string]int{}
 	for _, e := range t.Edges {
 		depth[e.Child] = depth[e.Parent] + 1
-		committed[e.Parent]++
+		children[e.Parent]++
 	}
 	height := map[string]int{}
 	for i := len(t.Edges) - 1; i >= 0; i-- {
@@ -57,6 +61,10 @@ func assignBackups(t *Topology, byName map[string]Node, c Constraints, order []s
 			height[e.Parent] = h
 		}
 	}
+	// backupLoad is the insurance already written against each node in this pass. It is
+	// tracked SEPARATELY from primary children because rank 4 orders on them
+	// separately, and because rank 0c bounds their sum rather than either alone.
+	backupLoad := map[string]int{}
 
 	subtreeOf := map[string]map[string]bool{}
 	inSubtree := func(parent string) map[string]bool {
@@ -83,11 +91,14 @@ func assignBackups(t *Topology, byName map[string]Node, c Constraints, order []s
 			if excluded[name] {
 				continue // covers u itself, P, u's siblings and every descendant
 			}
+			if byName[name].Impaired {
+				continue // a degraded relay is not insurance
+			}
 			capacity := capacityOf(byName[name], c)
 			if capacity == 0 {
 				continue // TURN-bound or too little upload to parent anyone
 			}
-			if committed[name] >= capacity+BackupOvershootAllowance {
+			if children[name]+backupLoad[name] >= capacity+BackupOvershootAllowance {
 				continue // already promised as much as the overshoot bound allows
 			}
 			if depth[name]+1+height[u] > c.MaxDepth {
@@ -95,10 +106,11 @@ func assignBackups(t *Topology, byName map[string]Node, c Constraints, order []s
 			}
 			cand := backupCandidate{
 				name:     name,
-				spare:    committed[name] < capacity,
+				spare:    children[name] < capacity,
 				noDeeper: depth[name] <= depth[p],
 				rtt:      rttTo(byName[u], name),
-				load:     committed[name],
+				children: children[name],
+				backups:  backupLoad[name],
 			}
 			if best.name == "" || cand.better(best) {
 				best = cand
@@ -108,8 +120,9 @@ func assignBackups(t *Topology, byName map[string]Node, c Constraints, order []s
 			out = append(out, Backup{Node: u, Parent: best.name})
 			// Spend the budget: the next node's search sees this promise, which is
 			// what bounds fan-in. Without it, every child of a dying relay could
-			// name the same backup and promote at once.
-			committed[best.name]++
+			// name the same backup and promote at once, and the overshoot would be
+			// the size of the failed subtree rather than one child.
+			backupLoad[best.name]++
 		}
 	}
 	return out
@@ -122,7 +135,8 @@ type backupCandidate struct {
 	spare    bool
 	noDeeper bool
 	rtt      float64
-	load     int
+	children int
+	backups  int
 }
 
 // better reports whether a outranks b under the ordering documented on
@@ -138,26 +152,11 @@ func (a backupCandidate) better(b backupCandidate) bool {
 	if a.rtt != b.rtt {
 		return a.rtt < b.rtt
 	}
-	if a.load != b.load {
-		return a.load < b.load
+	if a.children != b.children {
+		return a.children < b.children
+	}
+	if a.backups != b.backups {
+		return a.backups < b.backups
 	}
 	return a.name < b.name
-}
-
-// backupHeight is the number of hops from name down to the deepest node in its
-// subtree (0 for a leaf). Exposed as a helper for Validate, which has no build
-// state to reuse and must recompute it from the tree alone.
-func backupHeight(t *Topology, name string) int {
-	sub := t.Subtree(name)
-	if len(sub) == 0 {
-		return 0
-	}
-	base := t.Depth(name)
-	h := 0
-	for _, n := range sub {
-		if d := t.Depth(n) - base; d > h {
-			h = d
-		}
-	}
-	return h
 }
