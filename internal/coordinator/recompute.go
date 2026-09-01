@@ -180,6 +180,27 @@ func (c *Coordinator) commit(rs *roomState, next *overlay.Topology, nodes []over
 		c.unbuildable(rs, "computed tree failed Validate: "+verr.Error())
 		return
 	}
+	if sameShape(rs.published, next) {
+		// The recompute arrived back at the tree the fleet is already running, so
+		// there is nothing to tell anyone. Bumping the revision would cost every peer
+		// a fence check and every relay a diff-and-apply, in exchange for a tree
+		// byte-identical to the one they hold — and when the trigger is a condition
+		// that recomputing cannot fix, doing that on every repetition is the livelock
+		// MaxStrandedRepairs exists to bound. Removing the churn at its source is the
+		// cheaper half of that fix.
+		//
+		// The round still COUNTED: the cooldown restarts and the urgency is spent, so
+		// a suppressed round cannot be used to sidestep the anti-thrash window.
+		c.log.Debug("recompute produced no change; not republishing",
+			slog.String("room_id", rs.id), slog.String("cause", cause),
+			slog.Uint64("rev", rs.rev))
+		rs.lastBuild = c.cfg.Clock.Now()
+		rs.dirty = false
+		rs.urgent = false
+		rs.promotions = make(map[string]string)
+		c.catchUpPushes(rs)
+		return
+	}
 	c.publishTree(rs, next, outcome, reason, cause)
 }
 
@@ -221,7 +242,9 @@ func (c *Coordinator) publishTree(rs *roomState, next *overlay.Topology, outcome
 		if ns.name == "" {
 			continue // unmanaged peer (joined without a name): nothing to push
 		}
-		c.enqueueSend(sendOp{roomID: rs.id, peerID: ns.id, topo: next, gate: rs.gate})
+		if c.enqueueSend(sendOp{roomID: rs.id, peerID: ns.id, topo: next, gate: rs.gate}) {
+			ns.pushedRev = next.Rev
+		}
 	}
 
 	c.publish(rs, Event{Kind: EventTopology, Outcome: outcome, Reason: reason, Topo: next})
@@ -608,4 +631,59 @@ func reconstructObserved(parents map[string]string, epoch uint64) *overlay.Topol
 	// Rev 0 on purpose: this is a BASELINE, not a published tree, and BuildTree refuses
 	// a prev whose revision the new tree does not advance past.
 	return &overlay.Topology{Epoch: epoch, Rev: 0, Root: root, Edges: edges}
+}
+
+// sameShape reports whether next is structurally identical to the tree already
+// published — same root, same edges in the same order, same backup assignment. Epoch and
+// Rev are deliberately ignored: they are what would CHANGE if this were republished, so
+// comparing them would make the answer always false.
+//
+// A nil published tree is never "the same": the first tree of a meet, and the first of a
+// new term, must always go out.
+func sameShape(published, next *overlay.Topology) bool {
+	if published == nil || next == nil {
+		return false
+	}
+	if published.Root != next.Root ||
+		len(published.Edges) != len(next.Edges) ||
+		len(published.Backups) != len(next.Backups) {
+		return false
+	}
+	for i := range next.Edges {
+		if published.Edges[i] != next.Edges[i] {
+			return false
+		}
+	}
+	for i := range next.Backups {
+		if published.Backups[i] != next.Backups[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// catchUpPushes sends the CURRENT published tree to any member that has not received it.
+//
+// It is what makes suppressing a republish safe. A peer reconnecting arrives on a new
+// socket with the same name, so the tree over those names is unchanged and the recompute
+// is suppressed — and without this the returning peer would be told nothing at all,
+// sitting dark in a meet the coordinator considers perfectly healthy. It also repairs
+// the other way a peer can miss a push: a drop on a full outbound queue, which is why
+// pushedRev advances only on a successful enqueue.
+func (c *Coordinator) catchUpPushes(rs *roomState) {
+	if rs.published == nil {
+		return
+	}
+	for _, id := range c.sortedPeerIDs(rs) {
+		ns := rs.nodes[id]
+		if ns.name == "" || ns.pushedRev >= rs.published.Rev {
+			continue
+		}
+		c.log.Debug("catching up a member that has not received the current tree",
+			slog.String("room_id", rs.id), slog.String("peer_id", ns.id),
+			slog.Uint64("has_rev", ns.pushedRev), slog.Uint64("rev", rs.published.Rev))
+		if c.enqueueSend(sendOp{roomID: rs.id, peerID: ns.id, topo: rs.published, gate: rs.gate}) {
+			ns.pushedRev = rs.published.Rev
+		}
+	}
 }

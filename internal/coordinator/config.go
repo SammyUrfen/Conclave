@@ -74,6 +74,42 @@ const (
 	DegradedCPUPct = 90.0
 )
 
+// MaxStrandedRepairs bounds how many times the coordinator will spend an urgent
+// recompute on ONE peer that reports it cannot attach, before it stops trying and says
+// so.
+//
+// WHY A BOUND EXISTS AT ALL. The stranded bypass answers "this peer is receiving
+// nothing, serve it now" — and that is right the first time. But the coordinator's only
+// move is to compute a tree, and a peer can be un-attachable for a reason no tree can
+// fix: if the SOURCE is orphaned, nothing is flowing to hand it, so its confirmation can
+// never arrive however many times it is re-parented. Without a bound the loop is a
+// livelock — recompute, republish, renegotiate, fail, repeat — and it was observed live
+// as rev churn with an error storm underneath it.
+//
+// WHAT COUNTS AS AN ATTEMPT is the load-bearing part: an attempt is UNPRODUCTIVE only
+// when the recompute it triggered published nothing new. If the coordinator had a
+// different tree to offer, the peer has something new to try and the budget resets. So
+// this counts "times I answered and my answer did not change", not "times you
+// complained" — which is what makes it a progress bound rather than a rate limit.
+//
+// 3, because an attempt is cheap for the control plane and expensive for the media
+// plane: each one that DOES change an edge costs that edge a renegotiation and a
+// keyframe wait. Three absorbs a genuine transient — a peer reporting failure once or
+// twice while its old session finishes tearing down — and converges in well under a
+// second on a structural fault, where by construction a fourth identical answer cannot
+// help. Attaching successfully resets it, so this bounds one EPISODE and never a peer.
+const MaxStrandedRepairs = 3
+
+// ReasonUnratifiable is the Event.Reason on the EventUnbuildable that reports a repair
+// loop giving up: the coordinator believes its tree is correct and the peer cannot
+// confirm it.
+//
+// It is an unbuildable OUTCOME rather than a new kind because the audience is the same
+// one §5.9 wrote that outcome for — an operator who has to change something, since no
+// tree the coordinator can compute will fix an orphaned source. The distinct reason is
+// what separates it from an over-constrained fleet, which is a different fix.
+const ReasonUnratifiable = "repair loop gave up: the peer cannot confirm any parent, and recomputing no longer changes the tree"
+
 // ReasonNoEligibleRoot is the Event.Reason a meet carries when overlay.PickRoot
 // found nobody fit to root the tree.
 //

@@ -430,10 +430,22 @@ func TestPublishIsGatedByTheIndependentOracle(t *testing.T) {
 	}
 
 	// And the gate is not simply refusing everything: a legal tree still goes out.
+	//
+	// It has to be a legal tree that DIFFERS from the published one, because commit
+	// also suppresses a republish of a structurally identical tree. Reversing a star's
+	// edges gives exactly that: both parents are the root, so the order is still
+	// topological and the tree is still legal, but it is not the same sequence.
+	d.join("p3", "c", 0)
 	rs := d.c.rooms["r"]
-	valid, err := overlay.BuildTree(nodes, rs.working, cons)
-	if err != nil {
-		t.Fatalf("fixture: %v", err)
+	nodes, _ = d.c.project(rs)
+	pub := rs.published
+	if len(pub.Edges) != 2 {
+		t.Fatalf("fixture: want a two-edge star, got %+v", pub.Edges)
+	}
+	cons.Root, cons.Rev = pub.Root, pub.Rev+1
+	valid := &overlay.Topology{
+		Epoch: pub.Epoch, Rev: pub.Rev + 1, Root: pub.Root,
+		Edges: []overlay.Edge{pub.Edges[1], pub.Edges[0]},
 	}
 	d.c.commit(rs, valid, nodes, cons, OutcomeBuilt, "", "oracle test")
 	if rs.published != valid {
