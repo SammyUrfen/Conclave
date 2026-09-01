@@ -76,13 +76,16 @@ func TestDeriveWorking(t *testing.T) {
 			name:       "a promotion onto a node that is itself gone is ignored",
 			live:       []string{"a", "x", "b", "c"},
 			promotions: map[string]string{"b": "d"},
-			want:       "a>x a>c ",
+			want:       "a>x x>b a>c ",
 		},
 		{
+			// b and d were orphaned by x and are re-admitted at their published
+			// positions AFTER the edges that survived intact — deterministic, and
+			// still parents-first, which is all BuildTree replays it for.
 			name:       "departure and promotion compose",
 			live:       []string{"a", "b", "c", "d"},
 			promotions: map[string]string{"b": "a", "d": "c"},
-			want:       "a>b a>c c>d ",
+			want:       "a>c a>b c>d ",
 		},
 	}
 

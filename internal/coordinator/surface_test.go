@@ -22,12 +22,17 @@ const syncBarrierTrials = 200
 
 // TestSyncIsASoundQuiescenceBarrier is the property simnet.AddBarrier documents and
 // that every deterministic test in this repo rests on: when Sync returns, a timer
-// that has already FIRED must have been fully reacted to.
+// that has already FIRED must have been fully reacted to — including the pushes that
+// reaction produced.
 //
-// The shape is deliberate. The cooldown deadline is armed and then the virtual
-// clock is advanced past it WITHOUT settling, so the wake channel holds a fired
-// value at the exact moment Sync is enqueued. Both are then ready at one parked
-// select — the precise situation Go resolves at random.
+// The shape is deliberate on two counts. The cooldown deadline is armed and then the
+// virtual clock is advanced past it WITHOUT settling, so the wake channel holds a
+// fired value at the exact moment Sync is enqueued: both are ready at one parked
+// select, the precise situation Go resolves at random. And the assertion is made on
+// what the SENDER has received, not on what the coordinator believes — because Sync
+// rides the event queue and then the outbound queue in order, a loop that acked
+// without draining would put its barrier marker AHEAD of the pushes the fired
+// deadline is about to produce, and the marker would come back first.
 func TestSyncIsASoundQuiescenceBarrier(t *testing.T) {
 	h := newHarness(t, baseConfig())
 	h.member("room", "p1", "a", 8000)
@@ -57,6 +62,10 @@ func TestSyncIsASoundQuiescenceBarrier(t *testing.T) {
 
 		if got := h.published("room").Rev; got != armed+1 {
 			t.Fatalf("trial %d: Sync returned before the fired deadline was reacted to; rev %d, want %d",
+				i, got, armed+1)
+		}
+		if got := h.fs.last("p1"); got == nil || got.Rev != armed+1 {
+			t.Fatalf("trial %d: Sync returned before the fired deadline's push reached the Sender; got %+v, want rev %d",
 				i, got, armed+1)
 		}
 	}
@@ -315,5 +324,34 @@ func TestReportRefinesTheTree(t *testing.T) {
 		Root: topo.Root, MaxDepth: 2, StreamKbps: 2000, Epoch: topo.Epoch, Rev: topo.Rev,
 	}); err != nil {
 		t.Fatalf("published tree fails Validate: %v", err)
+	}
+}
+
+// TestNamelessFrameFromAnUnknownPeerIsDropped: the resurrection rule admits an
+// unknown peer from the NAME in its frame body. A frame with no name carries nothing
+// that could be placed in a name-keyed tree, so admitting it would publish a
+// membership event for the empty string and leave an unplaceable record behind.
+func TestNamelessFrameFromAnUnknownPeerIsDropped(t *testing.T) {
+	h := newHarness(t, baseConfig())
+	h.member("room", "p1", "a", 8000)
+	h.member("room", "p2", "b", 0)
+	rev := h.published("room").Rev
+	h.fp.reset()
+
+	h.beat("room", "p9", metrics.Heartbeat{Seq: 1}) // no Name
+	h.report("room", "p8", metrics.Report{})        // no Name
+
+	if n := h.fp.countOf(coordinator.EventMember); n != 0 {
+		t.Fatalf("a nameless frame must not admit a member, got %d member events", n)
+	}
+	if len(h.snapshot("room").Members) != 2 {
+		t.Fatalf("membership must be unchanged, got %+v", h.snapshot("room").Members)
+	}
+	if got := h.published("room").Rev; got != rev {
+		t.Fatalf("nothing to place means nothing to rebuild; rev %d -> %d", rev, got)
+	}
+	// And it must not leave a record behind for a meet nobody is in.
+	if snap := h.snapshot("other"); snap.RoomID != "" {
+		t.Fatalf("a stray frame must not create a meet, got %+v", snap)
 	}
 }

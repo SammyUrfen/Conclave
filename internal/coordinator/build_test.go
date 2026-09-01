@@ -307,20 +307,47 @@ func TestUnbuildableOnlyAfterSettle(t *testing.T) {
 		t.Fatalf("no unbuildable verdict may be reached before the settle closes, got %d", n)
 	}
 	if n := h.fp.countOf(coordinator.EventSettling); n != 1 {
-		t.Fatalf("want exactly one settling event, got %d", n)
-	}
-	ev, _ := h.fp.lastOf(coordinator.EventSettling)
-	if len(ev.Waiting) != 3 {
-		t.Fatalf("EventSettling must name who is being waited on, got %v", ev.Waiting)
-	}
-	for i := 1; i < len(ev.Waiting); i++ {
-		if ev.Waiting[i-1] > ev.Waiting[i] {
-			t.Fatalf("Waiting must be ordered so the dashboard is replayable, got %v", ev.Waiting)
-		}
+		t.Fatalf("EventSettling fires once per transition into ineligibility, not per suppressed event; got %d", n)
 	}
 
 	h.advance(coordinator.JoinSettle + 1)
 	if n := h.fp.countOf(coordinator.EventUnbuildable); n != 1 {
 		t.Fatalf("post-settle, a 0-upload fleet IS unbuildable; got %d", n)
+	}
+}
+
+// TestSettlingNamesWhoIsAwaited: a meet that has already built and then GROWS enters
+// a new, separate wait, and the event must say who it is waiting on — in a stable
+// order, because the dashboard replays this stream.
+func TestSettlingNamesWhoIsAwaited(t *testing.T) {
+	h := newHarness(t, baseConfig())
+	h.member("room", "p1", "a", 8000)
+	h.member("room", "p2", "b", 0)
+	if h.published("room") == nil {
+		t.Fatal("precondition: the meet must have built")
+	}
+	h.fp.reset()
+
+	// Two silent joiners: a real, separate membership-growth episode.
+	h.join("room", "p4", "zeta")
+	h.join("room", "p3", "carl")
+
+	evs := h.fp.of(coordinator.EventSettling)
+	if len(evs) != 1 {
+		t.Fatalf("a second growth episode is one new wait, got %d settling events", len(evs))
+	}
+	got := evs[0].Waiting
+	if len(got) != 1 || got[0] != "zeta" {
+		t.Fatalf("the first transition must name exactly the member not yet heard from, got %v", got)
+	}
+
+	h.advance(coordinator.JoinSettle + 1)
+	topo := h.published("room")
+	if topo.ParentOf("zeta") == "" || topo.ParentOf("carl") == "" {
+		t.Fatalf("both joiners must be placed when the window closes: %+v", topo)
+	}
+	// One build, not two: the burst coalesced.
+	if n := h.fp.countOf(coordinator.EventTopology); n != 1 {
+		t.Fatalf("want exactly one build for the growth episode, got %d", n)
 	}
 }
