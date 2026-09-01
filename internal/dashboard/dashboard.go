@@ -148,31 +148,19 @@ type Server struct {
 	closed bool
 }
 
-// meetStream is the per-meet fan-out state.
+// meetStream is the per-meet fan-out state. It holds NO copy of control state: every
+// observable number the dashboard serves is read from the coordinator or the arbiter at
+// the moment it is needed, because a value the dashboard accumulates itself is wrong
+// across a restart, wrong for a fresh subscriber, and — for anything that can reset —
+// unable to represent a legitimate decrease.
 type meetStream struct {
 	subs map[*subscription]struct{}
-	// stale is the INTERIM fence-rejection counter, superseded by
-	// RoomSnapshot.StaleRejected once §15.14's carrier lands (see meetBody).
-	// coordinator.RoomSnapshot carries no such field as of this commit, so the
-	// dashboard owns the number §9.3 puts in every snapshot; capturing it when a
-	// snapshot frame is MINTED (not when it is materialised) is what keeps it
-	// consistent with the deltas that follow — each rejection counted exactly once.
-	//
-	// It is monotonic and per-process, and the real counter is neither, which is why
-	// this is replaced rather than reconciled when the carrier arrives.
-	stale uint64
 	// epoch and rev are the last control-plane version seen for this meet, from an
 	// event or a snapshot. They stamp frames that carry no version of their own (a
 	// demo action, a pong). Stamping those with zero would be worse than omitting
 	// them: web/js/state.js copies frame.epoch onto its snapshot for every delta, so
 	// a zero would blank the epoch the operator is watching.
 	epoch, rev uint64
-	// health is the INTERIM last-published Health per node, superseded by
-	// coordinator.Event.PrevHealth once §15.14's plumbing lands (see healthData).
-	// coordinator.Event carries only the new value as of this commit, so the dashboard
-	// remembers the series it is the only component to see in full. Bounded by live
-	// membership: an entry is dropped when the member leaves.
-	health map[string]coordinator.Health
 	// touched drives the maxTrackedMeets eviction.
 	touched time.Time
 }
@@ -257,10 +245,7 @@ func (s *Server) streamLocked(meetID string) *meetStream {
 	ms := s.meets[meetID]
 	if ms == nil {
 		s.evictLocked()
-		ms = &meetStream{
-			subs:   map[*subscription]struct{}{},
-			health: map[string]coordinator.Health{},
-		}
+		ms = &meetStream{subs: map[*subscription]struct{}{}}
 		s.meets[meetID] = ms
 	}
 	ms.touched = s.clk.Now()
@@ -302,11 +287,4 @@ func (s *Server) noteVersion(meetID string, epoch, rev uint64) {
 	if rev != 0 {
 		ms.rev = rev
 	}
-}
-
-// staleCount reads the meet's observed fence-rejection count.
-func (s *Server) staleCount(meetID string) uint64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.streamLocked(meetID).stale
 }

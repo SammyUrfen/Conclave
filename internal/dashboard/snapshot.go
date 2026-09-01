@@ -27,11 +27,8 @@ const (
 )
 
 // snapshotBody assembles the §9.3 detail body, which is also the WS `snapshot` frame's
-// data. stale is passed in rather than read here because a stream's snapshot must use
-// the count captured when the frame was MINTED — see meetStream.stale.
-//
-// It calls two seams and holds no lock while doing so.
-func (s *Server) snapshotBody(ctx context.Context, meetID string, stale uint64) (meetBody, error) {
+// data. It calls two seams and holds no lock while doing so.
+func (s *Server) snapshotBody(ctx context.Context, meetID string) (meetBody, error) {
 	meet, err := s.cfg.Meets.GetMeet(ctx, meetID)
 	if err != nil {
 		return meetBody{}, err
@@ -43,13 +40,13 @@ func (s *Server) snapshotBody(ctx context.Context, meetID string, stale uint64) 
 			return meetBody{}, err
 		}
 	}
-	return s.buildMeetBody(meet, snap, stale), nil
+	return s.buildMeetBody(meet, snap), nil
 }
 
 // buildMeetBody is the pure merge of the arbiter's identity facts and the
 // coordinator's tree. Keeping it free of I/O is what lets the ordering and
 // sanitisation rules be tested without either seam.
-func (s *Server) buildMeetBody(meet arbiter.Meet, snap coordinator.RoomSnapshot, stale uint64) meetBody {
+func (s *Server) buildMeetBody(meet arbiter.Meet, snap coordinator.RoomSnapshot) meetBody {
 	topo := snap.Topo
 
 	// Epoch appears on both sides of the provenance split and legitimately (§9.4b):
@@ -84,7 +81,7 @@ func (s *Server) buildMeetBody(meet arbiter.Meet, snap coordinator.RoomSnapshot,
 		Nodes:          make([]nodeBody, 0, len(snap.Members)),
 		Edges:          edgesOf(topo),
 		Backups:        backupsOf(topo),
-		StaleRejected:  stale,
+		StaleRejected:  snap.StaleRejected,
 		Diverged:       make([]string, 0),
 		Provenance:     provenanceIntended,
 	}
