@@ -131,6 +131,15 @@ type Config struct {
 	// first peer that clears DemoteBelowScore — the posture that makes a meet
 	// usable immediately and still migrates.
 	Coordinate bool
+	// CoordinatorConfig is the tuning every coordinator of every meet in this process
+	// serves under, announced to whichever node holds the role. cmd/server builds it
+	// from the same flags that build its OWN coordinator.Config, so the server-hosted
+	// and peer-hosted coordinators are configured identically by construction rather
+	// than by two code paths agreeing.
+	//
+	// It is not defaulted here on purpose: see CoordinatorConfig.Validate.
+	CoordinatorConfig CoordinatorConfig
+
 	// ArbiterID is the coordinator id to announce when the arbiter holds the role.
 	// Empty means DefaultArbiterID. cmd/server passes signaling.ServerID.
 	ArbiterID string
@@ -262,6 +271,18 @@ func New(log *slog.Logger, cfg Config, ann Announcer, pub Publisher) *Arbiter {
 		a.validMeetID = policy.ValidMeetID
 	}
 	a.newMeetID = cfg.NewMeetID
+	// Warn rather than refuse. An elected peer builds its coordinator from what we
+	// announce, so an unusable configuration means it adopts the role, runs, and
+	// publishes nothing — a silent failure whose symptom (a tree that is never
+	// repaired after a handover) points nowhere near its cause. cmd/server's startup
+	// validation is what makes this fatal; here it is a breadcrumb for the case where
+	// something else constructed the arbiter.
+	if cfg.Elect {
+		if err := cfg.CoordinatorConfig.Validate(); err != nil {
+			a.log.Warn("coordinator configuration is unusable; an elected peer will publish no tree",
+				slog.Any("error", err))
+		}
+	}
 	return a
 }
 
@@ -994,6 +1015,7 @@ func (a *Arbiter) announce(ms *meetState, h holder, reason Reason, now time.Time
 		CoordinatorID: coordID,
 		Prev:          prev,
 		Reason:        reason,
+		Config:        a.cfg.CoordinatorConfig,
 		IssuedAt:      now,
 	}
 	ms.lastAnn, ms.hasAnn = ann, true

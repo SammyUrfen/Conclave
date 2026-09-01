@@ -55,6 +55,17 @@ type Announcement struct {
 	Prev string `json:"prev,omitempty"`
 	// Reason explains the change. Never parsed by a peer; peers act on Epoch alone.
 	Reason Reason `json:"reason"`
+	// Config is the tuning the named coordinator must serve this meet under.
+	//
+	// It rides here because the tuning belongs to the MEET, not to whichever node
+	// holds the role: an elected peer otherwise has no way to learn what constraints
+	// to coordinate under, and a handover would silently re-shape the subnet. See
+	// CoordinatorConfig.
+	//
+	// It is present on every announcement, including a vacancy — the frame is one
+	// shape, and a re-announcement or a unicast repair replays it verbatim along with
+	// everything else.
+	Config CoordinatorConfig `json:"config"`
 	// IssuedAt comes from the injected clock, never the wall clock, so a replayed
 	// scenario produces identical frames. It is a time.Time rather than the
 	// *_unix_ms convention used elsewhere because that convention is scoped to
