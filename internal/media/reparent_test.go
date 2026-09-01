@@ -30,8 +30,9 @@ type meetFixture struct {
 	cancel  context.CancelFunc
 	log     *slog.Logger
 
-	mu  sync.Mutex
-	ids map[string]string // peer name → server-assigned id, learned from the roster
+	mu      sync.Mutex
+	ids     map[string]string // peer name → server-assigned id, learned from the roster
+	coordID string            // the coordinator client's own server-assigned id
 }
 
 func newMeetFixture(t *testing.T, ctx context.Context, room string, cfgs map[string]RouterConfig) *meetFixture {
@@ -76,6 +77,7 @@ func newMeetFixture(t *testing.T, ctx context.Context, room string, cfgs map[str
 				switch msg.Type {
 				case signaling.TypeJoined:
 					f.mu.Lock()
+					f.coordID = msg.To
 					for _, p := range msg.Peers {
 						f.ids[p.Name] = p.ID
 					}
@@ -143,6 +145,50 @@ func (f *meetFixture) idOf(t *testing.T, name string) string {
 	return ""
 }
 
+// announce fences every peer on this fixture's coordinator client at epoch, the way
+// cmd/peer does when an arbiter TypeCoordinator frame arrives. Without it the fence
+// (§6.5) correctly rejects every push, because a peer that has not been told who is
+// in charge obeys nobody.
+func (f *meetFixture) announce(t *testing.T, epoch uint64) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		f.mu.Lock()
+		id := f.coordID
+		f.mu.Unlock()
+		if id != "" {
+			// Every Router must have processed its own TypeJoined first, since that
+			// RESETS the fence — adopting before it would be wiped.
+			for name, r := range f.routers {
+				if !f.joined(r) {
+					t.Fatalf("%s had not joined before the announcement", name)
+				}
+				r.AdoptCoordinator(epoch, id)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("never learned the coordinator client's own id")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// joined waits (bounded) for a Router to have processed its own joined frame.
+func (f *meetFixture) joined(r *Router) bool {
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		id := r.selfID
+		r.mu.Unlock()
+		if id != "" {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
 // push sends topo to every named peer, the way the coordinator does.
 func (f *meetFixture) push(t *testing.T, topo *overlay.Topology) {
 	t.Helper()
@@ -199,6 +245,7 @@ func TestRouterAppliesTopologyDiff(t *testing.T) {
 		phaseMu.Unlock()
 	}
 
+	f.announce(t, 1)
 	topo1 := tree("a", [2]string{"a", "b"}, [2]string{"b", "c"})
 	f.push(t, topo1)
 
@@ -261,7 +308,9 @@ func TestRouterPromotesBackupParent(t *testing.T) {
 	f := newMeetFixture(t, ctx, "backup", map[string]RouterConfig{
 		"a": {},
 		"b": {},
-		"c": {SendMedia: true, Backup: true, OnReparented: func(r metrics.Reparented) {
+		// DisableBackup is left at its zero value on purpose: promotion must be ON
+		// for a caller that says nothing about it (§15.13).
+		"c": {SendMedia: true, OnReparented: func(r metrics.Reparented) {
 			select {
 			case reports <- r:
 			default:
@@ -269,6 +318,7 @@ func TestRouterPromotesBackupParent(t *testing.T) {
 		}},
 	})
 
+	f.announce(t, 1)
 	topo := tree("a", [2]string{"a", "b"}, [2]string{"b", "c"})
 	topo.Backups = []overlay.Backup{{Node: "c", Parent: "a"}}
 	f.push(t, topo)

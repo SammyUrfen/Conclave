@@ -30,6 +30,7 @@ type gatedTransport struct {
 	answers  int
 	sendErr  error // when non-nil, every Send fails with it (drives the retry path)
 	attempts int
+	offerSDP []string // the SDP body of every offer, in order
 }
 
 func (t *gatedTransport) Send(msg signaling.Message) error {
@@ -39,6 +40,7 @@ func (t *gatedTransport) Send(msg signaling.Message) error {
 	switch msg.Type {
 	case signaling.TypeOffer:
 		t.offers++
+		t.offerSDP = append(t.offerSDP, string(msg.SDP))
 	case signaling.TypeAnswer:
 		t.answers++
 	}
@@ -69,6 +71,14 @@ func (t *gatedTransport) release() {
 	for _, msg := range held {
 		t.out <- msg
 	}
+}
+
+// offerSDPs returns every offer body sent so far, so a test can prove a retry
+// re-sent the SAME description rather than minting a new one.
+func (t *gatedTransport) offerSDPs() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]string(nil), t.offerSDP...)
 }
 
 func (t *gatedTransport) counts() (offers, answers, attempts int) {
