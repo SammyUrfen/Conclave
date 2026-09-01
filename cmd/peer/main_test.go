@@ -15,8 +15,10 @@ import (
 
 	"github.com/SammyUrfen/conclave/internal/arbiter"
 	"github.com/SammyUrfen/conclave/internal/clock"
+	"github.com/SammyUrfen/conclave/internal/coordinator"
 	"github.com/SammyUrfen/conclave/internal/logging"
 	"github.com/SammyUrfen/conclave/internal/media"
+	"github.com/SammyUrfen/conclave/internal/meetconfig"
 	"github.com/SammyUrfen/conclave/internal/metrics"
 	"github.com/SammyUrfen/conclave/internal/overlay"
 	"github.com/SammyUrfen/conclave/internal/signaling"
@@ -305,7 +307,7 @@ func TestAdoptAnnouncementAuthorizes(t *testing.T) {
 
 	t.Run("adopting authorizes exactly the named coordinator", func(t *testing.T) {
 		var f overlay.Fence
-		adopted, _ := adoptAnnouncement(testLogger(), selfID("p3"), f.AdoptAnnouncement, announcement(2, "relay", "p3"))
+		_, adopted, _ := adoptAnnouncement(testLogger(), selfID("p3"), f.AdoptAnnouncement, announcement(2, "relay", "p3"))
 		if !adopted {
 			t.Fatal("a fresh announcement was not adopted")
 		}
@@ -332,11 +334,15 @@ func TestAdoptAnnouncementAuthorizes(t *testing.T) {
 	t.Run("a stale or duplicate epoch is not adopted", func(t *testing.T) {
 		var f overlay.Fence
 		adoptAnnouncement(testLogger(), selfID("p3"), f.AdoptAnnouncement, announcement(5, "relay", "p3"))
-		if dup, _ := adoptAnnouncement(testLogger(), selfID("p3"), f.AdoptAnnouncement, announcement(5, "leaf-a", "p7")); dup {
+		if _, dup, _ := adoptAnnouncement(testLogger(), selfID("p3"), f.AdoptAnnouncement, announcement(5, "leaf-a", "p7")); dup {
 			t.Error("a duplicate epoch was adopted; a peer must not be re-pointed inside a term")
 		}
-		if stale, _ := adoptAnnouncement(testLogger(), selfID("p3"), f.AdoptAnnouncement, announcement(4, "leaf-a", "p7")); stale {
+		if _, stale, _ := adoptAnnouncement(testLogger(), selfID("p3"), f.AdoptAnnouncement, announcement(4, "leaf-a", "p7")); stale {
 			t.Error("a stale epoch was adopted")
+		}
+		if got, _, _ := adoptAnnouncement(testLogger(), selfID("p3"), f.AdoptAnnouncement,
+			announcement(9, "relay", "p3")); got.Epoch != 9 || got.CoordinatorID != "p3" {
+			t.Errorf("adoptAnnouncement did not return the decoded announcement: %+v", got)
 		}
 		if f.CoordinatorID != "p3" {
 			t.Errorf("CoordinatorID = %q, want p3 (a refused announcement must leave the fence untouched)", f.CoordinatorID)
@@ -345,7 +351,7 @@ func TestAdoptAnnouncementAuthorizes(t *testing.T) {
 
 	t.Run("a malformed body is dropped, not fatal", func(t *testing.T) {
 		called := false
-		got, _ := adoptAnnouncement(testLogger(), selfID("p3"),
+		_, got, _ := adoptAnnouncement(testLogger(), selfID("p3"),
 			func(uint64, string) bool { called = true; return true },
 			[]byte("{not json"))
 		if got || called {
@@ -372,7 +378,7 @@ func TestAdoptAnnouncementAuthorizes(t *testing.T) {
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
 				var f overlay.Fence
-				_, self := adoptAnnouncement(testLogger(), selfID(tc.id), f.AdoptAnnouncement,
+				_, _, self := adoptAnnouncement(testLogger(), selfID(tc.id), f.AdoptAnnouncement,
 					announcement(1, "relay", "p3"))
 				if self != tc.wantSelf {
 					t.Errorf("self = %v, want %v", self, tc.wantSelf)
@@ -881,8 +887,34 @@ func TestPeerBeatsAndDeclaresOnTheWire(t *testing.T) {
 // captureObserver records the control-plane frames the Hub terminates, so the test
 // can assert on what the SERVER received rather than on what the peer intended.
 type captureObserver struct {
-	mu   sync.Mutex
-	seen map[signaling.Type][][]byte
+	mu    sync.Mutex
+	seen  map[signaling.Type][][]byte
+	coord string
+	// forward mirrors §8 routing rule 2: the server carries a TERMINATED control
+	// frame the last hop to an elected coordinator peer. Without it an elected peer
+	// hears nothing from anyone, which is the pre-wiring state under test.
+	forward func(peerID string, kind signaling.Type, payload []byte)
+}
+
+func (o *captureObserver) setCoordinator(id string) {
+	o.mu.Lock()
+	o.coord = id
+	o.mu.Unlock()
+}
+
+func (o *captureObserver) coordinator() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.coord
+}
+
+func (o *captureObserver) fanOut(peerID string, kind signaling.Type, payload []byte) {
+	o.mu.Lock()
+	fwd := o.forward
+	o.mu.Unlock()
+	if fwd != nil {
+		fwd(peerID, kind, payload)
+	}
 }
 
 func (o *captureObserver) record(t signaling.Type, payload []byte) {
@@ -918,14 +950,17 @@ func (o *captureObserver) last(t signaling.Type) []byte {
 
 func (o *captureObserver) PeerJoined(string, string, string) {}
 func (o *captureObserver) PeerLeft(string, string)           {}
-func (o *captureObserver) Metrics(_, _ string, payload []byte) {
+func (o *captureObserver) Metrics(_, peerID string, payload []byte) {
 	o.record(signaling.TypeMetrics, payload)
+	o.fanOut(peerID, signaling.TypeMetrics, payload)
 }
-func (o *captureObserver) Heartbeat(_, _ string, payload []byte) {
+func (o *captureObserver) Heartbeat(_, peerID string, payload []byte) {
 	o.record(signaling.TypeHeartbeat, payload)
+	o.fanOut(peerID, signaling.TypeHeartbeat, payload)
 }
-func (o *captureObserver) Reparented(_, _ string, payload []byte) {
+func (o *captureObserver) Reparented(_, peerID string, payload []byte) {
 	o.record(signaling.TypeReparented, payload)
+	o.fanOut(peerID, signaling.TypeReparented, payload)
 }
 
 // TestPeerReportsRealizedTreeOnTheWire is the end-to-end proof for the REALIZED half
@@ -1154,4 +1189,475 @@ func mustHeartbeatFrom(t *testing.T, obs *captureObserver, name string) metrics.
 		t.Fatalf("no heartbeat from %q reached the server", name)
 	}
 	return hb
+}
+
+// --- WI-8: peerPlane, the in-process coordinator an elected peer hosts ---------
+
+// fakeCoordinator records what the plane feeds a coordinator, so the routing and the
+// lifecycle can be asserted without a real control loop. The compile-time assertion
+// on planeCoordinator is what keeps it honest.
+type fakeCoordinator struct {
+	mu         sync.Mutex
+	rosters    [][]coordinator.Member
+	joined     [][2]string
+	left       []string
+	metrics    []string
+	beats      []string
+	reparents  []string
+	epochs     []uint64
+	yields     []uint64
+	ranCtx     context.Context
+	runStarted chan struct{}
+}
+
+func newFakeCoordinator() *fakeCoordinator {
+	return &fakeCoordinator{runStarted: make(chan struct{})}
+}
+
+func (f *fakeCoordinator) Run(ctx context.Context) error {
+	f.mu.Lock()
+	f.ranCtx = ctx
+	f.mu.Unlock()
+	close(f.runStarted)
+	<-ctx.Done()
+	return ctx.Err()
+}
+func (f *fakeCoordinator) SetRoster(_ string, m []coordinator.Member) {
+	f.mu.Lock()
+	f.rosters = append(f.rosters, m)
+	f.mu.Unlock()
+}
+func (f *fakeCoordinator) PeerJoined(_, id, name string) {
+	f.mu.Lock()
+	f.joined = append(f.joined, [2]string{id, name})
+	f.mu.Unlock()
+}
+func (f *fakeCoordinator) PeerLeft(_, id string) {
+	f.mu.Lock()
+	f.left = append(f.left, id)
+	f.mu.Unlock()
+}
+func (f *fakeCoordinator) Metrics(_, id string, _ []byte) {
+	f.mu.Lock()
+	f.metrics = append(f.metrics, id)
+	f.mu.Unlock()
+}
+func (f *fakeCoordinator) Heartbeat(_, id string, _ []byte) {
+	f.mu.Lock()
+	f.beats = append(f.beats, id)
+	f.mu.Unlock()
+}
+func (f *fakeCoordinator) Reparented(_, id string, _ []byte) {
+	f.mu.Lock()
+	f.reparents = append(f.reparents, id)
+	f.mu.Unlock()
+}
+func (f *fakeCoordinator) SetEpoch(_ string, e uint64) {
+	f.mu.Lock()
+	f.epochs = append(f.epochs, e)
+	f.mu.Unlock()
+}
+func (f *fakeCoordinator) Yield(_ string, e uint64) {
+	f.mu.Lock()
+	f.yields = append(f.yields, e)
+	f.mu.Unlock()
+}
+func (f *fakeCoordinator) snap() fakeCoordinator {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return fakeCoordinator{
+		rosters: f.rosters, joined: f.joined, left: f.left,
+		metrics: f.metrics, beats: f.beats, reparents: f.reparents,
+		epochs: f.epochs, yields: f.yields,
+	}
+}
+
+var _ planeCoordinator = (*fakeCoordinator)(nil)
+var _ planeCoordinator = (*coordinator.Coordinator)(nil)
+
+// resolvedConfig is a fully-resolved announcement config: every value chosen, so
+// Resolved is true and nothing below is a Go zero standing in for "unset".
+func resolvedConfig() arbiter.CoordinatorConfig {
+	return arbiter.CoordinatorConfig{
+		Resolved: true, MaxDepth: 2, StreamKbps: 2000, DefaultUploadKbps: 3000,
+		StickinessMs: 25, DwellMs: 10_000, RecomputeCooldownMs: 100,
+		DegradedAfterMs: 0, GoneAfterMs: 0, JoinSettleMs: 200, SocketDetectionMs: 7_000,
+	}
+}
+
+func announcementFor(epoch uint64, name, id string, cc arbiter.CoordinatorConfig) arbiter.Announcement {
+	return arbiter.Announcement{
+		RoomID: "demo", Epoch: epoch, Coordinator: name, CoordinatorID: id,
+		Reason: arbiter.ReasonBootstrap, Config: cc,
+	}
+}
+
+// TestPlaneConfigFillsWhatTheWireCannotCarry guards the trap meetconfig documents:
+// the translator deliberately leaves SelfName and Clock zero, and an empty SelfName
+// is how a coordinator marks itself as running INSIDE THE ARBITER. A peer that
+// forgets to set it gets a coordinator that believes it is the arbiter.
+func TestPlaneConfigFillsWhatTheWireCannotCarry(t *testing.T) {
+	cc := resolvedConfig()
+	clk := simnet.NewVirtualClock(time.Unix(0, 0).UTC())
+
+	got, err := planeConfig(cc, "relay", clk)
+	if err != nil {
+		t.Fatalf("planeConfig: %v", err)
+	}
+	if got.SelfName != "relay" {
+		t.Errorf("SelfName = %q, want %q — empty marks a coordinator as the ARBITER's", got.SelfName, "relay")
+	}
+	if got.Clock != clock.Clock(clk) {
+		t.Error("Clock was not injected; the coordinator would run on the wall clock")
+	}
+	// Every meet-shaping field must be exactly what the shared translator produced —
+	// no second conversion, no local re-derivation.
+	want := meetconfig.Coordinator(cc)
+	want.SelfName, want.Clock = got.SelfName, got.Clock
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("config diverged from meetconfig.Coordinator:\n\tgot  %+v\n\twant %+v", got, want)
+	}
+}
+
+// TestPlaneConfigRefusesUnusable: nobody upstream will stop a peer from starting a
+// coordinator it cannot run — the arbiter only warns. An unresolved config is the
+// "adopts the role and publishes nothing" symptom, so it must be refused here.
+func TestPlaneConfigRefusesUnusable(t *testing.T) {
+	unresolved := resolvedConfig()
+	unresolved.Resolved = false
+	noStream := resolvedConfig()
+	noStream.StreamKbps = 0
+	noDepth := resolvedConfig()
+	noDepth.MaxDepth = 0
+
+	tests := []struct {
+		name    string
+		cc      arbiter.CoordinatorConfig
+		wantErr bool
+	}{
+		{name: "resolved", cc: resolvedConfig()},
+		{name: "unresolved is refused", cc: unresolved, wantErr: true},
+		{name: "zero stream cost is refused", cc: noStream, wantErr: true},
+		{name: "zero depth is refused", cc: noDepth, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := planeConfig(tt.cc, "relay", clock.System())
+			if tt.wantErr && err == nil {
+				t.Fatal("expected a refusal, got none")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected refusal: %v", err)
+			}
+		})
+	}
+}
+
+// TestPeerPlaneLifecycle drives the whole role lifecycle off the (adopted, self)
+// pair the announcement path already produces.
+func TestPeerPlaneLifecycle(t *testing.T) {
+	t.Run("an unadopted announcement never starts anything", func(t *testing.T) {
+		p, fake := newTestPlane(t)
+		// A re-announcement of a term this peer already holds is NOT adopted
+		// (Fence.AdoptAnnouncement needs a strictly higher epoch). Acting on it would
+		// restart a running coordinator for no reason.
+		p.announce(announcementFor(1, "relay", "p1", resolvedConfig()), false, true)
+		p.sync()
+		if p.hosting() {
+			t.Fatal("an unadopted announcement started a coordinator")
+		}
+		if fake.count() != 0 {
+			t.Fatalf("constructed %d coordinators, want 0", fake.count())
+		}
+	})
+
+	t.Run("elected, re-elected, then replaced", func(t *testing.T) {
+		p, fake := newTestPlane(t)
+
+		p.announce(announcementFor(1, "relay", "p1", resolvedConfig()), true, true)
+		p.sync()
+		if !p.hosting() {
+			t.Fatal("an adopted announcement naming this peer did not start a coordinator")
+		}
+		if fake.count() != 1 {
+			t.Fatalf("constructed %d coordinators, want 1", fake.count())
+		}
+
+		// Re-elected at a higher term: the SAME coordinator is told the new epoch.
+		// Yield keeps a coordinator warm by design, so rebuilding one would throw
+		// away telemetry and health that are still true.
+		p.announce(announcementFor(2, "relay", "p1", resolvedConfig()), true, true)
+		p.sync()
+		if fake.count() != 1 {
+			t.Fatalf("re-election constructed %d coordinators, want 1", fake.count())
+		}
+		if got := fake.latest().snap().epochs; !reflect.DeepEqual(got, []uint64{1, 2}) {
+			t.Errorf("epochs = %v, want [1 2]", got)
+		}
+
+		// The role moves elsewhere: yield at the term that replaced us.
+		p.announce(announcementFor(3, "leaf-a", "p2", resolvedConfig()), true, false)
+		p.sync()
+		if got := fake.latest().snap().yields; !reflect.DeepEqual(got, []uint64{3}) {
+			t.Errorf("yields = %v, want [3]", got)
+		}
+		if p.hosting() {
+			t.Error("still reports hosting after yielding the role")
+		}
+	})
+
+	t.Run("an unusable config refuses loudly and starts nothing", func(t *testing.T) {
+		p, fake := newTestPlane(t)
+		bad := resolvedConfig()
+		bad.Resolved = false
+		p.announce(announcementFor(1, "relay", "p1", bad), true, true)
+		p.sync()
+		if p.hosting() || fake.count() != 0 {
+			t.Fatal("started a coordinator from an unusable config")
+		}
+		if p.Refused() != 1 {
+			t.Errorf("Refused() = %d, want 1 — the refusal must be counted, not silent", p.Refused())
+		}
+	})
+}
+
+// TestPeerPlaneRoutesControlFrames covers every frame an elected peer's coordinator
+// lives on. SetRoster gets its own emphasis: simnet's scenarios never drive it, and
+// it is the path a peer coordinator depends on most — it gets no Observer callbacks,
+// so TypeMembership is the only way it learns the authoritative roster.
+func TestPeerPlaneRoutesControlFrames(t *testing.T) {
+	p, fake := newTestPlane(t)
+	p.announce(announcementFor(1, "relay", "p1", resolvedConfig()), true, true)
+	p.sync()
+
+	p.post(signaling.Message{Type: signaling.TypeMembership, Peers: []signaling.Peer{
+		{ID: "p1", Name: "relay"}, {ID: "p2", Name: "leaf-a"},
+	}})
+	p.post(signaling.Message{Type: signaling.TypePeerJoined, From: "p3", Name: "leaf-b"})
+	p.post(signaling.Message{Type: signaling.TypePeerLeft, From: "p2", Name: "leaf-a"})
+	p.post(signaling.Message{Type: signaling.TypeMetrics, From: "p3", Payload: json.RawMessage(`{"name":"leaf-b"}`)})
+	p.post(signaling.Message{Type: signaling.TypeHeartbeat, From: "p3", Payload: json.RawMessage(`{"name":"leaf-b","seq":1}`)})
+	p.post(signaling.Message{Type: signaling.TypeReparented, From: "p3", Payload: json.RawMessage(`{"name":"leaf-b","ok":true}`)})
+	p.sync()
+
+	got := fake.latest().snap()
+	wantRoster := []coordinator.Member{{ID: "p1", Name: "relay"}, {ID: "p2", Name: "leaf-a"}}
+	if len(got.rosters) != 1 || !reflect.DeepEqual(got.rosters[0], wantRoster) {
+		t.Errorf("SetRoster got %+v, want one call with %+v", got.rosters, wantRoster)
+	}
+	if !reflect.DeepEqual(got.joined, [][2]string{{"p3", "leaf-b"}}) {
+		t.Errorf("PeerJoined = %v", got.joined)
+	}
+	if !reflect.DeepEqual(got.left, []string{"p2"}) {
+		t.Errorf("PeerLeft = %v", got.left)
+	}
+	// Every telemetry frame must be attributed to the ORIGINAL sender: the server
+	// forwards it with From preserved, and the coordinator keys its member records
+	// on that id. Attributing it to the server, or to ourselves, files another
+	// peer's telemetry under the wrong node.
+	if !reflect.DeepEqual(got.metrics, []string{"p3"}) ||
+		!reflect.DeepEqual(got.beats, []string{"p3"}) ||
+		!reflect.DeepEqual(got.reparents, []string{"p3"}) {
+		t.Errorf("telemetry attribution wrong: metrics=%v beats=%v reparents=%v",
+			got.metrics, got.beats, got.reparents)
+	}
+
+	t.Run("frames before election are dropped, not queued forever", func(t *testing.T) {
+		q, qf := newTestPlane(t)
+		q.post(signaling.Message{Type: signaling.TypeMembership, Peers: []signaling.Peer{{ID: "p1", Name: "relay"}}})
+		q.sync()
+		if qf.count() != 0 {
+			t.Fatal("a control frame constructed a coordinator on its own")
+		}
+	})
+}
+
+// TestPeerPlanePostNeverBlocks: post runs on media's Run goroutine — the loop that
+// feeds every session's negotiation — so a full queue must drop and count, never
+// block. media's OnControlFrame doc names this exact requirement.
+func TestPeerPlanePostNeverBlocks(t *testing.T) {
+	p, _ := newTestPlane(t)
+	for i := 0; i < planeQueueDepth*4; i++ {
+		p.post(signaling.Message{Type: signaling.TypeHeartbeat, From: "p3"})
+	}
+	if p.Dropped() == 0 {
+		t.Fatal("expected the plane to drop on overflow rather than block")
+	}
+}
+
+// --- the acceptance test ------------------------------------------------------
+
+// TestElectedPeerRepairsTheMeet is the whole point of WI-8's last item, and it
+// asserts the thing that was actually broken: not that a coordinator is constructed,
+// but that the MEET IS REPAIRED. Three real peers, a real Hub, the test playing
+// arbiter; one peer is elected, and the tree it publishes must reach the others —
+// visible as rev advancing off 0 on every peer's heartbeat, with a connected tree.
+//
+// Before this wiring existed the elected peer adopted the role and hosted nothing:
+// rev stayed 0 forever and no peer ever logged an applied topology.
+func TestElectedPeerRepairsTheMeet(t *testing.T) {
+	const room = "handover"
+
+	obs := &captureObserver{}
+	hub := signaling.NewHub(testLogger())
+	hub.SetObserver(obs)
+	// §8 routing rule 2: the SERVER forwards terminated telemetry the last hop to an
+	// elected coordinator peer, From preserved. cmd/server does this in production;
+	// the test must, or the elected coordinator never hears a peer report.
+	obs.forward = func(peerID string, kind signaling.Type, payload []byte) {
+		coordID := obs.coordinator()
+		if coordID == "" || coordID == peerID {
+			return
+		}
+		hub.SendTo(room, coordID, signaling.Message{Type: kind, From: peerID, To: coordID, Payload: payload})
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /ws", hub.ServeWS)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
+
+	for _, name := range []string{"leaf-b", "leaf-a", "relay"} {
+		opts, err := parseArgs([]string{
+			"-call", "-managed", "-name", name,
+			"-server", srv.URL, "-room", room, "-heartbeat", "50ms",
+		})
+		if err != nil {
+			t.Fatalf("parseArgs(%s): %v", name, err)
+		}
+		wg.Add(1)
+		go func() { defer wg.Done(); _ = runCall(ctx, testLogger(), opts.cfg) }()
+	}
+	waitForSlow(t, "all three peers to join", func() bool { return len(hub.Roster(room)) == 3 })
+
+	// Nobody has published anything yet: rev is 0 everywhere. This is the state the
+	// live verification measured and never left.
+	relayID := peerIDFor(t, hub, room, "relay")
+	waitForSlow(t, "a first heartbeat from every peer", func() bool {
+		for _, n := range []string{"relay", "leaf-a", "leaf-b"} {
+			if _, ok := lastHeartbeatFrom(t, obs, n); !ok {
+				return false
+			}
+		}
+		return true
+	})
+	for _, n := range []string{"relay", "leaf-a", "leaf-b"} {
+		if hb := mustHeartbeatFrom(t, obs, n); hb.Rev != 0 {
+			t.Fatalf("%s reported rev %d before any election; want 0", n, hb.Rev)
+		}
+	}
+
+	// The arbiter elects the relay, and the announcement carries the meet's tuning.
+	obs.setCoordinator(relayID)
+	ann, err := json.Marshal(announcementWithRoom(room, 1, "relay", relayID, resolvedConfig()))
+	if err != nil {
+		t.Fatalf("marshal announcement: %v", err)
+	}
+	if n := hub.SendRoom(room, signaling.Message{Type: signaling.TypeCoordinator, Payload: ann}); n != 3 {
+		t.Fatalf("announcement reached %d peers, want 3", n)
+	}
+	// The membership change an elected coordinator learns the roster from. A peer
+	// coordinator gets no Observer callbacks, so this frame is its only ground truth.
+	hub.SendRoom(room, signaling.Message{Type: signaling.TypeMembership, Peers: hub.Roster(room)})
+
+	// THE ASSERTION: a tree published by the ELECTED PEER reaches everyone.
+	waitForSlow(t, "the elected peer to publish a tree that repairs the meet", func() bool {
+		roots := 0
+		for _, n := range []string{"relay", "leaf-a", "leaf-b"} {
+			hb, ok := lastHeartbeatFrom(t, obs, n)
+			if !ok || hb.Epoch != 1 || hb.Rev < 1 {
+				return false
+			}
+			if hb.Parent == "" {
+				roots++
+			}
+		}
+		return roots == 1
+	})
+
+	var roots []string
+	for _, n := range []string{"relay", "leaf-a", "leaf-b"} {
+		hb := mustHeartbeatFrom(t, obs, n)
+		if hb.Epoch != 1 {
+			t.Errorf("%s epoch = %d, want 1", n, hb.Epoch)
+		}
+		if hb.Rev < 1 {
+			t.Errorf("%s rev = %d, want it to have ADVANCED off 0 — that is the repair", n, hb.Rev)
+		}
+		if hb.Parent == "" {
+			roots = append(roots, n)
+		}
+	}
+	if len(roots) != 1 {
+		t.Errorf("the published tree has %d roots (%v), want exactly 1", len(roots), roots)
+	}
+}
+
+// --- peerPlane test helpers ---------------------------------------------------
+
+// fakeFactory stands in for the real coordinator constructor so a test can assert
+// HOW MANY coordinators the plane builds — the difference between re-election
+// (SetEpoch on the warm one) and a rebuild that would throw away live telemetry.
+type fakeFactory struct {
+	mu    sync.Mutex
+	calls int
+	last  *fakeCoordinator
+	cfgs  []coordinator.Config
+}
+
+func (f *fakeFactory) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func (f *fakeFactory) latest() *fakeCoordinator {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.last
+}
+
+func (f *fakeFactory) make(cfg coordinator.Config) planeCoordinator {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	f.cfgs = append(f.cfgs, cfg)
+	f.last = newFakeCoordinator()
+	return f.last
+}
+
+// newTestPlane builds a running plane over a fake coordinator factory, joined on
+// cleanup so a leaked drain goroutine fails the test rather than the next one.
+func newTestPlane(t *testing.T) (*peerPlane, *fakeFactory) {
+	t.Helper()
+	f := &fakeFactory{}
+	p := newPeerPlane(testLogger(), "demo", "relay", clock.System(),
+		func(signaling.Message) error { return nil })
+	p.newCoordinator = f.make
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); p.run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("peerPlane.run did not return after its context was cancelled")
+		}
+	})
+	return p, f
+}
+
+func announcementWithRoom(room string, epoch uint64, name, id string, cc arbiter.CoordinatorConfig) arbiter.Announcement {
+	a := announcementFor(epoch, name, id, cc)
+	a.RoomID = room
+	return a
 }
