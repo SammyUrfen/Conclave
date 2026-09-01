@@ -1717,6 +1717,33 @@ func TestPeerPlaneFeedsItsHostLocally(t *testing.T) {
 		t.Errorf("self re-parent attribution = %v, want [p1]", got.reparents)
 	}
 
+	// The TEE itself, not just the plane method it calls: the three self-injections
+	// live in the send closures of the reporter, the beater and the re-parent sender,
+	// and a missing one there is invisible to any test that calls the plane directly.
+	t.Run("the re-parent tee reaches the plane and still ships to the wire", func(t *testing.T) {
+		r, rf := newTestPlane(t)
+		r.selfID = func() string { return "p1" }
+		r.announce(announcementFor(1, "relay", "p1", resolvedConfig()), true, true)
+		r.sync()
+
+		var wire []signaling.Message
+		send := reparentSend(r, func(msg signaling.Message) error {
+			wire = append(wire, msg)
+			return nil
+		})
+		if err := send(metrics.Reparented{Name: "relay", From: "root", To: "leaf-a", OK: true}); err != nil {
+			t.Fatalf("reparent send: %v", err)
+		}
+		r.sync()
+
+		if got := rf.latest().snap().reparents; !reflect.DeepEqual(got, []string{"p1"}) {
+			t.Errorf("the host's own re-parent did not reach its local coordinator: %v", got)
+		}
+		if len(wire) != 1 || wire[0].Type != signaling.TypeReparented {
+			t.Errorf("the frame must still go on the wire too: %+v", wire)
+		}
+	})
+
 	t.Run("nothing is injected before this peer is elected", func(t *testing.T) {
 		q, qf := newTestPlane(t)
 		q.selfID = func() string { return "p1" }
