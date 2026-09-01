@@ -41,10 +41,25 @@ type Node struct {
 	RTT map[string]float64
 	// NAT bounds the node's role: NATRelayed forces it to a leaf.
 	NAT NATType
+	// Provisional marks a node whose telemetry is an ASSUMED DEFAULT, not a
+	// measurement — a peer that has joined but whose first metrics report has not
+	// arrived. It is set by the coordinator's projection, which supplies the assumed
+	// number; this flag records that the number is a guess.
+	//
+	// Why overlay needs to know: a provisional node may be ATTACHED (as a leaf,
+	// which is what a 0-upload default already makes it) but may NEVER be chosen as
+	// ROOT by PickRoot. Rooting on a guess is how the tree ends up re-rooting a
+	// second later when the real number arrives — the most expensive reconfiguration
+	// there is, triggered by nothing but WebSocket arrival order. Expressing it as a
+	// plain value on Node keeps overlay pure: the package still has no idea what a
+	// "report" is, only that this datum is soft.
+	Provisional bool
 }
 
 // Constraints parameterise a build: which node roots the tree, how deep it may get,
-// and the per-child upload cost that turns each node's budget into a degree bound.
+// the per-child upload cost that turns each node's budget into a degree bound, the
+// control-plane term the result is stamped with, and how hard the builder clings to
+// the previous tree.
 type Constraints struct {
 	// Root is the node at depth 0 — the tree's source/relay origin. Required.
 	Root string
@@ -55,7 +70,59 @@ type Constraints struct {
 	// StreamKbps is the upload cost of forwarding one stream to one child. A node's
 	// child capacity is floor(UploadKbps / StreamKbps). Must be > 0.
 	StreamKbps int
+	// Epoch is stamped onto the result. The coordinator supplies the term it is
+	// serving under; BuildTree never invents one. Must be ≥ 1.
+	Epoch uint64
+	// Rev is stamped onto the result. Must be ≥ 1 and, when prev is non-nil with the
+	// same Epoch, must be > prev.Rev — BuildTree rejects a non-advancing revision
+	// rather than silently emitting a tree no peer will accept.
+	Rev uint64
+	// StickinessMs is the RTT margin (ms) by which a challenger must beat a node's
+	// INCUMBENT parent before the node is re-parented. It is the anti-thrash knob at
+	// the graph layer: 0 makes BuildTree memoryless and purely greedy; a large value
+	// pins the tree in place. See DefaultStickinessMs.
+	StickinessMs float64
 }
+
+// DefaultStickinessMs is the re-parent margin used unless a caller overrides it.
+//
+// 25 ms is chosen against the ARCHITECTURE's own latency budget: ~150 ms one-way is
+// "good" and ~400 ms is the ceiling, so a 25 ms improvement is ~6% of the usable
+// range — small enough that trading a stream interruption for it is a bad deal,
+// large enough that a genuinely closer relay (a LAN peer at 5 ms vs a WAN peer at
+// 60 ms) still wins immediately. It is also comfortably above the sampling noise on
+// a residential link, where consecutive RTT samples routinely differ by 5–15 ms.
+const DefaultStickinessMs = 25.0
+
+// RootChangeMarginKbps is how much more upload a challenger must advertise before
+// it is worth re-rooting the entire subnet.
+//
+// 2000 kbit/s is exactly one stream at the default stream cost, i.e. the challenger
+// must be able to serve at least one MORE child than the incumbent before the swap
+// is even considered. That is the smallest difference that buys anything
+// structural; anything less re-parents every peer in the meet to gain nothing.
+// Deliberately an ABSOLUTE margin rather than a ratio: capacity here is integer
+// children (floor(upload / streamKbps)), so a percentage margin would mean
+// different things at different fleet sizes, while "one more child's worth" means
+// the same thing everywhere.
+const RootChangeMarginKbps = 2000
+
+// BackupOvershootAllowance is how far a relay's COMMITTED load (its primary
+// children plus every node naming it as a backup) may exceed its computed capacity.
+//
+// 1, because that is the exact overshoot the design is willing to pay for: capacity
+// is deliberately NOT reserved for backups — at the scale this system runs (4–8
+// peers on residential upload) capacity is already the binding constraint, and
+// halving usable fan-out to insure against a failure that triggers one recompute is
+// a bad trade. But "not reserved" must not mean "unbounded": with no allowance at
+// all, every child of a dying relay could name the SAME backup and promote at once,
+// oversubscribing it by |Subtree(P)|−1 rather than by one child. Spending capacity
+// across backup assignment with an allowance of exactly 1 keeps the documented
+// bound true: at the instant of a simultaneous failover a relay may serve at most
+// one child more than its computed capacity, until the coordinator's recompute
+// lands. Note this overshoot exists only in a peer's REALIZED state — it is never
+// encoded in a Topology, so Validate still holds for everything this package emits.
+const BackupOvershootAllowance = 1
 
 // unknownRTT is the score used when a candidate parent's RTT is unmeasured. It must
 // dominate any real RTT so measured parents always win over unknown ones, while
@@ -65,32 +132,42 @@ type Constraints struct {
 const unknownRTT = math.MaxFloat64
 
 // BuildTree computes a degree-bounded, depth-limited, min-latency relay tree by a
-// greedy heuristic, and is the pure heart of the control plane: no sockets, no
-// clock, no randomness — the same inputs always yield the same tree, which is what
-// makes it unit- and simulation-testable.
+// greedy heuristic that PREFERS THE PREVIOUS TREE, and is the pure heart of the
+// control plane: no sockets, no clock, no randomness — the same (nodes, prev, c)
+// always yields the same tree, which is what makes it unit- and
+// simulation-testable.
 //
 // Why greedy and not optimal: the target — a degree-constrained, depth-limited,
-// minimum-latency spanning tree — is NP-hard (it generalises degree-bounded
-// minimum spanning tree). For a handful of home peers reconfigured on every join or
-// leave, an optimal solve is both unnecessary and too slow to run in the control
-// loop. The greedy rule ("attach each node to the lowest-latency relay that still
-// has spare upload and keeps within the depth bound") runs in well under a
-// millisecond and produces shallow, balanced trees that are easily good enough. The
-// trade-off is stated so a future maintainer doesn't mistake the heuristic for a
-// bug.
+// minimum-latency spanning tree — is NP-hard (it generalises degree-bounded minimum
+// spanning tree). For a handful of home peers reconfigured on every join or leave,
+// an optimal solve is both unnecessary and too slow to run in the control loop. The
+// greedy rule runs in well under a millisecond and produces shallow, balanced trees
+// that are easily good enough. The trade-off is stated so a future maintainer
+// doesn't mistake the heuristic for a bug.
+//
+// prev may be nil (the first build for a meet, or a coordinator that has not yet
+// rebuilt its state). A non-nil prev makes the build stability-preserving, which is
+// what "local repair — re-parent only the subtree" requires: a node's parent changes
+// only when it HAS to, so a rebuild after one departure moves exactly the orphans
+// and nobody else. That property is asserted by ValidateLocalRepair.
+//
+// The cost of that property, stated plainly: with prev supplied the result is a
+// function of HISTORY, not just of the fleet. Two meets with identical members can
+// legitimately hold different valid trees because they got there by different
+// routes. Path-independence is exactly what was traded away to buy
+// minimal-disruption rebuilds; the two cannot both hold.
 //
 // The algorithm:
 //  1. Seed the tree with the root at depth 0.
-//  2. Consider the remaining nodes strongest-upload-first, so high-capacity nodes
-//     attach near the root and naturally become the relays that carry the tree.
-//  3. Attach each node to the best currently-attached parent that can take it: one
-//     that is not itself forced to a leaf, is above the depth bound, and has spare
-//     child capacity — choosing, among those, minimum RTT, then fewest children
-//     (balance), then name (determinism).
-//  4. If no parent can take a node, fail loud: the fleet is over-constrained (too
-//     little aggregate upload, or a depth bound too shallow) and silently dropping
-//     the node would be the "mysterious missing stream" we refuse to ship.
-func BuildTree(nodes []Node, c Constraints) (*Topology, error) {
+//  2. Process incumbents first, in prev's edge order, then newcomers strongest
+//     first — so a strong joiner cannot claim capacity ahead of a node that is
+//     already using it (see processingOrder).
+//  3. Attach each node to the best parent that can take it: incumbency first,
+//     then minimum RTT, then fewest children, then name (see bestParent).
+//  4. Assign warm backup parents over the finished tree (see assignBackups).
+//  5. If no parent can take a node, fail loud: silently dropping the node would be
+//     the "mysterious missing stream" we refuse to ship.
+func BuildTree(nodes []Node, prev *Topology, c Constraints) (*Topology, error) {
 	if c.StreamKbps <= 0 {
 		return nil, fmt.Errorf("build tree: StreamKbps must be > 0, got %d", c.StreamKbps)
 	}
@@ -99,6 +176,16 @@ func BuildTree(nodes []Node, c Constraints) (*Topology, error) {
 	}
 	if c.Root == "" {
 		return nil, fmt.Errorf("build tree: Root is required")
+	}
+	if c.Epoch < 1 {
+		return nil, fmt.Errorf("build tree: Epoch must be ≥ 1 (the arbiter mints it), got %d", c.Epoch)
+	}
+	if c.Rev < 1 {
+		return nil, fmt.Errorf("build tree: Rev must be ≥ 1, got %d", c.Rev)
+	}
+	if prev != nil && prev.Epoch == c.Epoch && c.Rev <= prev.Rev {
+		return nil, fmt.Errorf("build tree: Rev %d does not advance on the previous tree's rev %d in epoch %d; no peer would accept it",
+			c.Rev, prev.Rev, c.Epoch)
 	}
 	if len(nodes) == 0 {
 		return nil, fmt.Errorf("build tree: no nodes")
@@ -134,23 +221,9 @@ func BuildTree(nodes []Node, c Constraints) (*Topology, error) {
 	children := map[string]int{}
 	attachedOrder := []string{root.Name}
 
-	// Consider nodes strongest-first (upload desc, then name for determinism).
-	others := make([]Node, 0, len(nodes)-1)
-	for _, n := range nodes {
-		if n.Name != root.Name {
-			others = append(others, n)
-		}
-	}
-	sort.Slice(others, func(i, j int) bool {
-		if others[i].UploadKbps != others[j].UploadKbps {
-			return others[i].UploadKbps > others[j].UploadKbps
-		}
-		return others[i].Name < others[j].Name
-	})
-
-	var edges []Edge
-	for _, u := range others {
-		parent, err := bestParent(u, byName, c, depth, children, attachedOrder)
+	edges := make([]Edge, 0, len(nodes)-1)
+	for _, u := range processingOrder(nodes, byName, prev, root.Name) {
+		parent, err := bestParent(u, byName, c, depth, children, attachedOrder, prev)
 		if err != nil {
 			return nil, err
 		}
@@ -159,18 +232,96 @@ func BuildTree(nodes []Node, c Constraints) (*Topology, error) {
 		children[parent]++
 		attachedOrder = append(attachedOrder, u.Name)
 	}
-	return &Topology{Edges: edges}, nil
+
+	topo := &Topology{Epoch: c.Epoch, Rev: c.Rev, Root: root.Name, Edges: edges}
+	topo.Backups = assignBackups(topo, byName, c, attachedOrder)
+	return topo, nil
+}
+
+// processingOrder fixes the order nodes are attached in, which is the fix for the
+// memoryless-rebuild defect. A purely upload-descending order (the Phase 4 rule)
+// let a strong joiner claim a parent's capacity ahead of the incumbents already
+// using it, re-parenting the world on every join. The order is:
+//
+//  1. prev's ROOT, if it is still present and is not the new root. It is neither an
+//     incumbent (it has no parent in prev, so it appears nowhere in prev.Edges) nor
+//     a newcomer, and prev.Edges implicitly starts at it — so it is placed at that
+//     implicit position. Placing it here, rather than with the newcomers, is what
+//     lets its former children keep it as their parent after a re-root instead of
+//     being scattered because their parent had not been attached yet.
+//  2. Incumbents, in prev.Edges order. That order is topological by invariant, so
+//     parents are placed before their children — which is why the invariant is
+//     load-bearing and not decoration.
+//  3. Newcomers — everything left — sorted upload descending, then name ascending.
+//
+// With prev == nil steps 1 and 2 are empty and this degenerates exactly to the
+// Phase 4 order.
+func processingOrder(nodes []Node, byName map[string]Node, prev *Topology, root string) []Node {
+	placed := map[string]bool{root: true}
+	out := make([]Node, 0, len(nodes))
+	take := func(name string) {
+		if placed[name] {
+			return
+		}
+		n, ok := byName[name]
+		if !ok {
+			return // named in prev but no longer in the fleet
+		}
+		placed[name] = true
+		out = append(out, n)
+	}
+
+	if prev != nil {
+		take(prev.Root)
+		for _, e := range prev.Edges {
+			take(e.Child)
+		}
+	}
+
+	newcomers := make([]Node, 0, len(nodes))
+	for _, n := range nodes { // slice order in, so the sort below is total and stable
+		if !placed[n.Name] {
+			newcomers = append(newcomers, n)
+		}
+	}
+	sort.Slice(newcomers, func(i, j int) bool {
+		if newcomers[i].UploadKbps != newcomers[j].UploadKbps {
+			return newcomers[i].UploadKbps > newcomers[j].UploadKbps
+		}
+		return newcomers[i].Name < newcomers[j].Name
+	})
+	return append(out, newcomers...)
 }
 
 // bestParent picks the parent for u among the already-attached nodes, or errors if
-// none can take it. Selection order: eligible (non-leaf, within depth, spare
-// capacity), then minimum RTT, then fewest children (balance), then name.
-func bestParent(u Node, byName map[string]Node, c Constraints, depth, children map[string]int, attached []string) (string, error) {
-	best := ""
-	bestRTT := math.Inf(1)
-	bestChildren := math.MaxInt
-
+// none can take it. The preference ordering is lexicographic and total:
+//
+//	rank 0  hard filters — attached, able to parent, within depth, spare capacity;
+//	rank 1  INCUMBENCY — u's parent in prev wins unless a candidate beats it by
+//	        more than c.StickinessMs of RTT;
+//	rank 2  minimum RTT (unknown scores worst);
+//	rank 3  fewest children (load balance — what makes attachment sane on a LAN
+//	        where no RTT has been measured);
+//	rank 4  name ascending (determinism; no ties survive).
+//
+// Rank 1 sits ABOVE RTT and ABOVE load and BELOW the hard constraints, and that
+// placement is the whole design: re-parenting costs a visible stream interruption,
+// so a 5 ms RTT win or a less-loaded sibling must not buy one, while an incumbent
+// that is gone, TURN-bound, full, or too deep is simply not a candidate — stickiness
+// must never produce an invalid tree.
+//
+// Rejected alternative: a scored objective (cost = α·rtt + β·churn + γ·load, pick
+// the argmin). More expressive, and one knob would trade all three off smoothly. It
+// lost on explainability: a lexicographic ordering answers "why is B parented to R?"
+// by walking four rules, while a weighted sum requires reconstructing three floats
+// and their weights — false precision over inputs this noisy.
+func bestParent(u Node, byName map[string]Node, c Constraints, depth, children map[string]int, attached []string, prev *Topology) (string, error) {
+	// Rank 0: the eligible set, in attach order.
+	eligible := make([]string, 0, len(attached))
 	for _, name := range attached {
+		if name == u.Name {
+			continue
+		}
 		p := byName[name]
 		if capacityOf(p, c) == 0 {
 			continue // TURN-bound or too little upload to parent anyone
@@ -181,44 +332,134 @@ func bestParent(u Node, byName map[string]Node, c Constraints, depth, children m
 		if children[name] >= capacityOf(p, c) {
 			continue // degree bound reached
 		}
-		rtt := unknownRTT
-		if v, ok := u.RTT[name]; ok {
-			rtt = v
+		eligible = append(eligible, name)
+	}
+	if len(eligible) == 0 {
+		return "", fmt.Errorf("build tree: cannot attach %q — no relay has spare upload within depth %d (fleet is over-constrained%s)",
+			u.Name, c.MaxDepth, stabilityHint(prev))
+	}
+
+	// Rank 1: incumbency. Only a materially closer parent breaks it.
+	if prev != nil {
+		if incumbent := prev.ParentOf(u.Name); incumbent != "" && contains(eligible, incumbent) {
+			incumbentRTT := rttTo(u, incumbent)
+			beaten := false
+			for _, q := range eligible {
+				if q != incumbent && rttTo(u, q)+c.StickinessMs < incumbentRTT {
+					beaten = true
+					break
+				}
+			}
+			if !beaten {
+				return incumbent, nil
+			}
 		}
-		// Total, deterministic comparison: RTT, then load, then name.
+	}
+
+	// Ranks 2–4.
+	best, bestRTT, bestChildren := "", math.Inf(1), math.MaxInt
+	for _, name := range eligible {
+		rtt := rttTo(u, name)
 		better := rtt < bestRTT ||
 			(rtt == bestRTT && children[name] < bestChildren) ||
-			(rtt == bestRTT && children[name] == bestChildren && (best == "" || name < best))
+			(rtt == bestRTT && children[name] == bestChildren && name < best)
 		if best == "" || better {
 			best, bestRTT, bestChildren = name, rtt, children[name]
 		}
 	}
-	if best == "" {
-		return "", fmt.Errorf("build tree: cannot attach %q — no relay has spare upload within depth %d (fleet is over-constrained)", u.Name, c.MaxDepth)
-	}
 	return best, nil
 }
 
-// PickRoot chooses a sensible root for BuildTree: the highest-upload node that can
-// actually parent (not TURN-bound), ties broken by name for determinism. BuildTree
-// takes an explicit root because the caller may have a policy of its own; this is
-// the default policy the coordinator and the simnet harness share so they do not
-// each reinvent it. Returns "" when no node can be a relay for the others (all
-// TURN-bound with more than one node), which the caller treats as "unbuildable"; a
-// lone TURN node is returned as-is, since a one-node tree is trivially valid.
-func PickRoot(nodes []Node) string {
-	best := ""
-	bestUp := -1
-	for _, n := range nodes {
-		if n.NAT == NATRelayed {
-			continue // a TURN-bound node cannot root a tree of others
+// stabilityHint distinguishes "this fleet cannot be served at all" from "this fleet
+// cannot be served WITHOUT MOVING PEOPLE". A stability-preserving rebuild pins every
+// surviving node to its incumbent parent before the newcomers are placed, so a
+// rebuild can fail on a fleet that a from-scratch build would satisfy. Saying which
+// one happened is the difference between an operator adding upload and a caller
+// simply retrying with prev = nil.
+func stabilityHint(prev *Topology) string {
+	if prev == nil {
+		return ""
+	}
+	return "; this was a stability-preserving rebuild, so a rebuild from scratch may still succeed"
+}
+
+// rttTo scores the link from u to name, treating an unmeasured pair as worst-case.
+func rttTo(u Node, name string) float64 {
+	if v, ok := u.RTT[name]; ok {
+		return v
+	}
+	return unknownRTT
+}
+
+func contains(names []string, name string) bool {
+	for _, n := range names {
+		if n == name {
+			return true
 		}
-		if n.UploadKbps > bestUp || (n.UploadKbps == bestUp && (best == "" || n.Name < best)) {
+	}
+	return false
+}
+
+// PickRoot chooses the tree's root. Three rules, in order:
+//
+//  1. NEVER a provisional node, and never a node that cannot parent (TURN-bound, or
+//     no upload budget at all). Rooting on an assumed default is how the root flaps
+//     on telemetry ARRIVAL ORDER rather than on telemetry CONTENT — nondeterminism
+//     the deterministic-simulation contract exists to eliminate.
+//  2. KEEP THE INCUMBENT. If prev is non-nil and prev.Root is present,
+//     non-provisional and still able to parent, it is retained unless some eligible
+//     challenger advertises at least RootChangeMarginKbps more upload than it.
+//  3. Otherwise: highest-upload eligible node, ties broken by name.
+//
+// Returns "" when no eligible node exists, which the caller treats as "not ready /
+// unbuildable" rather than as an error. A lone node is returned as-is (a one-node
+// tree is trivially valid) EVEN IF provisional — there is nothing to be wrong about.
+//
+// Root churn is the single most expensive thing this control plane can do: with a
+// stability-preserving builder, a changed root invalidates every parent choice in
+// the tree at once, which is the exact opposite of the "move one subtree, not the
+// world" property the design exists to provide. Hence a stickiness rule of its own,
+// stronger than the per-node one.
+//
+// Note "able to parent" is judged here as UploadKbps > 0, because PickRoot is not
+// given the per-stream cost. BuildTree remains the authority and will still reject
+// a root whose budget cannot cover one child at the actual StreamKbps; what this
+// rule removes is the far more common case — a peer projected at the assumed
+// default of zero being handed the root because its frame happened to arrive first.
+func PickRoot(nodes []Node, prev *Topology) string {
+	if len(nodes) == 1 {
+		return nodes[0].Name
+	}
+
+	eligible := func(n Node) bool {
+		return !n.Provisional && n.NAT != NATRelayed && n.UploadKbps > 0
+	}
+
+	// Rule 3's answer, computed first because rule 2 needs the best challenger.
+	best, bestUp := "", -1
+	for _, n := range nodes { // slice order: never a map range
+		if !eligible(n) {
+			continue
+		}
+		if n.UploadKbps > bestUp || (n.UploadKbps == bestUp && n.Name < best) {
 			best, bestUp = n.Name, n.UploadKbps
 		}
 	}
-	if best == "" && len(nodes) == 1 {
-		return nodes[0].Name
+	if best == "" {
+		return ""
+	}
+
+	// Rule 2: the incumbent keeps the role unless beaten by the whole margin.
+	if prev != nil && prev.Root != "" {
+		for _, n := range nodes {
+			if n.Name != prev.Root {
+				continue
+			}
+			if eligible(n) && bestUp < n.UploadKbps+RootChangeMarginKbps {
+				return n.Name
+			}
+			break
+		}
 	}
 	return best
 }
