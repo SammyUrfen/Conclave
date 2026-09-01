@@ -68,11 +68,7 @@ type frameItem struct {
 	// dequeue time. Deferring the read to the writer is what makes ordering exact —
 	// the frame's position in the queue is fixed at mint time, so no event published
 	// during the read can slip in front of the snapshot it is already reflected in.
-	snapshot bool
-	// stale is the fence-rejection count captured when a snapshot frame was minted,
-	// so the count in the body and the stale_rejected deltas that follow it add up
-	// exactly once each.
-	stale      uint64
+	snapshot   bool
 	epoch, rev uint64
 	kind       string
 	// data is shared, unmodified, by every subscriber. Nothing mutates it after
@@ -296,7 +292,7 @@ func (s *Server) materialise(ctx context.Context, st *stream, it frameItem) (env
 			Kind: it.kind, Data: it.data,
 		}, true
 	}
-	body, err := s.snapshotBody(ctx, st.sub.meetID, it.stale)
+	body, err := s.snapshotBody(ctx, st.sub.meetID)
 	if err != nil {
 		if errors.Is(err, arbiter.ErrMeetNotFound) {
 			// §9.4a: 1001 "going away" means the meet is gone. The client stops and
@@ -339,10 +335,9 @@ func (s *Server) finish(st *stream) {
 // Registration happens BEFORE the snapshot is read (the writer does that), so no event
 // can fall into the gap between "the snapshot was taken" and "we started listening".
 // The cost of choosing that direction is that an event published in that window may be
-// delivered as a delta even though the snapshot already reflects it — a duplicate,
-// which every delta in web/js/state.js applies idempotently. The one counter that would
-// double-count, stale_rejected, is captured here at mint time rather than read later,
-// so it cannot.
+// delivered as a delta even though the snapshot already reflects it — a duplicate. Every
+// delta is idempotent under that: each carries an ABSOLUTE value (a full tree, a health
+// verdict, a cumulative refusal total), never an increment to be applied.
 func (s *Server) subscribe(meetID string) (*subscription, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -356,7 +351,7 @@ func (s *Server) subscribe(meetID string) (*subscription, bool) {
 		stop:   make(chan struct{}),
 	}
 	sub.produced = 1
-	sub.first = frameItem{seq: 1, snapshot: true, stale: ms.stale, at: s.clk.Now()}
+	sub.first = frameItem{seq: 1, snapshot: true, at: s.clk.Now()}
 	ms.subs[sub] = struct{}{}
 	return sub, true
 }
@@ -389,8 +384,8 @@ func (s *Server) mintPong(sub *subscription) {
 func (s *Server) mintSnapshot(sub *subscription) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ms := s.streamLocked(sub.meetID)
-	s.enqueueLocked(sub, frameItem{snapshot: true, stale: ms.stale, at: s.clk.Now()})
+	s.streamLocked(sub.meetID)
+	s.enqueueLocked(sub, frameItem{snapshot: true, at: s.clk.Now()})
 }
 
 // enqueueLocked mints one frame for one subscription. Caller holds mu.
@@ -435,29 +430,19 @@ func (s *Server) Publish(ev coordinator.Event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ms := s.streamLocked(ev.RoomID)
-	switch ev.Kind {
-	case coordinator.EventHealth:
-		// INTERIM (§15.14): read ev.PrevHealth here once coordinator.Event has it, and
-		// delete ms.health entirely. Until then this is the dashboard's own memory of
-		// the series, which is wrong across a restart and for a fresh subscriber — but
-		// less wrong than emitting "" for every transition.
-		if hd, ok := data.(*healthData); ok {
-			hd.PrevHealth = string(ms.health[ev.Node])
+	// EventStale is the ONE kind whose Epoch/Rev do not describe the meet: they are the
+	// refusing PEER's fence, which coordinator.publish deliberately leaves undefaulted
+	// so a peer that adopted nothing reads as epoch 0. Folding those into the meet's
+	// tracked version would roll the operator's epoch display BACKWARDS — and keep it
+	// there, since every later versionless frame is stamped from this memory. They are
+	// carried in `data` instead (see staleData).
+	if ev.Kind != coordinator.EventStale {
+		if ev.Epoch != 0 {
+			ms.epoch = ev.Epoch
 		}
-		ms.health[ev.Node] = ev.Health
-	case coordinator.EventMember:
-		if !ev.Present {
-			// Bound the health memory by live membership.
-			delete(ms.health, ev.Node)
+		if ev.Rev != 0 {
+			ms.rev = ev.Rev
 		}
-	case coordinator.EventStale:
-		ms.stale++
-	}
-	if ev.Epoch != 0 {
-		ms.epoch = ev.Epoch
-	}
-	if ev.Rev != 0 {
-		ms.rev = ev.Rev
 	}
 	s.fanoutLocked(ms, frameItem{
 		kind: kind, data: data, epoch: ms.epoch, rev: ms.rev, at: at,
@@ -536,11 +521,14 @@ func frameForEvent(ev coordinator.Event) (string, any) {
 		if ev.Present {
 			kind = kindMemberJoined
 		}
-		return kind, &memberData{Name: ev.Node}
+		return kind, &memberData{ID: ev.NodeID, Name: ev.Node}
 	case coordinator.EventHealth:
-		// PrevHealth is filled by the caller, under the lock, from the dashboard's
-		// own INTERIM memory of this node's last published value (§15.14).
-		return kindHealthChanged, &healthData{Name: ev.Node, Health: string(ev.Health)}
+		// Both values come straight from the coordinator, which performed the
+		// transition. PrevHealth == Health is legal (a sustained-degradation verdict)
+		// and is passed through rather than normalised away.
+		return kindHealthChanged, &healthData{
+			Name: ev.Node, Health: string(ev.Health), PrevHealth: string(ev.PrevHealth),
+		}
 	case coordinator.EventTopology:
 		depth, relays := treeShape(ev.Topo)
 		root := ""
@@ -568,7 +556,7 @@ func frameForEvent(ev coordinator.Event) (string, any) {
 		}
 	case coordinator.EventStale:
 		return kindStaleRejected, &staleData{
-			Name: ev.Node, Epoch: ev.Epoch, Rev: ev.Rev, Reason: ev.Reason,
+			Name: ev.Node, Epoch: ev.Epoch, Rev: ev.Rev, Total: ev.Count, Reason: ev.Reason,
 		}
 	case coordinator.EventSettling:
 		return kindSettling, &settlingData{

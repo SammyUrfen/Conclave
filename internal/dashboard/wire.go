@@ -93,19 +93,14 @@ type meetBody struct {
 	Nodes          []nodeBody   `json:"nodes"`
 	Edges          []edgeBody   `json:"edges"`
 	Backups        []backupBody `json:"backups"`
-	// StaleRejected is the visible proof of the fence: how many stale-epoch
-	// instructions were refused for the meet.
+	// StaleRejected is the visible proof of the fence: coordinator.RoomSnapshot's
+	// meet-wide total of the refusals its members have reported.
 	//
-	// BLOCKED: §15.14 ratified metrics.Heartbeat.StaleRejected as the carrier, with
-	// coordinator.RoomSnapshot/MemberSnapshot gaining StaleRejected and EventStale
-	// firing on an INCREASE carrying the total in Event.Count. None of those fields
-	// exist as of this commit, and nothing in the tree publishes EventStale at all, so
-	// this reads 0 in production and is fed by the dashboard's own interim counter.
-	//
-	// When the real value lands, note that it can DECREASE: the peer's fence resets on
-	// TypeJoined (§5.7 rule 6), so the counter resets on rejoin exactly like Seq. A
-	// decrease is legitimate and must not be read as corruption — which is precisely
-	// why the interim counter below, being monotonic, cannot simply be kept.
+	// It is READ FROM THE SNAPSHOT, never accumulated here. The number can legitimately
+	// DECREASE — a peer's fence resets on TypeJoined, so its heartbeat counter resets
+	// on rejoin exactly like Seq — and an in-process accumulator could not represent
+	// that: it would pin the display at a high-water mark belonging to a fence that no
+	// longer exists.
 	StaleRejected uint64 `json:"stale_rejected"`
 	// Converged and Diverged expose the gap between intended and realized (§9.4b).
 	// A non-empty Diverged means convergence lag, a failed apply, or a fenced-out
@@ -207,32 +202,28 @@ const (
 // The per-kind `data` shapes (§9.4).
 
 type memberData struct {
-	// ID is BLOCKED, not designed. §15.14 ruled that coordinator.Event gains NodeID —
-	// the coordinator already holds it as nodeState.id, so this was a plumbing gap and
-	// not a missing fact — and that the dashboard must read it, so a delta can be
-	// joined against nodes[] on the same server-authoritative key the snapshot uses
-	// rather than on a peer-supplied name.
-	//
-	// coordinator.Event has NO NodeID field as of this commit, so this is "" until
-	// WI-3 lands it. The fix is one line here (ev.NodeID) and TestEventKindMapping
-	// pins the "" exactly, so landing NodeID fails that test and forces the swap
-	// instead of leaving a silently empty field behind.
+	// ID is the SERVER-STAMPED peer id (coordinator.Event.NodeID), never the
+	// peer-supplied name. It is what lets a membership delta be joined against
+	// nodes[] on the same authoritative key the snapshot uses; keying on Name would
+	// key on the one field a peer controls.
 	ID   string `json:"id"`
 	Name string `json:"name"`
 }
 
 type healthData struct {
 	Name string `json:"name"`
-	// Health and PrevHealth are the transition, not a sample.
+	// Health and PrevHealth are the transition, not a sample, and BOTH come straight
+	// from the coordinator — the only party that performed the transition. The
+	// dashboard deliberately remembers nothing here: in-process memory is wrong across
+	// a restart and wrong for a fresh subscriber, whose very first frame would report
+	// "" for a node whose history it simply had not witnessed.
 	//
-	// PrevHealth is BLOCKED the same way as memberData.ID: §15.14 ruled that
-	// coordinator.Event gains PrevHealth and that the dashboard MUST NOT remember it
-	// in-process, because in-process memory is wrong across a restart and wrong for a
-	// fresh subscriber, whose first transition reports "". coordinator.Event has no
-	// such field as of this commit, so the in-process memory below is retained as an
-	// INTERIM: dropping it now would make prev_health permanently "" rather than
-	// merely "" on the first transition, which is strictly worse than the state the
-	// ruling is correcting. It must be deleted the moment Event.PrevHealth lands.
+	// PrevHealth == Health is a VALID and expected shape, not a bug to normalise away:
+	// sustained degradation and its recovery ride this event with the two equal,
+	// because the node's LIVENESS did not change — a fired dwell is a quality verdict.
+	// That equality is how a consumer separates the two cases without parsing Reason,
+	// which the coordinator promises never to make parseable, so it is passed through
+	// untouched.
 	Health     string `json:"health"`
 	PrevHealth string `json:"prev_health"`
 }
@@ -286,10 +277,21 @@ type repairData struct {
 	Resolved  bool   `json:"resolved"`
 }
 
+// staleData explains one fence refusal.
+//
+// Epoch and Rev are the PEER's fence, NOT the meet's — coordinator.publish exempts this
+// kind from its usual meet-stamping precisely so a peer that has adopted nothing shows
+// as epoch 0, which is the most diagnostic case there is. They are the numbers that
+// explain the refusal, and they belong here rather than on the envelope, whose epoch/rev
+// describe the meet.
 type staleData struct {
-	Name   string `json:"name"`
-	Epoch  uint64 `json:"epoch"`
-	Rev    uint64 `json:"rev"`
+	Name  string `json:"name"`
+	Epoch uint64 `json:"epoch"`
+	Rev   uint64 `json:"rev"`
+	// Total is that peer's cumulative refusals THIS SESSION (Event.Count). The event
+	// fires on an INCREASE, never per heartbeat, so consecutive frames report a
+	// climbing total rather than a stream of identical ones.
+	Total  uint64 `json:"total"`
 	Reason string `json:"reason"`
 }
 

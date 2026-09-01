@@ -726,13 +726,6 @@ func TestStaleRejectedCount(t *testing.T) {
 	sub.set(snap)
 	s, url := standupServer(t, Config{Subnet: sub})
 
-	// Publishing stale events must NOT move the number: the source of truth is the
-	// coordinator's snapshot, and a dashboard that also counted would double.
-	for i := 0; i < 3; i++ {
-		s.Publish(coordinator.Event{Kind: coordinator.EventStale, RoomID: "standup",
-			Node: "frank", NodeID: "p7", Epoch: 1, Rev: 1, Count: uint64(i + 1)})
-	}
-
 	conn := dialEvents(t, url, "standup", "")
 	f := readFrame(t, conn)
 	var body map[string]any
@@ -740,13 +733,29 @@ func TestStaleRejectedCount(t *testing.T) {
 		t.Fatal(err)
 	}
 	if body["stale_rejected"] != float64(2) {
-		t.Errorf("snapshot stale_rejected = %v, want 2 from RoomSnapshot.StaleRejected "+
-			"(the dashboard must not be counting events itself)", body["stale_rejected"])
+		t.Errorf("snapshot stale_rejected = %v, want 2 from RoomSnapshot.StaleRejected",
+			body["stale_rejected"])
 	}
+
+	// Observing three more refusals must NOT move the dashboard's number: the source of
+	// truth is the coordinator's snapshot, and a dashboard that also counted would
+	// double every one of them.
 	for i := 0; i < 3; i++ {
+		s.Publish(coordinator.Event{Kind: coordinator.EventStale, RoomID: "standup",
+			Node: "frank", NodeID: "p7", Epoch: 1, Rev: 1, Count: uint64(i + 1)})
 		if got := readFrame(t, conn); got.Kind != "stale_rejected" {
 			t.Fatalf("frame %d kind = %q", i, got.Kind)
 		}
+	}
+	writeOp(t, conn, "resync")
+	f = readFrame(t, conn)
+	if err := json.Unmarshal(f.Data, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["stale_rejected"] != float64(2) {
+		t.Errorf("after three observed refusals stale_rejected = %v, want 2 — the "+
+			"dashboard must report the coordinator's total, not accumulate its own",
+			body["stale_rejected"])
 	}
 
 	// The peer rejoins: its fence resets, so the meet total DROPS. The dashboard must

@@ -146,7 +146,7 @@ func (s *Server) handleMeet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	body, err := s.snapshotBody(r.Context(), id, s.staleCount(id))
+	body, err := s.snapshotBody(r.Context(), id)
 	if err != nil {
 		s.writeSourceError(w, "snapshot", err, map[string]any{"id": id})
 		return
