@@ -70,8 +70,8 @@ func TestBootstrap(t *testing.T) {
 		if got[0].RoomID != "m" {
 			t.Errorf("RoomID = %q, want m", got[0].RoomID)
 		}
-		if got[0].IssuedAtUnixMs != epoch0.UnixMilli() {
-			t.Errorf("IssuedAtUnixMs = %d, want %d (the injected clock)", got[0].IssuedAtUnixMs, epoch0.UnixMilli())
+		if !got[0].IssuedAt.Equal(epoch0) {
+			t.Errorf("IssuedAt = %v, want %v (the injected clock)", got[0].IssuedAt, epoch0)
 		}
 	})
 
@@ -273,7 +273,7 @@ func TestFailover(t *testing.T) {
 		h.wantCoord("m", "bob", 2) // MinTermDuration still applies to a voluntary move
 	})
 
-	t.Run("a failure with no eligible replacement leaves the meet uncoordinated", func(t *testing.T) {
+	t.Run("a failure with no eligible replacement ANNOUNCES the vacancy at a bumped epoch", func(t *testing.T) {
 		h := newHarness(t, electing())
 		h.join("m", "p1", strong("alice"))
 		h.join("m", "p2", unwilling("bob"))
@@ -281,11 +281,56 @@ func TestFailover(t *testing.T) {
 		h.leave("m", "p1")
 
 		m := h.meet("m")
-		if m.Coordinator != "" || m.CoordinatorID != "" {
-			t.Fatalf("meet = %+v, want no coordinator when no candidate exists", m)
+		if m.Coordinator != "" || m.CoordinatorID != "" || m.ArbiterIsCoord {
+			t.Fatalf("meet = %+v, want a vacancy", m)
 		}
-		if m.Epoch != 1 {
-			t.Errorf("Epoch = %d, want 1: an epoch is minted only when a coordinator is NAMED", m.Epoch)
+		// Going silent is NOT enough: silence cannot tell a live-but-demoted
+		// coordinator to stop, and it fences a joiner to nothing rather than to the
+		// true state. Only a higher epoch naming nobody does both.
+		if m.Epoch != 2 {
+			t.Fatalf("Epoch = %d, want 2 — the vacancy is fenced by a BUMPED epoch", m.Epoch)
+		}
+		last := h.lastAnn("m")
+		if last.Reason != arbiter.ReasonVacated {
+			t.Fatalf("reason = %q, want %q", last.Reason, arbiter.ReasonVacated)
+		}
+		if last.Epoch != 2 || last.Coordinator != "" || last.CoordinatorID != "" {
+			t.Errorf("announcement = %+v, want epoch 2 naming nobody", last)
+		}
+		if last.Prev != "alice" {
+			t.Errorf("Prev = %q, want alice", last.Prev)
+		}
+	})
+
+	t.Run("the vacancy is retained and replayed to a joiner", func(t *testing.T) {
+		h := newHarness(t, electing())
+		h.join("m", "p1", strong("alice"))
+		h.join("m", "p2", unwilling("bob"))
+		h.leave("m", "p1")
+		before := len(h.ann.forRoom("m"))
+
+		h.join("m", "p4", unwilling("dan"))
+
+		got := h.ann.forRoom("m")
+		if len(got) != before+1 {
+			t.Fatalf("announcements = %d, want %d — the vacancy must be replayed", len(got), before+1)
+		}
+		last := got[len(got)-1]
+		if last.Reason != arbiter.ReasonVacated || last.Epoch != 2 {
+			t.Errorf("replayed = %+v, want the retained vacancy at epoch 2", last)
+		}
+	})
+
+	t.Run("a vacancy is announced once, not once per membership change", func(t *testing.T) {
+		h := newHarness(t, electing())
+		h.join("m", "p1", strong("alice"))
+		h.join("m", "p2", unwilling("bob"))
+		h.leave("m", "p1")
+		h.join("m", "p4", unwilling("dan"))
+		h.leave("m", "p4")
+
+		if got := h.meet("m").Epoch; got != 2 {
+			t.Errorf("Epoch = %d, want 2 — re-entering a vacancy already announced burns no epoch", got)
 		}
 	})
 
@@ -297,7 +342,7 @@ func TestFailover(t *testing.T) {
 
 		h.join("m", "p3", mid("carol"))
 
-		h.wantCoord("m", "carol", 2)
+		h.wantCoord("m", "carol", 3) // 1 bootstrap, 2 vacancy, 3 the new term
 		if last := h.lastAnn("m"); last.Reason != arbiter.ReasonBootstrap {
 			t.Errorf("reason = %q, want %q — the meet had no coordinator to fail over from",
 				last.Reason, arbiter.ReasonBootstrap)
@@ -666,8 +711,8 @@ func TestForceElection(t *testing.T) {
 
 	t.Run("an unknown meet is an error", func(t *testing.T) {
 		h := newHarness(t, electing())
-		if err := force(t, h, "nope", ""); !errors.Is(err, arbiter.ErrNoSuchMeet) {
-			t.Errorf("err = %v, want ErrNoSuchMeet", err)
+		if err := force(t, h, "nope", ""); !errors.Is(err, arbiter.ErrMeetNotFound) {
+			t.Errorf("err = %v, want ErrMeetNotFound", err)
 		}
 	})
 
@@ -759,8 +804,8 @@ func TestMeetRegistry(t *testing.T) {
 		h := newHarness(t, electing())
 		ctx, cancel := context.WithTimeout(context.Background(), syncWait)
 		defer cancel()
-		if _, err := h.a.GetMeet(ctx, "nope"); !errors.Is(err, arbiter.ErrNoSuchMeet) {
-			t.Errorf("err = %v, want ErrNoSuchMeet", err)
+		if _, err := h.a.GetMeet(ctx, "nope"); !errors.Is(err, arbiter.ErrMeetNotFound) {
+			t.Errorf("err = %v, want ErrMeetNotFound", err)
 		}
 	})
 
@@ -837,20 +882,17 @@ func TestMeetDerivation(t *testing.T) {
 		if m.Depth != 2 {
 			t.Errorf("Depth = %d, want 2 hops root->leaf", m.Depth)
 		}
-		if m.Rev != 4 {
-			t.Errorf("Rev = %d, want 4 (the newest revision any member realized)", m.Rev)
-		}
 	})
 
-	t.Run("a revision from a stale epoch is ignored", func(t *testing.T) {
-		h := newHarness(t, electing())
-		h.join("m", "p1", strong("alice"))
-		h.join("m", "p2", mid("bob"))
-		h.beatTree("m", "p1", "", []string{"bob"}, 1, 2)
-		h.beatTree("m", "p2", "alice", nil, 99, 900) // a peer from another era
-
-		if got := h.meet("m").Rev; got != 2 {
-			t.Errorf("Rev = %d, want 2: a rev under a foreign epoch is meaningless here", got)
+	// Rev is a coordinator counter, not an observable. A heartbeat-derived rev would be
+	// a fabricated number wearing an authoritative name, so the field must not exist —
+	// which, like the upload exclusion, can only be asserted against the type.
+	t.Run("Meet carries no Rev", func(t *testing.T) {
+		mt := reflect.TypeOf(arbiter.Meet{})
+		for i := 0; i < mt.NumField(); i++ {
+			if n := mt.Field(i).Name; strings.EqualFold(n, "rev") {
+				t.Errorf("Meet.%s: rev is the coordinator's counter and is not observable here", n)
+			}
 		}
 	})
 }
@@ -942,7 +984,7 @@ func TestElectDisabled(t *testing.T) {
 		}
 	})
 
-	t.Run("with both, the arbiter bootstraps and then hands over", func(t *testing.T) {
+	t.Run("with both, the arbiter hands over on the DWELL alone", func(t *testing.T) {
 		cfg := electing()
 		cfg.Coordinate = true
 		h := newHarness(t, cfg)
@@ -951,12 +993,35 @@ func TestElectDisabled(t *testing.T) {
 			t.Fatal("want the arbiter to hold the role at bootstrap")
 		}
 
-		h.elapse("m", 61*time.Second)
+		// MinTermDuration gates only transitions that COULD flap. The arbiter does
+		// not compete for the role, so arbiter->peer happens at most once per meet
+		// and gating it just costs a minute in a stepping-stone configuration.
+		h.elapseCurrent("m", 19*time.Second)
+		if !h.meet("m").ArbiterIsCoord {
+			t.Fatal("handed over before ElectionDwell elapsed")
+		}
 
+		h.elapseCurrent("m", 2*time.Second)
 		m := h.meet("m")
 		if m.ArbiterIsCoord || m.Coordinator != "alice" || m.Epoch != 2 {
-			t.Errorf("meet = %+v, want alice coordinating at epoch 2", m)
+			t.Errorf("meet = %+v, want alice coordinating at epoch 2 after ~20s, not 60s", m)
 		}
+	})
+
+	t.Run("a peer-to-peer handover is still gated by MinTermDuration", func(t *testing.T) {
+		cfg := electing()
+		cfg.Coordinate = true
+		h := newHarness(t, cfg)
+		h.join("m", "p1", mid("alice"))
+		h.elapseCurrent("m", 21*time.Second) // arbiter -> alice, ungated
+		h.wantCoord("m", "alice", 2)
+
+		h.join("m", "p2", strong("bob"))
+		h.elapseCurrent("m", 30*time.Second) // dwell cleared, term floor not
+		h.wantCoord("m", "alice", 2)
+
+		h.elapseCurrent("m", 31*time.Second)
+		h.wantCoord("m", "bob", 3)
 	})
 }
 
