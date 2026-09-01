@@ -167,11 +167,15 @@ func TestCPUSamplerDeltas(t *testing.T) {
 // entire boot-average, reported as the current instant.
 func TestCPUSamplerRejectsUnparseableWithoutLosingItsBaseline(t *testing.T) {
 	var s CPUSampler
-	s.sampleFrom([]byte(procStat("cpu  0 0 0 0 0 0 0 0 0 0")))
+	// The baseline must be NON-ZERO. With a zero baseline this test passes against
+	// the very mutation it exists to catch — resetting prev to the zero cpuTimes is
+	// indistinguishable from keeping a zero baseline — which is how a test ends up
+	// measuring nothing while reading as coverage.
+	s.sampleFrom([]byte(procStat("cpu  100 0 0 100 0 0 0 0 0 0")))
 	if _, ok := s.sampleFrom([]byte("garbage")); ok {
 		t.Fatal("an unparseable read must not report a value")
 	}
-	got, ok := s.sampleFrom([]byte(procStat("cpu  30 0 0 70 0 0 0 0 0 0")))
+	got, ok := s.sampleFrom([]byte(procStat("cpu  130 0 0 170 0 0 0 0 0 0")))
 	if !ok {
 		t.Fatal("the sample after a bad read must report a value")
 	}
