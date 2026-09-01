@@ -354,20 +354,33 @@ func TestEventStreamCloseCodes(t *testing.T) {
 // the SAME allow-list the REST surface uses, and a non-matching origin gets the
 // upgrade REFUSED — not a 200 with an empty stream. Both halves matter: the deny case
 // proves the check exists, the allow case proves it is not simply deny-everything.
+//
+// The status is asserted EXACTLY, because §15.14 corrected the contract here: an
+// origin rejection is an HTTP 403 on the HANDSHAKE, so no WebSocket is ever
+// established and there is NO close code. v2.4 wrongly filed this under 1008, which
+// is unreachable; a client that waited for a close event would hang instead of
+// surfacing a -allowed-origins misconfiguration.
 func TestEventStreamOriginRejected(t *testing.T) {
 	_, url := standupServer(t, Config{})
 
-	if _, res, err := dialEventsErr(t, url, "standup", "https://evil.example"); err == nil {
-		t.Errorf("upgrade succeeded from a non-allowed origin")
-	} else if res != nil && res.StatusCode == http.StatusSwitchingProtocols {
-		t.Errorf("upgrade returned 101 for a rejected origin")
+	conn, res, err := dialEventsErr(t, url, "standup", "https://evil.example")
+	if err == nil {
+		conn.CloseNow()
+		t.Fatalf("upgrade succeeded from a non-allowed origin")
+	}
+	if res == nil {
+		t.Fatalf("no HTTP response for a rejected upgrade: %v", err)
+	}
+	if res.StatusCode != http.StatusForbidden {
+		t.Errorf("rejected upgrade status = %d, want 403 — the client distinguishes a "+
+			"config error from a retryable close by exactly this (§9.4a, v2.6)", res.StatusCode)
 	}
 
-	conn, _, err := dialEventsErr(t, url, "standup", "https://sammyurfen.github.io")
+	ok, _, err := dialEventsErr(t, url, "standup", "https://sammyurfen.github.io")
 	if err != nil {
 		t.Fatalf("upgrade REFUSED for an allowed origin (%v) — the check is deny-everything", err)
 	}
-	conn.CloseNow()
+	ok.CloseNow()
 }
 
 // TestEventKindMapping is the exhaustive §9.4 fan-in table: every coordinator and
@@ -386,12 +399,20 @@ func TestEventKindMapping(t *testing.T) {
 		emit func(s *Server)
 		kind string
 		want map[string]any
+		// absent names keys that MUST NOT appear. A contract that removes a field is
+		// only tested by asserting its absence: checking the surviving fields passes
+		// just as well when the removed one is still there.
+		absent []string
 	}{
 		{
 			name: "member_joined",
 			emit: func(s *Server) {
 				s.Publish(coordinator.Event{Kind: coordinator.EventMember, RoomID: "standup", Node: "frank", Present: true})
 			},
+			// id is "" until coordinator.Event gains NodeID (ruled in §15.14, NOT YET
+			// SHIPPED in internal/coordinator). This assertion is deliberately exact so
+			// that landing NodeID FAILS here and forces the dashboard to consume it,
+			// rather than leaving a silently empty field behind.
 			kind: "member_joined", want: map[string]any{"name": "frank", "id": ""},
 		},
 		{
@@ -436,7 +457,12 @@ func TestEventKindMapping(t *testing.T) {
 			},
 			kind: "reparent",
 			want: map[string]any{"name": "dave", "from": "bob", "to": "carol",
-				"self_promoted": true, "reason": "primary gone"},
+				"reason": "primary gone"},
+			// §15.14 REMOVED self_promoted: coordinator.EventReparent is emitted only
+			// from the self-promotion path by construction (a coordinator-decided move
+			// arrives as failover + topology), so the field could only ever hold one
+			// value — the third instance of that trap in this build.
+			absent: []string{"self_promoted"},
 		},
 		{
 			name: "failover",
@@ -527,6 +553,11 @@ func TestEventKindMapping(t *testing.T) {
 			for k, want := range tt.want {
 				if fmt.Sprint(got[k]) != fmt.Sprint(want) {
 					t.Errorf("data.%s = %#v, want %#v", k, got[k], want)
+				}
+			}
+			for _, k := range tt.absent {
+				if _, present := got[k]; present {
+					t.Errorf("data still carries %q, which the contract removed: %v", k, got)
 				}
 			}
 		})

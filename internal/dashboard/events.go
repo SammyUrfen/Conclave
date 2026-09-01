@@ -138,8 +138,14 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// A WebSocket upgrade is NOT subject to CORS — the browser sends Origin and it is
 	// the server's job to check it. The SAME allow-list drives this and the REST
 	// surface, injected from one parsed value, because a security control that exists
-	// in two places is one that will diverge (§2.4). A non-matching origin gets the
-	// upgrade refused by Accept, not a 200 with an empty stream.
+	// in two places is one that will diverge (§2.4).
+	//
+	// A non-matching origin is refused by Accept with an HTTP 403 on the HANDSHAKE, so
+	// NO WebSocket is established and there is NO close code — 1008 is unreachable here
+	// and v2.4's table was wrong to list it (corrected in §15.14). Do not "improve"
+	// this by accepting the upgrade and then closing with 1008: that would turn a
+	// configuration error the client can name (-allowed-origins) into a close event
+	// indistinguishable from a policy violation mid-stream.
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		OriginPatterns: s.origins.Patterns(),
 	})
@@ -431,8 +437,10 @@ func (s *Server) Publish(ev coordinator.Event) {
 	ms := s.streamLocked(ev.RoomID)
 	switch ev.Kind {
 	case coordinator.EventHealth:
-		// prev_health is the dashboard's own memory of the series (§9.4 asks for it;
-		// coordinator.Event carries only the new value).
+		// INTERIM (§15.14): read ev.PrevHealth here once coordinator.Event has it, and
+		// delete ms.health entirely. Until then this is the dashboard's own memory of
+		// the series, which is wrong across a restart and for a fresh subscriber — but
+		// less wrong than emitting "" for every transition.
 		if hd, ok := data.(*healthData); ok {
 			hd.PrevHealth = string(ms.health[ev.Node])
 		}
@@ -531,7 +539,7 @@ func frameForEvent(ev coordinator.Event) (string, any) {
 		return kind, &memberData{Name: ev.Node}
 	case coordinator.EventHealth:
 		// PrevHealth is filled by the caller, under the lock, from the dashboard's
-		// own memory of this node's last published value.
+		// own INTERIM memory of this node's last published value (§15.14).
 		return kindHealthChanged, &healthData{Name: ev.Node, Health: string(ev.Health)}
 	case coordinator.EventTopology:
 		depth, relays := treeShape(ev.Topo)
@@ -550,8 +558,7 @@ func frameForEvent(ev coordinator.Event) (string, any) {
 		}
 	case coordinator.EventReparent:
 		return kindReparent, &reparentData{
-			Name: ev.Node, From: ev.PrevParent, To: ev.Parent,
-			SelfPromoted: true, Reason: ev.Reason,
+			Name: ev.Node, From: ev.PrevParent, To: ev.Parent, Reason: ev.Reason,
 		}
 	case coordinator.EventFailover:
 		return kindFailover, &failoverData{

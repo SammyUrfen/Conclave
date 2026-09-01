@@ -67,7 +67,11 @@ func TestGetMeetSnapshot(t *testing.T) {
 	// weights, never by calling Score in the test — a test that re-derives its
 	// expectation from the code under test proves only that the code is consistent
 	// with itself. Uptime is 0 for every node: coordinator.MemberSnapshot carries no
-	// join time, so the dashboard cannot supply that term (reported as a §9 gap).
+	// join time, so the dashboard cannot supply that term. §15.14 ruled that the wire
+	// key is therefore `fitness_lower_bound` and NOT `fitness`: a value quietly short
+	// by up to the 0.15 uptime weight is invisibly wrong, and the name is what makes
+	// it announce itself. The absence assertion below is the load-bearing half —
+	// emitting BOTH keys would satisfy a rename test that only checked the new one.
 	//   alice: .30*.69 + .35*(1-12.5/300) + .20*(1-0.2/10) = 0.738
 	//   bob:   .30*.45 + .35*(1-240/300)  + .20*(1-6.1/10) = 0.283
 	//   carol: .30*.88 + .35*(1-18.4/300) + .20*1          = 0.793
@@ -145,9 +149,17 @@ func TestGetMeetSnapshot(t *testing.T) {
 			if fmt.Sprint(got) != fmt.Sprint(tt.kids) && !(len(got) == 0 && len(tt.kids) == 0) {
 				t.Errorf("%s.children = %v, want %v", tt.name, got, tt.kids)
 			}
-			f, _ := n["fitness"].(float64)
+			f, ok := n["fitness_lower_bound"].(float64)
+			if !ok {
+				t.Fatalf("%s has no fitness_lower_bound: %#v", tt.name, n["fitness_lower_bound"])
+			}
 			if math.Abs(f-tt.fitness) > 1e-9 {
-				t.Errorf("%s.fitness = %v, want %v (3 decimals, §9.4a)", tt.name, f, tt.fitness)
+				t.Errorf("%s.fitness_lower_bound = %v, want %v (3 decimals, §9.4a)", tt.name, f, tt.fitness)
+			}
+			if _, present := n["fitness"]; present {
+				t.Errorf("%s still carries the bare `fitness` key; §15.14 renamed it to "+
+					"fitness_lower_bound and emitting both would let the UI keep reading "+
+					"the unlabelled one", tt.name)
 			}
 		})
 	}
@@ -272,7 +284,7 @@ func TestNodeValueSanitising(t *testing.T) {
 		m := n.(map[string]any)
 		byName[m["name"].(string)] = m
 	}
-	for _, k := range []string{"rtt_server_ms", "loss_pct", "cpu_pct", "fitness"} {
+	for _, k := range []string{"rtt_server_ms", "loss_pct", "cpu_pct", "fitness_lower_bound"} {
 		if v := byName["nan"][k]; v != float64(0) {
 			t.Errorf("nan.%s = %#v, want 0 (non-finite clamped)", k, v)
 		}
@@ -286,11 +298,11 @@ func TestNodeValueSanitising(t *testing.T) {
 	}
 	// arbiter.Score's hard disqualifiers must survive the trip to the wire: a
 	// TURN-bound or non-live peer is INELIGIBLE to coordinate, not merely worse.
-	if f := byName["turnpeer"]["fitness"]; f != float64(0) {
-		t.Errorf("turnpeer.fitness = %#v, want 0 (NATRelayed is a hard disqualifier)", f)
+	if f := byName["turnpeer"]["fitness_lower_bound"]; f != float64(0) {
+		t.Errorf("turnpeer.fitness_lower_bound = %#v, want 0 (NATRelayed is a hard disqualifier)", f)
 	}
-	if f := byName["gonepeer"]["fitness"]; f != float64(0) {
-		t.Errorf("gonepeer.fitness = %#v, want 0 (health gone ⇒ not Live)", f)
+	if f := byName["gonepeer"]["fitness_lower_bound"]; f != float64(0) {
+		t.Errorf("gonepeer.fitness_lower_bound = %#v, want 0 (health gone ⇒ not Live)", f)
 	}
 	if v := byName["rounding"]["cpu_pct"]; v != 31.3 {
 		t.Errorf("rounding.cpu_pct = %#v, want 31.3 (1 decimal, §9.4a)", v)
