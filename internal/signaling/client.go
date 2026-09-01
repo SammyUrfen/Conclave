@@ -76,6 +76,25 @@ func (c *Client) Send(msg Message) error {
 	}
 }
 
+// Ping measures this peer's round trip to the server on the control link: it writes
+// a WebSocket PROTOCOL ping and blocks until the matching pong arrives or ctx
+// expires, so a nil return IS the round trip. metrics.RTTProbe times the call.
+//
+// It writes DIRECTLY to the connection rather than queueing on the out channel, for
+// the same reason Hub.pingLoop does: a ping routed through writePump would sit behind
+// whatever application frames are already buffered, so the measurement would report
+// queueing delay as network latency — and on a wedged peer it would never go out at
+// all. Concurrency with writePump is safe because coder/websocket serialises control
+// frames against data writes with its own internal write lock.
+//
+// It also REQUIRES a concurrent reader to consume the pong, which readPump provides
+// for the life of the connection. On a closed Client the read pump is gone and Ping
+// returns an error rather than blocking — which is the behaviour the probe relies on
+// to tell a dead link from a fast one.
+func (c *Client) Ping(ctx context.Context) error {
+	return c.conn.Ping(ctx)
+}
+
 // Incoming returns the stream of inbound frames. It is closed when the
 // connection ends, so ranging over it is a clean way to consume until disconnect.
 func (c *Client) Incoming() <-chan Message { return c.in }
