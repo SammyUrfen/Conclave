@@ -12,19 +12,32 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
-// TestPionRemoveTrackDoesNotRenegotiate PINS A LIBRARY BEHAVIOUR, not our own code.
+// TestPionRenegotiatesARemovalOnceConnected PINS A LIBRARY BEHAVIOUR, not our own
+// code — and it REPLACES an earlier pin that asserted the opposite.
 //
-// §7.2 originally assumed pion renegotiates on RemoveTrack. Measured against pion
-// v4.2.16 it does not: RemoveTrack flips the transceiver sendrecv → recvonly and
-// calls onNegotiationNeeded, but checkNegotiationNeeded concludes nothing is needed
-// and the handler never runs — while a manual CreateOffer at that exact point DOES
-// produce a correct `a=recvonly`. That gap is why Session.RemoveTrack carries
-// pendingLocalChange and nudges the serializer itself.
+// The earlier version (TestPionRemoveTrackDoesNotRenegotiate) claimed pion never
+// fires OnNegotiationNeeded for a RemoveTrack. Measured properly, that is wrong, and
+// wrong in the direction that matters: on a CONNECTED PeerConnection pion fires
+// immediately and reliably. The original measurement was taken on a pc that had
+// exchanged SDP but was still establishing — which is all `-race` ever produced,
+// because DTLS there takes seconds and every quiescence window expired first. Six
+// runs varying only the delay before the removal put the correlation beyond doubt:
+// removed while `connected` it fires within the same millisecond; removed while
+// `connecting` it fires the instant the pc connects, or not at all if it never does.
 //
-// This test exists so that a pion upgrade which FIXES the behaviour fails here
-// instead of silently shipping two offers per removal (pion's re-fire plus our
-// nudge). If it fails, the fix is to delete pendingLocalChange, not to loosen it.
-func TestPionRemoveTrackDoesNotRenegotiate(t *testing.T) {
+// That is the opposite of the production regime. A relay removes a departed source's
+// track from sessions that have been carrying media for minutes.
+//
+// So this test waits for `connected` FIRST — which is what makes the behaviour
+// deterministic under both `go test` and `go test -race` — and then pins what is
+// actually true. If a future pion stops firing here, that is a real change and the
+// nudge in Session.RemoveTrack becomes the only mechanism, so it must fail loudly
+// rather than pass by accident.
+//
+// The complementary half — that pion does NOT fire when the removal lands while the
+// pc is not stable, which is why pendingLocalChange exists at all — is pinned by
+// TestRemovalNudgeSurvivesTheAnswer, where deleting the nudge fails deterministically.
+func TestPionRenegotiatesARemovalOnceConnected(t *testing.T) {
 	bTr, aTr := newGatedPair("b", "a")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -49,23 +62,20 @@ func TestPionRemoveTrackDoesNotRenegotiate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add forward track: %v", err)
 	}
-	waitFor(t, "the initial exchange to settle", 15*time.Second, func() bool {
-		return offerer.pc.SignalingState() == webrtc.SignalingStateStable &&
-			offerer.pc.CurrentRemoteDescription() != nil
+	// CONNECTED, not merely negotiated. This is the whole difference between the two
+	// regimes, and waiting for it is what makes the test invocation-independent:
+	// under -race the handshake takes seconds, under plain `go test` a few hundred
+	// milliseconds, and the assertion below holds identically once it has completed.
+	waitFor(t, "the PeerConnection to connect", 60*time.Second, func() bool {
+		return offerer.pc.ConnectionState() == webrtc.PeerConnectionStateConnected
 	})
 	if dirs := directionLines(offerer.pc.CurrentLocalDescription().SDP); len(dirs) != 1 || dirs[0] != "a=sendrecv" {
 		t.Fatalf("local offer directions = %v, want exactly [a=sendrecv]", dirs)
 	}
 
-	// The exchange must go QUIET before anything can be attributed to the removal,
-	// and quiet has to be WAITED FOR rather than asserted. pion may legitimately fire
-	// one more negotiation round on the return to stable, so a hard "the count has
-	// not moved" check here is a load-dependent flake: on a busy machine that extra
-	// round lands after the check and is then blamed on RemoveTrack. Waiting for two
-	// consecutive quiet samples, and re-reading the baseline immediately before the
-	// removal, removes the misattribution window entirely — the assertion itself is
-	// unchanged.
-	deadline := time.Now().Add(15 * time.Second)
+	// Quiet has to be WAITED for, never asserted: pion may legitimately fire one more
+	// round on the return to stable, and a hard check here blames that on the removal.
+	deadline := time.Now().Add(30 * time.Second)
 	var settled int64
 	for {
 		settled = handlerRuns.Load()
@@ -78,22 +88,89 @@ func TestPionRemoveTrackDoesNotRenegotiate(t *testing.T) {
 		}
 	}
 
-	// Raw pion, deliberately: Session.RemoveTrack adds the nudge this test is about.
+	// Raw pion, deliberately: Session.RemoveTrack adds a nudge of its own, and this
+	// test is about what the library does unaided.
 	if err := offerer.pc.RemoveTrack(sender); err != nil {
 		t.Fatalf("pc.RemoveTrack: %v", err)
 	}
-	stableFor(t, "pion NOT to fire negotiation-needed for a removal", 500*time.Millisecond, func() bool {
-		return handlerRuns.Load() == settled
+	waitFor(t, "pion to fire negotiation-needed for the removal", 10*time.Second, func() bool {
+		return handlerRuns.Load() > settled
 	})
 
-	// ...and yet the offer that pion says is unnecessary is materially different.
+	// And the offer it asks for really does carry the removal.
 	offer, err := offerer.pc.CreateOffer(nil)
 	if err != nil {
 		t.Fatalf("create offer after removal: %v", err)
 	}
 	if dirs := directionLines(offer.SDP); len(dirs) != 1 || dirs[0] != "a=recvonly" {
-		t.Fatalf("offer after removal has directions %v, want exactly [a=recvonly] — if this now "+
-			"matches the pre-removal SDP, the finding has changed and §7.2 must be re-derived", dirs)
+		t.Fatalf("offer after removal has directions %v, want exactly [a=recvonly]", dirs)
+	}
+}
+
+// TestSessionRemoveTrackOffersExactlyOnceWhenConnected is the production invariant
+// the finding above puts at risk: on a connected session a removal is renegotiated
+// by pion AND nudged by us, so two independent sources want an offer for one change.
+// Exactly one may go out — two offers for one removal is precisely the double-offer
+// the serializer exists to prevent, reintroduced through its own fix.
+//
+// It is asserted on a CONNECTED session on purpose. The unconnected regime, where
+// pion stays silent and the nudge is the only trigger, is covered separately by
+// TestSessionRemoveTrack.
+func TestSessionRemoveTrackOffersExactlyOnceWhenConnected(t *testing.T) {
+	bTr, aTr := newGatedPair("b", "a")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	answerer, err := NewSession(SessionConfig{Log: discardLog(), SelfID: "a", PeerID: "b", Transport: aTr})
+	if err != nil {
+		t.Fatalf("new answerer: %v", err)
+	}
+	defer answerer.Close()
+	offerer, err := NewSession(SessionConfig{Log: discardLog(), SelfID: "b", PeerID: "a", Transport: bTr})
+	if err != nil {
+		t.Fatalf("new offerer: %v", err)
+	}
+	defer offerer.Close()
+	answerer.Start(ctx)
+	offerer.Start(ctx)
+
+	_, sender, err := offerer.AddForwardTrack("fwd-1", "conclave")
+	if err != nil {
+		t.Fatalf("add forward track: %v", err)
+	}
+	waitFor(t, "the PeerConnection to connect", 60*time.Second, func() bool {
+		return offerer.pc.ConnectionState() == webrtc.PeerConnectionStateConnected
+	})
+
+	deadline := time.Now().Add(30 * time.Second)
+	var before int
+	for {
+		before, _, _ = bTr.counts()
+		time.Sleep(300 * time.Millisecond)
+		if o, _, _ := bTr.counts(); o == before {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("negotiation never went quiet")
+		}
+	}
+
+	if err := offerer.RemoveTrack(sender); err != nil {
+		t.Fatalf("RemoveTrack: %v", err)
+	}
+	waitFor(t, "the renegotiating offer", 10*time.Second, func() bool {
+		o, _, _ := bTr.counts()
+		return o == before+1
+	})
+	// The window has to outlast a full offer/answer round trip, because a redundant
+	// second offer would be emitted when the FIRST one's answer lands, not straight
+	// away.
+	stableFor(t, "exactly one offer for one removal", 2*time.Second, func() bool {
+		o, _, _ := bTr.counts()
+		return o == before+1
+	})
+	if dirs := directionLines(offerer.pc.LocalDescription().SDP); len(dirs) != 1 || dirs[0] != "a=recvonly" {
+		t.Errorf("the single offer does not carry the removal: directions = %v", dirs)
 	}
 }
 

@@ -153,18 +153,27 @@ type Session struct {
 	// answer-deadline goroutine can tell "my offer is still unanswered" from "a
 	// later negotiation is in flight".
 	negGen uint64
-	// pendingLocalChange means a LOCAL mutation has been made that pion will not
-	// re-fire negotiation for on its own.
+	// pendingLocalChange means a track has been REMOVED and that removal is not yet
+	// carried in an offer.
 	//
-	// Measured against pion v4.2.16, not assumed: RemoveTrack changes the
-	// transceiver from sendrecv to recvonly and then calls onNegotiationNeeded, but
-	// checkNegotiationNeeded concludes no renegotiation is required and the handler
-	// is never invoked — while a manual CreateOffer at that moment DOES produce a
-	// correctly changed offer (a=recvonly). So for removals, and only for removals,
-	// this Session must schedule its own follow-up. It is NOT the "renegotiate
-	// later" flag the contract removed: that one raced pion on the path where pion
-	// genuinely does re-fire (AddTrack), and this one covers the path where it
-	// provably does not.
+	// Whether pion re-fires negotiation for a removal is CONDITIONAL, measured
+	// against v4.2.16 rather than assumed — and an earlier version of this comment
+	// stated the unconditional opposite, which was measured only on a pc that had
+	// not finished connecting:
+	//
+	//   - On a CONNECTED, stable pc, pion fires OnNegotiationNeeded immediately and
+	//     reliably. This flag is then belt-and-braces: the serializer collapses
+	//     pion's trigger and ours into a single offer.
+	//   - When the removal lands while the pc is NOT stable — an offer already in
+	//     flight, which is the ordinary case during a topology apply — pion's
+	//     negotiationNeededOp aborts on the signaling-state check and the
+	//     notification is simply LOST. Nothing re-raises it, and the departed
+	//     source's m-line would linger as a stale sendrecv forever.
+	//
+	// The second case is why this exists, and it is pinned by
+	// TestRemovalNudgeSurvivesTheAnswer, which fails deterministically without it.
+	// It is still NOT the "renegotiate later" flag the contract removed: that one
+	// duplicated a trigger pion supplies, this one supplies a trigger pion withholds.
 	pendingLocalChange bool
 }
 
@@ -352,20 +361,33 @@ func (s *Session) RemoveTrack(sender *webrtc.RTPSender) error {
 	if sender == nil {
 		return nil
 	}
-	err := s.pc.RemoveTrack(sender)
-	if errors.Is(err, webrtc.ErrConnectionClosed) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("remove track: %w", err)
-	}
+	// Set the flag BEFORE the removal, not after. On a connected pc, RemoveTrack
+	// makes pion fire negotiation-needed on its own operations goroutine, which can
+	// create and send the whole offer before this line would otherwise run — leaving
+	// the flag set for a change that is already on the wire, and buying a redundant
+	// second renegotiation when that offer's answer lands. Setting it first means any
+	// offer the removal provokes clears it.
 	s.mu.Lock()
 	s.pendingLocalChange = true
 	s.mu.Unlock()
+
+	err := s.pc.RemoveTrack(sender)
+	if err != nil {
+		s.mu.Lock()
+		s.pendingLocalChange = false
+		s.mu.Unlock()
+		if errors.Is(err, webrtc.ErrConnectionClosed) {
+			return nil
+		}
+		return fmt.Errorf("remove track: %w", err)
+	}
 	// Nudge the serializer, off this goroutine so a caller holding a lock (the
-	// Router's Run loop does) never runs CreateOffer inline. The serializer decides
-	// whether an offer actually goes out, so several removals in one apply still
-	// cost exactly one renegotiation — SDP is a full snapshot.
+	// Router's Run loop does) never runs CreateOffer inline. On a connected pc this
+	// usually races pion's own trigger and loses harmlessly; on a pc that is
+	// mid-negotiation it is the only trigger there is. Either way the serializer
+	// decides whether an offer actually goes out, so one removal costs exactly one
+	// renegotiation and several removals in one apply still cost one — SDP is a full
+	// snapshot.
 	s.spawn(s.onNegotiationNeeded)
 	return nil
 }
@@ -645,9 +667,10 @@ func (s *Session) onRemoteDescription(msg signaling.Message) {
 		//
 		// Issued before SetRemoteDescription it raced it: the handler read the
 		// signaling state while the pc could still be in have-local-offer, deferred,
-		// and left pendingLocalChange set. pion provably never re-fires for a
-		// removal, so nothing picked it up and the departed source's m-line lingered
-		// as exactly the stale sendrecv this mechanism exists to clear.
+		// and left pendingLocalChange set. pion does not re-fire from that state —
+		// its negotiationNeededOp aborts on the same signaling-state check — so
+		// nothing picked it up and the departed source's m-line lingered as exactly
+		// the stale sendrecv this mechanism exists to clear.
 		//
 		// Inline rather than spawned because a goroutine reintroduces the same race
 		// in miniature — its scheduling decides which state it observes — and there
