@@ -433,24 +433,7 @@ func (c *Coordinator) Heartbeat(roomID, peerID string, payload []byte) {
 		return
 	}
 	hb.Normalize()
-	// SCAFFOLD, with a stated end. metrics.Heartbeat does not yet carry the frozen
-	// `stale_rejected` key, so it is read here with a second decode of the SAME payload
-	// — not a second copy of the wire type, and not a second source of truth: one key,
-	// one type, and it is discarded the moment the field lands.
-	// TestStaleRejectedShimIsStillNeeded fails on that day and names the lines to
-	// delete, so this cannot quietly become permanent.
-	var sh staleShim
-	if err := json.Unmarshal(payload, &sh); err != nil {
-		c.log.Debug("bad heartbeat payload", slog.String("peer_id", peerID), slog.Any("error", err))
-		return
-	}
-	c.enqueue(event{kind: evBeat, roomID: roomID, peerID: peerID, beat: hb, stale: sh.StaleRejected})
-}
-
-// staleShim reads the one heartbeat key metrics.Heartbeat has no field for yet. See
-// Heartbeat.
-type staleShim struct {
-	StaleRejected uint64 `json:"stale_rejected"`
+	c.enqueue(event{kind: evBeat, roomID: roomID, peerID: peerID, beat: hb, stale: hb.StaleRejected})
 }
 
 // Reparented delivers a peer's report that it changed its own parent without being

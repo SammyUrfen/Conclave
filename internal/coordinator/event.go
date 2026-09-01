@@ -108,11 +108,19 @@ type Event struct {
 	// across a restart and wrong for a fresh subscriber, whose very first transition
 	// would report "".
 	//
-	// ONE RULE WORTH KNOWING: sustained degradation and its recovery have no event kind
-	// of their own, so they ride EventHealth — and they set PrevHealth EQUAL to Health,
-	// because a node's LIVENESS did not change. A consumer can therefore separate a
-	// liveness transition from an impairment with a comparison, rather than by parsing
-	// Reason, which this package promises never to make parseable.
+	// ONE RULE WORTH KNOWING, and it is DELIBERATE rather than an artifact: sustained
+	// degradation and its recovery have no event kind of their own, so they ride
+	// EventHealth — and they set PrevHealth EQUAL to Health, because a node's LIVENESS
+	// did not change. A consumer separates a liveness transition from an impairment with
+	// a comparison, rather than by parsing Reason, which this package promises never to
+	// make parseable.
+	//
+	// This encoding is a compact signal, not a permanent design. If impairment ever
+	// becomes a first-class row in the dashboard rather than a footnote on a health
+	// event, the right answer is a new EventKind — NOT a discriminator field, which is
+	// the trap §15.14 caught three times (Meet.EndedAt, the impairment void,
+	// reparent.self_promoted). EventKind is frozen, so that change belongs to whoever
+	// unfreezes it.
 	PrevHealth Health
 	// Count is a monotonic total carried by counting events. EventStale sets it to the
 	// peer's cumulative refusal count; Reason carries no numbers.
