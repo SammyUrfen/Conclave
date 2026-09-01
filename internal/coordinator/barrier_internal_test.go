@@ -1,19 +1,27 @@
 package coordinator
 
 // The one property everything else in this repo's deterministic test strategy rests
-// on: Sync is a SOUND quiescence barrier.
+// on: Sync is a SOUND quiescence barrier. Plus the package's other guards that can
+// only be reached white-box.
 //
-// It is proved here, white-box and single-goroutine, rather than by racing a real
-// loop. A concurrent test of this cannot discriminate: a fired timer and a sync
-// arriving at one parked select are resolved by Go's uniform-random choice, but on a
-// multi-core machine the Run goroutine is almost always already awake and reacting
-// by the time the sync is enqueued — so a broken loop passes anyway, and the test
-// reads as coverage while proving nothing. (surface_test.go's 200-trial race test is
-// kept as an end-to-end check of the same claim, but THIS is the discriminator.)
+// The barrier is proved here rather than by racing a real loop. A concurrent test
+// cannot discriminate: a fired timer and a sync arriving at one parked select are
+// resolved by Go's uniform-random choice, but on a multi-core machine the Run goroutine
+// is almost always already awake and reacting by the time the sync is enqueued — so a
+// broken loop passes anyway, and the test reads as coverage while proving nothing.
+// surface_test.go's 200-trial race test is kept as an end-to-end check of the same
+// claim, and its own comment records that it does not discriminate.
 //
-// The construction: drive handle() directly on the test goroutine, fire a deadline
-// into the wake channel with nobody consuming it, and then hand the loop a sync. The
-// sync branch must react to the pending deadline BEFORE it acks.
+// TWO MUTATIONS, TWO TESTS, and the distinction matters — a mutation audit found the
+// original claim ("THIS is the discriminator") was true for only one of them:
+//
+//   - DELETING the drain is caught by TestSyncDrainsFiredDeadlinesBeforeAcking, which
+//     drives handle() synchronously: fire a deadline into the wake channel with nobody
+//     consuming it, then hand the loop a sync, and the reaction must have happened.
+//   - REORDERING it — acking before draining — is invisible to that test, because both
+//     statements complete before handle() returns. TestSyncDrainsBeforeItAcks catches it
+//     by freezing the loop inside the reaction and asking whether the ack has already
+//     been given.
 
 import (
 	"context"
