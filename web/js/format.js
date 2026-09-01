@@ -12,11 +12,12 @@
 // This project's whole ethos is "explain the primitive, don't just hand a library" — this
 // is the from-scratch version of what a JSON-bigint npm package would otherwise do for us.
 
-const BIGINT_KEYS = new Set(['seq', 'epoch', 'rev', 'last_beat_seq']);
+const BIGINT_KEYS = new Set(['seq', 'epoch', 'rev', 'last_beat_seq', 'peer_epoch', 'meet_epoch']);
 
 // Matches `"key":123` or `"key": -123` for exactly the frozen bigint field names, and wraps
 // the digits in quotes so JSON.parse hands them to the reviver as strings, not doubles.
-const BIGINT_FIELD_RE = /"(seq|epoch|rev|last_beat_seq)":\s*(-?\d+)(?!\.)/g;
+// `peer_epoch`/`meet_epoch` are `announce_repair`'s (§9.4, v2.3+) — also uint64 on the wire.
+const BIGINT_FIELD_RE = /"(seq|epoch|rev|last_beat_seq|peer_epoch|meet_epoch)":\s*(-?\d+)(?!\.)/g;
 
 /**
  * Parse a REST or WebSocket JSON body, converting `seq`/`epoch`/`rev`/`last_beat_seq` to

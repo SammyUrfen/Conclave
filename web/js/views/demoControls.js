@@ -1,8 +1,9 @@
-// demoControls.js — §9.6 gated demo surface. Rendered ONLY when state.demoEnabled is true.
-// §9.3/§9.4a define no capability flag for whether -demo is on, and the real api.js hard-codes
-// `hasDemoCapability()` to false rather than probing with a destructive call — absent means
-// off. This panel is therefore dark against a real server until the server positively
-// advertises the capability (requested); it only renders today in fixture (?mock=1) mode.
+// demoControls.js — §9.6 gated demo surface. Rendered ONLY when state.demoEnabled is true,
+// which state.js sets straight from `demo_enabled` on the GET /api/meets body — the server
+// advertises the gated surface on the same call the dashboard already makes on connect
+// (derived server-side from the same nil check that decides whether the routes exist, so
+// the advertisement cannot drift from reality). An older server that omits the field is
+// treated as demo-off (safe default), not probed for.
 
 import { el, setChildren } from '../dom.js';
 import { str } from '../format.js';

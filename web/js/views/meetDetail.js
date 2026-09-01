@@ -73,11 +73,30 @@ function connectingLabel(status) {
 }
 
 function renderEpochBar(meet, wsStatus) {
+  // §6.8/§9.4: stale_rejected legitimately reads 0 (Phase 6 wiring for this counter is
+  // incomplete server-side) — that is honest data, not a fault, so 0 stays in the neutral
+  // colour rather than a warning colour.
   const staleRejected = typeof meet.stale_rejected === 'number' ? meet.stale_rejected : 0;
+  // Coordinator is "" for BOTH "vacant" and "the arbiter itself is coordinating" — the
+  // two are distinguished by arbiter_is_coordinator, never by testing the name for "".
+  // (arbiter.Meet.Coordinator's own doc comment says this explicitly; getting it backwards
+  // would render an arbiter-coordinated meet as leaderless, which it is not.)
+  const coordName = str(meet.coordinator);
+  const coordLabel = meet.arbiter_is_coordinator
+    ? el('span', { class: 'pill pill-muted', title: 'The arbiter itself is hosting the coordinator role for this meet (no peer coordinator).' }, 'the arbiter')
+    : (coordName || '(vacant)'); // §6.8 ReasonVacated: no coordinator, not a missing field
+  // §9.4b: Converged/Diverged expose the gap between the coordinator's INTENDED tree and
+  // what peers REALIZED from their own heartbeats — convergence lag, a failed apply, or a
+  // fenced-out peer, invisible if the UI only ever shows the number it fetched last.
+  const diverged = Array.isArray(meet.diverged) ? meet.diverged : [];
+  const convergedNode = meet.converged === false || diverged.length > 0
+    ? el('span', { class: 'epoch-item text-warn', title: 'Realized parent differs from the published tree for these peers.' }, `diverged: ${diverged.length ? diverged.join(', ') : '(unspecified)'}`)
+    : el('span', { class: 'epoch-item fg-muted' }, 'converged');
   return el('div', { class: 'epoch-bar tabular-nums' },
     el('span', { class: 'epoch-item' }, 'epoch ', el('strong', null, fmtId(meet.epoch))),
     el('span', { class: 'epoch-item' }, 'rev ', el('strong', null, fmtId(meet.rev))),
-    el('span', { class: 'epoch-item' }, 'coordinator ', el('strong', null, str(meet.coordinator) || '—')),
+    el('span', { class: 'epoch-item' }, 'coordinator ', el('strong', null, coordLabel)),
+    convergedNode,
     el('span', { class: `epoch-item ${staleRejected > 0 ? 'text-warn' : 'fg-muted'}` }, `stale rejected: ${staleRejected}`),
     el('span', { class: `epoch-item ws-inline status-dot ${wsStatus === 'live' ? 'dot-ok' : wsStatus === 'stale' ? 'dot-warn' : 'dot-muted'}` }),
     el('span', { class: 'epoch-item fg-muted' }, wsStatus),

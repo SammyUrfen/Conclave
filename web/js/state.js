@@ -65,6 +65,7 @@ export const store = createStore({
   route: { name: 'meets' },
 
   meets: [], // list-view rows
+  endedMeets: [], // the tombstone ring (§6.9/§9.3 ended[]), always present, newest-first
   meetsLoading: false,
   meetsError: null,
   lastCreated: null, // { id, join } shown once after a successful create
@@ -117,11 +118,12 @@ export async function connectServer() {
     return;
   }
   await refreshMeets(httpBase);
+  // demoEnabled is set inside refreshMeets from the list body's own `demo_enabled` field
+  // (§9.6) — the server advertises it on the one call the dashboard already makes on
+  // connect, so there is no separate capability probe and no extra round trip.
   const s = store.getState();
   if (s.serverStatus !== 'error') {
-    // No speculative probing of the destructive demo surface (§9.6) — see api.js's
-    // hasDemoCapability doc comment. This is a synchronous, no-network check.
-    store.setState({ serverStatus: 'ok', demoEnabled: api.hasDemoCapability() });
+    store.setState({ serverStatus: 'ok' });
   }
 }
 
@@ -149,7 +151,11 @@ export async function refreshMeets(httpBaseArg) {
   try {
     const body = await api.listMeets(httpBase);
     const meets = Array.isArray(body && body.meets) ? body.meets : [];
-    store.setState({ meets, meetsLoading: false });
+    const endedMeets = Array.isArray(body && body.ended) ? body.ended : [];
+    // demo_enabled (§9.6) rides this same response; an older server that predates the
+    // field simply omits it, and `!!undefined` is the safe "off" default we want.
+    const demoEnabled = !!(body && body.demo_enabled);
+    store.setState({ meets, endedMeets, demoEnabled, meetsLoading: false });
     noteSkew(body);
   } catch (err) {
     store.setState({

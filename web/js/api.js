@@ -129,7 +129,12 @@ async function request(httpBase, path, opts = {}) {
   return { ok: true, body, raw: bodyText, status: res.status };
 }
 
-/** GET /api/meets */
+/**
+ * GET /api/meets. The body carries `demo_enabled` (§9.6) alongside `meets`/`ended` —
+ * the server advertises the gated demo surface on this same call rather than a
+ * separate capability route, so state.js reads it straight off this response with no
+ * extra round trip and no speculative probe of the destructive surface.
+ */
 export async function listMeets(httpBase) {
   const { body } = await request(httpBase, '/api/meets');
   return body;
@@ -152,20 +157,6 @@ export async function createMeet(httpBase, id) {
 export async function getMeet(httpBase, id) {
   const { body } = await request(httpBase, `/api/meets/${encodeURIComponent(id)}`);
   return body;
-}
-
-/**
- * Whether the gated demo surface (§9.6) should be shown. §9.3/§9.4a define no capability
- * flag for this, and a prior version of this file "solved" that by POSTing a speculative
- * evict against a bogus meet id and inferring support from the response shape. That is the
- * wrong shape: issuing a destructive verb as a capability probe is not safe just because the
- * target id doesn't exist — the correct default when a server cannot positively advertise a
- * capability is OFF, not "probe and see". So: always false here. A capability flag
- * (e.g. `demo_enabled` on GET /api/meets, or a small `/api/server` endpoint) has been
- * requested on the server side; flip this to read it once it exists.
- */
-export function hasDemoCapability() {
-  return false;
 }
 
 /** POST /api/demo/meets/{id}/evict */
