@@ -112,14 +112,7 @@ func (c *Coordinator) build(rs *roomState, nodes []overlay.Node, cause string) {
 		return
 	}
 
-	cons := overlay.Constraints{
-		Root:         root,
-		MaxDepth:     c.cfg.MaxDepth,
-		StreamKbps:   c.cfg.StreamKbps,
-		Epoch:        rs.epoch,
-		Rev:          rs.rev + 1,
-		StickinessMs: c.cfg.StickinessMs,
-	}
+	cons := c.constraintsFor(rs, root)
 
 	// A degraded handover explains itself on the tree that shows the damage. If the
 	// build ALSO goes relaxed, both explanations are kept and the handover's comes
@@ -537,10 +530,7 @@ func (c *Coordinator) reconstructBaseline(rs *roomState) (*overlay.Topology, str
 	// so the oracle sees a stamped copy and the builder gets the real one.
 	check := *obs
 	check.Rev = 1
-	cons := overlay.Constraints{
-		Root: obs.Root, MaxDepth: c.cfg.MaxDepth, StreamKbps: c.cfg.StreamKbps,
-		Epoch: rs.epoch, Rev: 1, StickinessMs: c.cfg.StickinessMs,
-	}
+	cons := c.constraintsFor(rs, obs.Root)
 	if err := overlay.Validate(&check, heardNodes, cons); err != nil {
 		// The residual case the contract admits: a genuinely torn tree, e.g. a
 		// mid-flight re-parent captured half-applied. Falling back to a memoryless
@@ -685,5 +675,25 @@ func (c *Coordinator) catchUpPushes(rs *roomState) {
 		if c.enqueueSend(sendOp{roomID: rs.id, peerID: ns.id, topo: rs.published, gate: rs.gate}) {
 			ns.pushedRev = rs.published.Rev
 		}
+	}
+}
+
+// constraintsFor assembles the build parameters for one meet's next tree.
+//
+// One place rather than two, because the two call sites — the round's own build and the
+// validation of a reconstructed baseline — must agree about every knob, and the one that
+// matters most here is the one that was silently wrong: an operator's StickinessMs
+// reaches overlay through this function and nowhere else.
+//
+// Rev is always the next one after what has been published, which for a term whose first
+// tree has not gone out yet (rs.rev == 0) is 1.
+func (c *Coordinator) constraintsFor(rs *roomState, root string) overlay.Constraints {
+	return overlay.Constraints{
+		Root:         root,
+		MaxDepth:     c.cfg.MaxDepth,
+		StreamKbps:   c.cfg.StreamKbps,
+		Epoch:        rs.epoch,
+		Rev:          rs.rev + 1,
+		StickinessMs: *c.cfg.StickinessMs,
 	}
 }
