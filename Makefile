@@ -66,11 +66,42 @@ lint: ## Run golangci-lint if installed; otherwise fall back to go vet.
 		$(GO) vet $(PKGS); \
 	fi
 
-# CONTROL_PLANE_DIRS are the packages that must be deterministically testable: they
-# drive every temporal behaviour through the injected clock.Clock, so a scenario can
-# run a whole meet in virtual time. Reaching for the wall clock in one of them breaks
-# replayability silently, which is why this is a build gate and not a review note.
-CONTROL_PLANE_DIRS := internal/overlay internal/simnet internal/coordinator internal/arbiter
+# The determinism gate has TWO TIERS, because docs/PLAN.md §4.7 states two different
+# rules and giving both one name is how a reader ends up believing the wrong thing.
+# Read the exclusion list at the bottom before concluding anything from a silent run:
+# this gate says "these named packages do not reach for the wall clock", NOT "no
+# package does".
+#
+# TIER 1 — REPLAYABLE_PKGS, checked in EVERY file, tests included. These are the pure
+# control plane: a scenario must be able to run a whole meet in virtual time and
+# replay byte-identically from a seed, so a wall-clock reference in a TEST here is as
+# damaging as one in production — it reintroduces the nondeterminism the harness
+# exists to eliminate. (§4.7 rule 2.)
+REPLAYABLE_PKGS := internal/overlay internal/simnet internal/coordinator internal/arbiter
+
+# TIER 2 — INJECTED_CLOCK_PKGS, checked in PRODUCTION FILES ONLY. These drive every
+# temporal behaviour through the injected clock.Clock, which is what lets their
+# callers and simnet control time — but their own tests legitimately drive real
+# sockets and real goroutines, and polling one with a real deadline is the honest way
+# to test it. Holding them to tier 1 would force those tests to fake a socket, which
+# would test less. They are gated so that a future edit cannot silently opt them out.
+# (§4.7 rule 1.)
+INJECTED_CLOCK_PKGS := internal/dashboard internal/signaling internal/metrics internal/policy
+
+# DELIBERATELY OUTSIDE BOTH, and why — this list is the honest part of the gate:
+#
+#   internal/media   — the data plane's cadence IS real time. meter.go paces an upload
+#                      sample, source.go paces RTP frame emission; both must track the
+#                      wall clock because pion and the network do. Forcing them onto a
+#                      virtual clock would not make them deterministic, it would make
+#                      them wrong. media's CONTROL logic is tested separately, pure.
+#   cmd/server,      — production code in both is clean today, but they are binaries
+#   cmd/peer           whose owners have not signed up to the constraint, and startup
+#                      or shutdown timing in main is a legitimate wall-clock use. Worth
+#                      revisiting: if their owners want the guarantee, move them into
+#                      INJECTED_CLOCK_PKGS — it costs nothing at present.
+#   internal/logging — no temporal behaviour at all; nothing to guarantee.
+#   web/             — not Go.
 
 # WALL_CLOCK_CALLS is every entry point into package time that reads or waits on real
 # time. The list is deliberately exhaustive: a guard that catches time.Now but misses
@@ -78,14 +109,21 @@ CONTROL_PLANE_DIRS := internal/overlay internal/simnet internal/coordinator inte
 WALL_CLOCK_CALLS := time\.(Now|Since|Until|Sleep|After|AfterFunc|Tick|NewTimer|NewTicker)\(
 
 .PHONY: check-determinism
-check-determinism: ## Fail if a control-plane package reaches for the wall clock.
-	@dirs="$(wildcard $(CONTROL_PLANE_DIRS))"; \
-	if [ -z "$$dirs" ]; then echo "check-determinism: no control-plane packages yet"; exit 0; fi; \
-	if grep -rnE '$(WALL_CLOCK_CALLS)' $$dirs; then \
+check-determinism: ## Fail if a gated package reaches for the wall clock (see the two tiers above).
+	@fail=0; \
+	tier1="$(wildcard $(REPLAYABLE_PKGS))"; \
+	if [ -n "$$tier1" ] && grep -rnE '$(WALL_CLOCK_CALLS)' --include='*.go' $$tier1; then \
 		echo ""; \
-		echo "^ the control plane must use the injected clock.Clock (see docs/PLAN.md 4.7)"; \
-		exit 1; \
-	fi
+		echo "^ REPLAYABLE_PKGS must use the injected clock.Clock in tests TOO (docs/PLAN.md 4.7 rule 2)"; \
+		fail=1; \
+	fi; \
+	tier2="$(wildcard $(INJECTED_CLOCK_PKGS))"; \
+	if [ -n "$$tier2" ] && grep -rnE '$(WALL_CLOCK_CALLS)' --include='*.go' --exclude='*_test.go' $$tier2; then \
+		echo ""; \
+		echo "^ INJECTED_CLOCK_PKGS must take a clock.Clock rather than calling package time (docs/PLAN.md 4.7 rule 1)"; \
+		fail=1; \
+	fi; \
+	exit $$fail
 
 .PHONY: check
 check: fmt vet check-determinism test ## Format + vet + determinism + test: the pre-commit gate.

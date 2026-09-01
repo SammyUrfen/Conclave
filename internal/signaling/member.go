@@ -60,6 +60,28 @@ func (m *member) writePump(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case msg := <-m.out:
+			// HAZARD, latent — read this before adding a graceful close code.
+			//
+			// coder/websocket arms a context.AfterFunc for the duration of every
+			// frame write, and that hook does not abort the write: it calls the
+			// connection's internal close, tearing the TCP socket down with NO close
+			// frame. So a write whose context is CANCELLED does not fail politely,
+			// it destroys the connection — and writeClose then swallows the
+			// resulting net.ErrClosed and reports success.
+			//
+			// That is harmless here TODAY only because this package never sends a
+			// graceful close code: every teardown path ends in CloseNow, so there is
+			// no close frame for a cancellation to steal. The trap springs the moment
+			// someone adds one — say, mirroring the dashboard's 1013 subscriber cap —
+			// because the close path would cancel this very ctx to wake the writer,
+			// killing the socket a moment before the code could go out. The peer
+			// would see an abrupt EOF instead of the reason it was disconnected.
+			//
+			// If you add a close code, strip cancellation from the write context
+			// (context.WithoutCancel; see dashboard.socketCtx) and keep only the
+			// deadline. The timeout is what bounds a stuck send; cancellation was
+			// buying nothing else. Reads keep their cancellation — a reader has no
+			// close frame to protect.
 			writeCtx, cancel := context.WithTimeout(ctx, writeTimeout)
 			err := wsjson.Write(writeCtx, m.conn, msg)
 			cancel()
