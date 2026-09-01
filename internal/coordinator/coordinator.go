@@ -221,8 +221,19 @@ type nodeState struct {
 	// REFUSED, cumulative since it last joined. It is mirrored rather than derived:
 	// only the peer can see a refusal, because the refusal happens at the peer.
 	staleRejected uint64
-	realParent    string
-	realChildren  []string
+
+	// strandedRepairs counts CONSECUTIVE UNPRODUCTIVE answers to this peer's reports
+	// that it cannot attach — unproductive meaning the recompute it triggered
+	// published nothing new. It is reset the moment the peer attaches, so it bounds
+	// one episode rather than the peer. See MaxStrandedRepairs.
+	strandedRepairs int
+	// pushedRev is the revision of the last tree successfully handed to the outbound
+	// queue for this peer. It is what lets a peer that missed a push — a reconnect
+	// under an unchanged tree, or a drop on a full queue — be caught up without
+	// republishing a tree everyone else already holds.
+	pushedRev    uint64
+	realParent   string
+	realChildren []string
 }
 
 // event kinds funnelled to the Run goroutine.
@@ -1102,6 +1113,12 @@ func (c *Coordinator) onBeat(roomID, peerID string, hb metrics.Heartbeat, stale 
 		ns.realChildren = append(ns.realChildren, ch.Name)
 	}
 	c.trackStale(rs, ns, hb, stale)
+	// A peer that reports a CONNECTED upstream edge has attached, which ends the
+	// stranding episode and restores its full repair budget. Ground truth from the
+	// peer, not an inference from the tree the coordinator hopes it applied.
+	if hb.Parent != "" && hb.ParentState == "connected" {
+		ns.strandedRepairs = 0
+	}
 	if rs.rebuilding && ns.name != "" {
 		// A heartbeat is the ONLY frame carrying realized topology, so the rebuild
 		// window waits on heartbeats specifically — a metrics report says nothing about
@@ -1137,21 +1154,16 @@ func (c *Coordinator) onReparented(roomID, peerID string, rp metrics.Reparented)
 	}
 
 	if !rp.OK {
-		// A stranded peer is receiving nothing, so the anti-thrash cooldown is the
-		// wrong trade. This is one of the only two frozen bypasses.
-		c.log.Warn("peer is stranded", slog.String("room_id", roomID),
-			slog.String("name", ns.name), slog.String("from", rp.From),
-			slog.String("reason", rp.Reason))
-		c.publish(rs, Event{Kind: EventReparent, Node: ns.name, NodeID: ns.id,
-			PrevParent: rp.From, Reason: rp.Reason})
-		rs.urgent = true
-		c.recompute(rs, "peer stranded")
+		c.onStranded(rs, ns, rp)
 		return
 	}
 
 	// Ratify only a promotion made under the tree the peers are actually running. A
 	// success reported against a tree already replaced says nothing about the
 	// current one, and patching it in would defend an edge from a dead topology.
+	// The peer attached: the stranding episode is over, whatever the coordinator
+	// decides about the choice itself.
+	ns.strandedRepairs = 0
 	current := rs.published != nil && rp.Epoch == rs.published.Epoch && rp.Rev == rs.published.Rev
 	if current && rp.To != "" {
 		rs.promotions[ns.name] = rp.To
@@ -1166,6 +1178,62 @@ func (c *Coordinator) onReparented(roomID, peerID string, rp metrics.Reparented)
 		Parent: rp.To, PrevParent: rp.From, Reason: rp.Reason})
 	// Threshold event 6.
 	c.recompute(rs, "peer self-promoted")
+}
+
+// onStranded answers a peer that reports it could not attach anywhere.
+//
+// A stranded peer is receiving nothing, so the anti-thrash cooldown is the wrong trade
+// and the recompute bypasses it — that is one of the two frozen bypasses, and it is
+// right the FIRST time. It is not right forever: the coordinator's only move is to
+// compute a tree, and a peer can be un-attachable for a reason no tree can fix (an
+// orphaned source has nothing to hand it), in which case bypassing on every repetition
+// is a livelock that burns a republish and a renegotiation per round and never
+// converges. That was observed live as rev churn with an error storm underneath it.
+//
+// So the bypass is spent against a budget of PRODUCTIVE answers. If the recompute
+// published something new, the peer has a tree it has not tried yet and the budget
+// resets; if it did not, the coordinator has run out of things to say, and after
+// MaxStrandedRepairs of those it stops bypassing and reports the peer as unservable.
+// Ordinary threshold events still recompute afterwards — the meet is not abandoned, only
+// the fast path for this one peer.
+func (c *Coordinator) onStranded(rs *roomState, ns *nodeState, rp metrics.Reparented) {
+	exhausted := ns.strandedRepairs >= MaxStrandedRepairs
+	if exhausted {
+		// Already reported. Re-warning once per beat is how a real signal becomes the
+		// noise an operator learns to scroll past.
+		c.log.Debug("peer is still stranded", slog.String("room_id", rs.id),
+			slog.String("name", ns.name), slog.String("reason", rp.Reason))
+	} else {
+		c.log.Warn("peer is stranded", slog.String("room_id", rs.id),
+			slog.String("name", ns.name), slog.String("from", rp.From),
+			slog.String("reason", rp.Reason),
+			slog.Int("unproductive_repairs", ns.strandedRepairs))
+	}
+	c.publish(rs, Event{Kind: EventReparent, Node: ns.name, NodeID: ns.id,
+		PrevParent: rp.From, Reason: rp.Reason})
+
+	if !exhausted {
+		rs.urgent = true
+	}
+	before := rs.rev
+	c.recompute(rs, "peer stranded")
+	if rs.rev != before {
+		// A new tree went out, so this answer was productive: the peer has something
+		// it has not tried yet and the budget starts over.
+		ns.strandedRepairs = 0
+		return
+	}
+	if exhausted {
+		return
+	}
+	ns.strandedRepairs++
+	if ns.strandedRepairs >= MaxStrandedRepairs {
+		c.log.Warn("giving up on placing a peer; recomputing no longer changes the tree",
+			slog.String("room_id", rs.id), slog.String("name", ns.name),
+			slog.Int("attempts", ns.strandedRepairs))
+		c.publish(rs, Event{Kind: EventUnbuildable, Node: ns.name, NodeID: ns.id,
+			Outcome: OutcomeUnbuildable, Reason: ReasonUnratifiable})
+	}
 }
 
 func (c *Coordinator) onRoster(roomID string, members []Member) {

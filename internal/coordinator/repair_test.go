@@ -167,10 +167,21 @@ func TestRatificationPatchesTheWorkingCopy(t *testing.T) {
 // one of the only two frozen bypasses.
 func TestStrandedPeerBypassesTheCooldown(t *testing.T) {
 	h := twoRelayMeet(t)
+
+	// A departure first, deep inside the cooldown, so a rebuild is PENDING and
+	// suppressed. Without this the stranded recompute would arrive back at the tree
+	// the fleet already holds, which is suppressed for a different reason — and a test
+	// that cannot tell "deferred by the cooldown" from "nothing to say" would pass
+	// against a coordinator that had lost the bypass entirely.
+	h.c.PeerLeft("room", peerIDOf(h, "room", "c"))
+	h.sync()
 	before := h.published("room")
+	if before.Depth("c") < 0 {
+		t.Fatal("precondition: the leave must have been coalesced by the cooldown")
+	}
 	stranded := before.ChildrenOf("x")[0]
 
-	// No clock advance at all: we are deep inside RecomputeCooldown.
+	// Still no clock advance: we are deep inside RecomputeCooldown.
 	h.reparented("room", peerIDOf(h, "room", stranded), metrics.Reparented{
 		Name: stranded, From: "x", OK: false,
 		Epoch: before.Epoch, Rev: before.Rev, Reason: "no backup",
@@ -179,6 +190,9 @@ func TestStrandedPeerBypassesTheCooldown(t *testing.T) {
 	after := h.published("room")
 	if after.Rev != before.Rev+1 {
 		t.Fatalf("a stranded peer must trigger an urgent rebuild inside the cooldown; rev %d -> %d", before.Rev, after.Rev)
+	}
+	if after.Depth("c") >= 0 {
+		t.Fatalf("the urgent rebuild must be the one the cooldown was holding: %+v", after.Edges)
 	}
 	ev, ok := h.fp.lastOf(coordinator.EventReparent)
 	if !ok || ev.Parent != "" || ev.Node != stranded {
