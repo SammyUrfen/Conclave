@@ -140,6 +140,13 @@ func (c *Coordinator) build(rs *roomState, nodes []overlay.Node, cause string) {
 		if reason == "" {
 			reason = err.Error()
 		} else {
+			// UNREACHABLE TODAY, and kept deliberately. reason is non-empty here only
+			// when a handover left no usable baseline — and in that state `published`
+			// is nil, so `working` is nil, so both build attempts have prev = nil and
+			// are identical: the sticky one cannot fail where the relaxed one
+			// succeeds. The branch exists so that if a future change gives the first
+			// attempt a baseline the second lacks, the handover's explanation is not
+			// silently overwritten by the builder's.
 			reason += "; " + err.Error()
 		}
 		c.log.Warn("stability-preserving build failed; published a relaxed tree",
@@ -147,9 +154,26 @@ func (c *Coordinator) build(rs *roomState, nodes []overlay.Node, cause string) {
 			slog.Any("sticky_error", err))
 	}
 
-	// The oracle gates publication in both branches. A tree that fails its own
-	// validator is never published — keeping the previous one is strictly better
-	// than shipping a tree we can prove is wrong.
+	c.commit(rs, next, nodes, cons, outcome, reason, cause)
+}
+
+// commit is the LAST LINE OF DEFENCE between a buggy builder and the whole fleet: it
+// runs the independent oracle over a computed tree and publishes only if it passes.
+//
+// It is a separate function rather than four lines inside build for one reason: this is
+// the only guard in the package whose entire job is to catch a bug in the layer BELOW
+// it, so it cannot be reached through any input — overlay.BuildTree is correct, and
+// there are no nodes that make it emit a tree overlay.Validate rejects. Giving the guard
+// its own seam is what lets a test hand it the malformed tree a future defect would
+// produce, which is exactly the boundary the defect would arrive at.
+//
+// Keeping the previous tree is strictly better than shipping one we can prove is wrong:
+// a stale tree still carries media, and an invalid one is the "mysterious missing
+// stream" this project refuses to ship. It is reported as unbuildable rather than
+// swallowed, because a builder disagreeing with its own validator is an operator-visible
+// fault and not a capacity problem.
+func (c *Coordinator) commit(rs *roomState, next *overlay.Topology, nodes []overlay.Node,
+	cons overlay.Constraints, outcome BuildOutcome, reason, cause string) {
 	if verr := overlay.Validate(next, nodes, cons); verr != nil {
 		c.log.Error("computed tree failed its own oracle; keeping the previous topology",
 			slog.String("room_id", rs.id), slog.Any("error", verr))
