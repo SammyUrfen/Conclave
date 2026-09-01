@@ -649,6 +649,27 @@ func (p *peerPlane) selfReport(rep metrics.Report) { p.postSelf(signaling.TypeMe
 
 func (p *peerPlane) selfBeat(hb metrics.Heartbeat) { p.postSelf(signaling.TypeHeartbeat, hb) }
 
+// reparentSend builds the re-parent sender's ship function: hand the report to the
+// local coordinator first, then put it on the wire.
+//
+// It is a named function rather than an inline closure because the tee is the part
+// that can be silently missing, and a closure buried in runCall is reachable only by
+// an end-to-end test that has to fail a real parent edge mid-call. Named, the tee is
+// a two-line assertion. A nil plane means this peer hosts nothing and only the wire
+// send happens, which is every peer that is not currently the coordinator.
+func reparentSend(plane *peerPlane, send func(signaling.Message) error) func(metrics.Reparented) error {
+	return func(rep metrics.Reparented) error {
+		if plane != nil {
+			plane.selfReparented(rep)
+		}
+		msg, err := controlFrame(signaling.TypeReparented, rep)
+		if err != nil {
+			return err
+		}
+		return send(msg)
+	}
+}
+
 // selfReparented closes the same hole for the third forwarded frame type. A
 // coordinator peer is a peer in the tree like any other: it can lose its own parent
 // and promote its own backup, and §8 rule 2 skips coordID == peerID for reparented
@@ -1108,18 +1129,7 @@ func runCall(ctx context.Context, logger *slog.Logger, cfg callConfig) error {
 	// The peer reports its OWN backup promotions so the coordinator can ratify them
 	// (or, when OK is false, repair a stranded peer urgently). Queued rather than
 	// sent inline: media invokes the callback from its Run goroutine.
-	reparents := newReparentSender(logger, func(rep metrics.Reparented) error {
-		// Tee, for the same reason as the report and the beat below: the server will
-		// not forward this peer's own frames back to it.
-		if plane != nil {
-			plane.selfReparented(rep)
-		}
-		msg, err := controlFrame(signaling.TypeReparented, rep)
-		if err != nil {
-			return err
-		}
-		return client.Send(msg)
-	})
+	reparents := newReparentSender(logger, reparentSend(plane, client.Send))
 
 	// router is captured by the callbacks below before it exists. That is safe, not a
 	// race: NewRouter returns on this goroutine before Run is called on it, and
