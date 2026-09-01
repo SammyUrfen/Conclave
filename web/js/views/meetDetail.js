@@ -2,7 +2,7 @@
 // Epoch/rev panels for one meet (§9.5). This is the view that owns the live WebSocket.
 
 import { el, setChildren } from '../dom.js';
-import { fmtId, fmtDepth, fmtKbps, fmtMs, fmtPct, fmtFitness, fmtUnixMs, str } from '../format.js';
+import { fmtId, fmtDepth, fmtKbps, fmtMs, fmtPct, fmtFitnessLowerBound, fmtUnixMs, str } from '../format.js';
 import * as subnetTree from './subnetTree.js';
 import * as eventLog from './eventLog.js';
 import * as demoControls from './demoControls.js';
@@ -12,7 +12,17 @@ const FATAL_MESSAGE = {
   meet_not_found: 'This meet no longer exists.',
   policy_violation: 'The server rejected this connection (origin policy). It will not retry — check -allowed-origins.',
   bad_server_url: 'The configured server address is invalid.',
+  // §9.4a v2.6: a refused WS origin never opens a socket, so it surfaces as a plain close
+  // with no server-chosen code — the api.js EventSocket tells never-connected apart from
+  // connected-then-lost and reports this reason only for the former. It will not retry
+  // (retrying an origin the server will not accept cannot help), so this is an actionable
+  // config error, not a transient network fault.
+  origin_rejected: 'The server rejected this page\'s origin. It will not retry — add this origin to the server\'s -allowed-origins flag.',
 };
+
+/** Reasons for which retrying is impossible, so "Back to meets" (implying "try again elsewhere on
+ * this server") is withheld rather than offered as if it could help. */
+const NO_RETRY_REASONS = new Set(['policy_violation', 'origin_rejected']);
 
 export function render(container, state, actions) {
   const { meetId, meet, meetSocketStatus, meetFatal, buildState, events, flashNode, selectedNodeName } = state;
@@ -26,9 +36,15 @@ export function render(container, state, actions) {
   ];
 
   if (meetFatal) {
+    const base = FATAL_MESSAGE[meetFatal.reason] || `Connection stopped: ${meetFatal.reason}`;
+    // Include the actual origin the browser sent — the exact value an operator needs to
+    // paste into -allowed-origins, not a description of where to find it.
+    const originSuffix = meetFatal.reason === 'origin_rejected' && meetFatal.detail && meetFatal.detail.origin
+      ? ` This page's origin: ${meetFatal.detail.origin}`
+      : '';
     nodes.push(el('div', { class: 'error-banner', role: 'alert' },
-      FATAL_MESSAGE[meetFatal.reason] || `Connection stopped: ${meetFatal.reason}`,
-      meetFatal.reason !== 'policy_violation' ? el('button', { class: 'btn btn-sm', onclick: actions.onBack }, 'Back to meets') : null,
+      base + originSuffix,
+      NO_RETRY_REASONS.has(meetFatal.reason) ? null : el('button', { class: 'btn btn-sm', onclick: actions.onBack }, 'Back to meets'),
     ));
   }
 
@@ -143,7 +159,10 @@ function renderNodeDetail(container, meet, selectedName) {
     ['rtt to server', fmtMs(node.rtt_server_ms)],
     ['loss', fmtPct(node.loss_pct)],
     ['cpu', fmtPct(node.cpu_pct)],
-    ['fitness', fmtFitness(node.fitness)],
+    // §9.4a: named "lower bound" because UptimeSec is unreachable server-side — the value
+    // can read up to 0.15 short of the arbiter's real fitness score. Label + "≥" prefix
+    // (from fmtFitnessLowerBound) both carry that, deliberately, instead of a tooltip.
+    ['fitness (lower bound)', fmtFitnessLowerBound(node.fitness_lower_bound)],
     ['last heartbeat seq', fmtId(node.last_beat_seq)],
     ['last heartbeat at', fmtUnixMs(node.last_beat_unix_ms)],
   ];

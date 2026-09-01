@@ -19,7 +19,7 @@
       "depth": 0,
       "upload_kbps": 8000, "nat": "direct",
       "rtt_server_ms": 12.5, "loss_pct": 0.2, "cpu_pct": 31.0,
-      "fitness": 0.738,
+      "fitness_lower_bound": 0.738,
       "last_beat_seq": 412, "last_beat_unix_ms": 1756684812100
     },
     {
@@ -31,7 +31,7 @@
       "depth": 1,
       "upload_kbps": 3000, "nat": "direct",
       "rtt_server_ms": 240.0, "loss_pct": 6.1, "cpu_pct": 55.0,
-      "fitness": 0.283,
+      "fitness_lower_bound": 0.283,
       "last_beat_seq": 407, "last_beat_unix_ms": 1756684808900
     },
     {
@@ -43,7 +43,7 @@
       "depth": 1,
       "upload_kbps": 1000, "nat": "direct",
       "rtt_server_ms": 18.4, "loss_pct": 0.0, "cpu_pct": 12.0,
-      "fitness": 0.793,
+      "fitness_lower_bound": 0.793,
       "last_beat_seq": 415, "last_beat_unix_ms": 1756684812300
     },
     {
@@ -55,7 +55,7 @@
       "depth": 2,
       "upload_kbps": 500, "nat": "turn",
       "rtt_server_ms": 44.0, "loss_pct": 1.2, "cpu_pct": 8.0,
-      "fitness": 0.0,
+      "fitness_lower_bound": 0.0,
       "last_beat_seq": 401, "last_beat_unix_ms": 1756684811900
     },
     {
@@ -67,7 +67,7 @@
       "depth": -1,
       "upload_kbps": 0, "nat": "direct",
       "rtt_server_ms": 0.0, "loss_pct": 100.0, "cpu_pct": 0.0,
-      "fitness": 0.0,
+      "fitness_lower_bound": 0.0,
       "last_beat_seq": 390, "last_beat_unix_ms": 1756684790000
     }
   ],

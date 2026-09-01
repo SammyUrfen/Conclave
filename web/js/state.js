@@ -299,8 +299,8 @@ export function openMeetDetail(meetId) {
       });
       pushEvent(frame);
     },
-    onFatal: (reason) => {
-      store.setState({ meetFatal: { reason } });
+    onFatal: (reason, detail) => {
+      store.setState({ meetFatal: { reason, detail } });
     },
     onVersionSkew: (serverVersion) => {
       store.setState({ versionSkew: serverVersion });

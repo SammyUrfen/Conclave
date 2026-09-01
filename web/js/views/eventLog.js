@@ -54,7 +54,9 @@ function summarize(kind, data) {
       return `${str(data.name, '?')}: ${prev} → ${str(data.health, '?')}`;
     }
     case 'topology': return `root=${str(data.root, '?')} outcome=${str(data.outcome, '?')}${data.reason ? ` (${data.reason})` : ''}`;
-    case 'reparent': return `${str(data.name, '?')}: ${str(data.from, '?')} → ${str(data.to, '?')}${data.self_promoted ? ' (self-promoted)' : ''}`;
+    // §9.4 v2.6: `self_promoted` removed from the wire — EventReparent is only ever emitted
+    // from the self-promotion path, so the label is unconditional now, implied by the kind.
+    case 'reparent': return `${str(data.name, '?')}: ${str(data.from, '?')} → ${str(data.to, '?')} (self-promoted)`;
     case 'failover': return `${str(data.name, '?')} failed — orphans: ${Array.isArray(data.orphans) ? data.orphans.join(', ') || 'none' : '?'}`;
     case 'election': {
       // Coordinator is "" when Reason is "vacated" (§6.8) — the epoch still bumps to
