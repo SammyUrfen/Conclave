@@ -1,6 +1,6 @@
 # PLAN.md — the Phase 5–6 architecture contract
 
-> **Status: v2.4, FROZEN**, 2026-09-01. v1 was frozen the same day, reviewed adversarially by
+> **Status: v2.5, FROZEN**, 2026-09-01. v1 was frozen the same day, reviewed adversarially by
 > two independent reviewers (12 critical + ~15 major findings), and amended in place. **§15 is
 > the amendment log — read it first if you built against v1**, because several frozen names
 > changed. v2 also reconciles the document with what WI-0 actually shipped; where the shipped
@@ -102,7 +102,7 @@ score. Concretely, this contract enforces it in three places:
 | `internal/logging` | slog construction, level/format parsing. Leaf. | none |
 | `internal/signaling` | WS transport, meets (rooms), frame relay, server-stamped identity, `Observer` seam, `SendTo`. SDP/ICE/Payload stay opaque `json.RawMessage`. | +3 frame types, +`SendRoom`, +2 `Observer` methods, +`ServerID`, +origin policy, +WS keepalive ping (§4) |
 | `internal/overlay` | The subnet model + pure `BuildTree` + independent `Validate` oracle. **PURE: no sockets, no clock, no pion, no `internal` imports.** | +epoch/rev/root/backups, +stability-preserving build, +`ValidateLocalRepair` (§3) |
-| `internal/media` | Data plane: pion sessions, mesh + tree relay, RTP forwarding, upstream PLI, upload meter. | +negotiation serializer, +`RemoveTrack`, +diff-and-apply `applyTopology`, +backup promotion (§7) |
+| `internal/media` | Data plane: pion sessions, mesh + tree relay, RTP forwarding, upstream PLI, upload meter. Imports `metrics` for the `Reparented` payload type (§15.13). | +negotiation serializer, +`RemoveTrack`, +diff-and-apply `applyTopology`, +backup promotion (§7) |
 | `internal/metrics` | The **peer → control-plane payload types** and the peer-side `Reporter`. | +`Heartbeat`, +`Reparented`, +`HeartbeatSender` (§4, §8) |
 | `internal/coordinator` | Control-plane brain: fan-in → `BuildTree` → push. Single-goroutine owned state. **Imports NEITHER `signaling` NOR `media`.** | +health FSM, +dwell, +local repair, +backup ratification, +`Publisher`, +`Sync`, +epoch adoption (§5, §6) |
 | `internal/simnet` | Deterministic, media-free harness driving the *real* control plane. Test-only. | +virtual clock, +event queue, +failure injection (§3 of the simnet contract, §4) |
@@ -144,6 +144,13 @@ legal downward edge, `arbiter.Meet` is arbiter-owned (which also supplies the ty
 defined), and `arbiter` imports nothing new. The §9.7 interfaces survive as *narrowing* seams
 — they still let the dashboard be tested with fakes — but they now name only arbiter-owned
 and coordinator-owned types.
+
+**`media` imports `metrics` (RATIFIED, §15.13).** §2.3 omitted it while §7.5 froze
+`OnReparented func(metrics.Reparented)` — a contradiction WI-4 resolved by implementing §7.5.
+`metrics` imports only `overlay`, `clock`, and `logging`, so the edge adds no cycle. The
+alternative — respecifying the callback as six positional parameters to dodge the type — is
+strictly worse: it is unreadable at the call site and every added field breaks every
+implementer, which is the argument §5.8 already made for `Publisher` taking a struct.
 
 **`arbiter` imports `metrics` (new edge).** It needs `metrics.Report` for fitness inputs and
 `metrics.Heartbeat` for its own liveness view (M4). `metrics` imports only `overlay`,
@@ -192,7 +199,7 @@ Written as an edge list, which is what you check against:
 | `signaling` | `logging`, `clock`, `policy` |
 | `coordinator` | `overlay`, `metrics`, `clock`, `logging` |
 | `arbiter` | `overlay`, `metrics`, `clock`, `policy`, `logging` |
-| `media` | `overlay`, `signaling`, `clock`, `logging` |
+| `media` | `overlay`, `signaling`, `metrics`, `clock`, `logging` |
 | `dashboard` | `overlay`, `coordinator`, `arbiter`, `clock`, `policy`, `logging` |
 | `simnet` | `overlay`, `coordinator`, `metrics`, `clock` |
 | `cmd/*` | anything under `internal/` |
@@ -2962,17 +2969,42 @@ Exact behaviour:
    `s.negotiating = false`, unlock, and schedule a retry (below) — pion will NOT re-fire for
    an error in our own call, which is why the retry path survives while the flag does not.
 
-**On a successfully applied answer** (in the `SDPTypeAnswer` branch, after
-`SetRemoteDescription` succeeds and `flushPending()` runs): lock, `s.negotiating = false`,
-unlock. Nothing else. If more changes accumulated while the offer was in flight, pion's own
-negotiation-needed flag is set and it fires `OnNegotiationNeeded` on its operations
-goroutine — which is both correct and off our `consume` goroutine for free.
+**On an inbound answer — the ORDER IS LOAD-BEARING (CORRECTED, §15.13).**
 
-> **Implementer obligation.** This rests on a claim about pion v4's internals. §12.2 already
-> requires a test that a second `AddTrack` during `have-local-offer` produces **exactly one**
-> follow-up offer. **Run that test first.** If pion does *not* re-fire, restore the
-> `renegotiate` flag exactly as v1 specified it (re-run on a new goroutine, never inline) and
-> report it — do not leave a silently half-negotiated session either way.
+```
+1. lock; s.negotiating = false; unlock      // BEFORE, not after
+2. s.pc.SetRemoteDescription(answer)
+3. s.flushPending()
+```
+
+v2.4 specified clearing the flag *after* `SetRemoteDescription`. **That is a bug, and the
+worst kind: silent and permanent.** Measured against pion v4.2.16, `SetRemoteDescription`
+re-fires negotiation-needed **from inside the call**, on pion's ops goroutine. With our flag
+still set, our handler takes the `s.negotiating` early-return — and pion has now consumed its
+own negotiation-needed flag, so **it never fires again.** The renegotiation is lost forever,
+with no error, no log, and a far end whose SDP is permanently stale.
+
+Clearing first is safe **because of the two-guard design**, which is exactly why §15.14
+declined to remove the `SignalingState()` check when a reviewer called it near-dead code. If
+`SetRemoteDescription` *fails* at step 2, we have cleared `negotiating` while the pc is still
+in `have-local-offer` — and the state guard catches it, because `SignalingState() != stable`.
+Intent flag and pion's truth cover each other's window; that is the whole point of having
+both, and it is what makes this ordering correct rather than merely lucky.
+
+> **Pin it.** This ordering is invisible in normal operation — the bug produces a missing
+> renegotiation, not a failure — so §12.2 requires a `negotiationProbe`-style subtest that
+> asserts the handler is reachable during `SetRemoteDescription`. Without it, a future
+> "tidy-up" that moves the clear back after the call reintroduces a permanent, silent defect
+> and every existing test still passes.
+
+**What pion does and does not re-fire (MEASURED, v4.2.16).** v2.4 asserted, from reading, that
+pion re-fires whenever changes accumulate. That is true for `AddTrack` and **false for
+`RemoveTrack`** — see §7.2. The rule to carry forward is not "pion always re-fires" but:
+
+> **Our bookkeeping supplements pion EXACTLY where `checkNegotiationNeeded` is known to
+> return false, and nowhere else.** Where pion does fire, adding our own trigger is the race
+> §15.3/M9 removed. Where it provably does not, omitting one is a permanent stall. The two
+> look identical in the code and are opposites in effect.
 
 **Retry:**
 ```go
@@ -2988,6 +3020,43 @@ const NegotiationRetryDelay = 250 * time.Millisecond
 // wedged session self-heals on the next tree. Retrying forever would hide a real bug.
 const NegotiationRetries = 5
 ```
+```go
+// NegotiationAnswerTimeout bounds how long we wait for an answer to an offer we sent before
+// RE-SENDING that same offer. REQUIRED, not optional — without it a role inversion (§7.4/C11)
+// deadlocks the edge permanently.
+//
+// The deadlock: on an inversion the two ends re-create their sessions at different moments.
+// For that window the far end still holds a session baked as OFFERER, so when our offer
+// arrives it correctly drops it as a role disagreement (§7.1's existing, correct rule). Our
+// side then sits in have-local-offer forever; their side waits for an offer that was already
+// thrown away. Neither end is wrong and neither end recovers.
+//
+// 2s: an SDP round trip over the signaling WebSocket is milliseconds on a LAN and tens to
+// low hundreds of ms over a WAN, so 2s is ~10x the worst realistic exchange and never fires
+// on a healthy one — while being short enough to pick up the far end's re-created session,
+// which completes in one signaling round trip.
+//
+// It reuses the retry ladder rather than adding a second one: each expiry counts as one
+// attempt, so the total is bounded by NegotiationRetries. Worst case (~10s) deliberately
+// exceeds ReparentConnectTimeout, so a re-parent abandons on its own bound first and the
+// two timeouts never fight over who gives up.
+const NegotiationAnswerTimeout = 2 * time.Second
+```
+
+**A retry NEVER calls `CreateOffer` from `have-local-offer` (CORRECTED, §15.13).** pion's
+signaling state machine forbids `SetLocal(offer)` from that state, so v2.4's "retry re-enters
+the full path" is illegal there. The retry has two shapes, decided by where the failure
+happened:
+
+| Failure point | pc state | Retry action |
+|---|---|---|
+| `CreateOffer` or `SetLocalDescription` | still `stable` | Re-enter the full path: `CreateOffer` → `SetLocalDescription` → send. |
+| `sendDescription` (transport), or `NegotiationAnswerTimeout` expiry | `have-local-offer` | **Re-send `s.pc.LocalDescription()` verbatim.** Never `CreateOffer`. |
+
+The second row is also the semantically right thing, not merely the legal one: the offer
+already exists and is already the local description — the far end simply never saw it, so
+re-sending exactly what we committed to is what makes both ends agree.
+
 The retry timer comes from the injected `clock.Clock` on `SessionConfig`, so a media test
 can drive it deterministically.
 
@@ -2997,10 +3066,46 @@ a bug — and the existing code already logs and drops it. Keep that.
 
 ### 7.2 `Session.RemoveTrack`
 
+**v2.4 said `RemoveTrack` "fires OnNegotiationNeeded, so the serializer emits the
+renegotiating offer". That is FALSE against real pion (MEASURED, v4.2.16 — §15.13).**
+
+`pc.RemoveTrack` does call `onNegotiationNeeded`, but pion's `checkNegotiationNeeded`
+predicate returns **false** for it: the offer said `a=sendrecv`, the answer said
+`a=recvonly`, and the transceiver is now `recvonly`, so pion concludes nothing has changed
+relative to the negotiated state and the handler is never invoked. Meanwhile a manual
+`CreateOffer` at that same instant *does* produce a correct `a=recvonly` offer — so the
+renegotiation is both necessary and available; pion simply will not ask for it.
+
+Left uncorrected, a removal never renegotiates and **the forwarded track stays in the far
+end's SDP forever** — the lingering-leg defect §7.4 exists to kill, reintroduced one layer
+down.
+
 ```go
-// RemoveTrack removes a previously added outbound track from this session. It fires
-// OnNegotiationNeeded, so the serializer (§7.1) emits the renegotiating offer; the caller
-// does not offer by hand.
+// Session gains one more field, guarded by s.mu:
+//
+//   pendingLocalChange bool  // a local m-line change was made that pion will NOT
+//                            // re-fire for. Set ONLY by RemoveTrack. Consumed by the
+//                            // serializer when it next returns to stable.
+```
+
+> **THE ASYMMETRY — read this before "simplifying" (frozen).** `pendingLocalChange` looks
+> exactly like the `renegotiate` flag §15.3/M9 removed, and is its opposite:
+>
+> | | removed `renegotiate` | added `pendingLocalChange` |
+> |---|---|---|
+> | Covers | `AddTrack` — a path where pion **does** re-fire | `RemoveTrack` — a path where pion **provably does not** |
+> | Effect | Races pion's own trigger ⇒ two offers for one change | Supplies the only trigger ⇒ one offer for one change |
+> | Without it | Correct | Permanently stale far-end SDP |
+>
+> **Scope is the whole safety property: set it in `RemoveTrack` and nowhere else.** A future
+> change that also sets it on `AddTrack` has silently rebuilt the flag that was removed, and
+> the symptom (duplicate offers) will look unrelated to the edit that caused it.
+
+```go
+// RemoveTrack removes a previously added outbound track from this session. Because pion
+// will NOT re-fire negotiation-needed for a removal (see above), RemoveTrack sets
+// pendingLocalChange so the serializer emits the renegotiating offer itself. The caller
+// still does not offer by hand.
 //
 // A closed PeerConnection returns webrtc.ErrConnectionClosed, which RemoveTrack maps to
 // nil: a closed session has already removed every track, so "remove from a closed session"
@@ -3008,6 +3113,12 @@ a bug — and the existing code already logs and drops it. Keep that.
 // site would be noise, and would tempt callers to ignore ALL errors from this method.
 func (s *Session) RemoveTrack(sender *webrtc.RTPSender) error
 ```
+
+> **Pin pion's behaviour, not just ours.** §12.2 requires a subtest asserting that
+> `RemoveTrack` alone produces no `OnNegotiationNeeded` callback while a manual `CreateOffer`
+> at the same point yields `a=recvonly`. That test documents the upstream fact this design
+> depends on, so a pion upgrade that starts re-firing is caught as a *test failure* rather
+> than as duplicate offers in production.
 
 The `forwarder` gains the mutation surface the Router needs, mirroring the existing
 `addOut`/`removeChild` pair:
@@ -3269,7 +3380,8 @@ establishment of downtime.
 
 ```go
 // RouterConfig gains:
-//   Backup bool          // honour precomputed backup parents on primary failure (default true)
+//   DisableBackup bool   // RENAMED from Backup (§15.13). Zero value ⇒ backup promotion
+//                        // ENABLED, which is the safe direction. See below.
 //   Clock  clock.Clock   // nil ⇒ clock.System()
 //   OnReparented func(metrics.Reparented)  // called after a self-promotion so cmd/peer can
 //                                          // ship the frame; nil ⇒ no report. Declared as a
@@ -3277,9 +3389,60 @@ establishment of downtime.
 //                                          // wire — same seam discipline as everywhere else.
 ```
 
+> **`Backup bool` → `DisableBackup bool` (RULING, §15.13).** v2's field was specified as
+> "default true", which a plain Go bool cannot express — its zero value is `false`, so a
+> caller that forgets the field silently gets **failover disabled**. That is the wrong
+> direction to fail in for the entire point of Phase 5.
+>
+> Inverting is the fix, not a `*bool` and not "WI-8 must remember". **Make the zero value the
+> safe case** is the operative Go principle here, and it is the only option of the three that
+> does not depend on a caller getting something right. A `*bool` trades a wrong default for a
+> nil-deref surface on a boolean; "pass it explicitly" makes correctness a matter of memory,
+> which is precisely what the question was asking about.
+>
+> The CLI keeps `-backup` defaulting to **true** (§10) — flags express non-zero defaults
+> fine; struct fields effectively cannot. `cmd/peer` translates `-backup=false` into
+> `DisableBackup: true`, and that translation is the only place the polarity flips.
+
 Triggered from the parent session's `OnState` handler: on `Failed`, or on `Disconnected`
 held for `ParentDisconnectGrace` (timed off the injected clock), run §7.3 steps 1–6 against
 `topo.BackupOf(selfName)` and then invoke `OnReparented`.
+
+#### 7.5a The backup edge is unmodelled — how both ends agree on it (§15.13)
+
+A backup edge **is not in the tree**. `Topology.Offers` is therefore meaningless on it, and
+the far end has no topology reason to expect a connection at all — so, as v2.4 specified it,
+the backup parent drops the promoting peer's offer as coming from an unknown peer and **the
+promotion deadlocks**. Two rules close it, and both are contract, not implementation detail:
+
+**1. The promoter forces itself offerer.** `SessionConfig.Offerer = &true` on a backup edge.
+Only an offer can add m-lines, and the backup parent has no way to know a connection is
+coming, so it cannot be the one to initiate. This is the single place `Offers` is bypassed,
+and it is bypassed because there is no tree edge to derive it from.
+
+**2. The backup parent accepts a first offer from a topology-unknown sender IFF
+`topo.BackupOf(sender) == self`, evaluated against its OWN current topology.**
+
+This check is doing real authorization work, so it gets stated plainly rather than left to be
+rediscovered:
+
+- **What authorizes it.** The receiver's current topology arrived over a fence-accepted
+  `TypeTopology` (§6.5), so its `Backups` assignment is the coordinator's, at an epoch the
+  receiver already accepted. "The coordinator told me I am this peer's backup" is the
+  warrant, and it is the only one available on an edge the tree does not contain.
+- **Fail closed on disagreement.** If the backup parent holds an older `Rev` that lacks the
+  assignment, it rejects; the promoter hits `ReparentConnectTimeout` and reports
+  `Reparented{OK:false}` (§5.6). A stranded peer bypasses `RecomputeCooldown`, so the
+  coordinator repairs it promptly. Rejecting is correct: two ends disagreeing about the tree
+  must not silently form an edge outside it.
+- **The exemption is temporary by construction.** Once the coordinator ratifies the
+  promotion (§5.6), the edge appears in the next published topology as a real edge, `Offers`
+  becomes meaningful again, and any role inversion is handled by §7.4/C11 in the normal way.
+  The unmodelled window is exactly promotion → ratification.
+- **Honest scope.** This is a *consistency* check, not a security boundary. Nothing
+  authenticates peers (§13.8), so it stops a confused peer, not a lying one — consistent with
+  §13.9's no-Byzantine-tolerance stance. It earns its place by making a legitimate promotion
+  work while keeping an unmodelled edge from forming for any other reason.
 
 ---
 
@@ -4150,7 +4313,7 @@ leaves it nil and gets `crypto/rand`.
 | **Control loop** | `coordinator` | `-race`, fake `Sender`, fake `Publisher`, `VirtualClock`, `Sync` barrier. | The eight threshold events and **only** those recompute; `RecomputeCooldown` coalescing a burst; the `OK:false` cooldown bypass; health FSM transitions in virtual time; local repair moves only orphans (asserted via `ValidateLocalRepair`); the ratification rule (a self-promoted parent survives the next rebuild); re-root on root loss; `Snapshot` never tears. **The settle rule: a 1-member meet never builds and never consumes the settle; every join RE-ARMS it; a join burst coalesces into one build; a join bypasses `RecomputeCooldown` but not the settle; `unbuildable` is emitted only post-settle.** **The §5.9a relaxed retry: a fleet that is sticky-unbuildable but fresh-buildable publishes with `OutcomeRelaxed` and NEVER reports `unbuildable`; a genuinely over-constrained fleet reports `unbuildable` and keeps its previous tree; the retry does not bypass the cooldown; `PickRoot == ""` short-circuits without a second attempt.** | |
 | **Election** | `arbiter` | Table-driven `Score`; scenario-driven election. | `Score` returns 0 for TURN-bound and non-healthy; upload is absent from the formula (assert a large `UploadKbps` changes nothing); every trigger in §6.2; `MinTermDuration` blocks a voluntary handover and does **not** block a failure one; epochs strictly increase and never repeat. |
 | **Fencing** | `simnet` + `coordinator` | Scenario. | Two coordinators mid-handover: the stale one's push is rejected and counted; a topology carrying a higher epoch is rejected; a rejoining peer resets `curEpoch`; the arbiter-restart hole (§6.7) is closed. |
-| **Media, deterministic** | `media` | Unit, no network. | The negotiation serializer: a second `AddTrack` while `negotiating` sets `renegotiate` and produces **exactly one** follow-up offer; the retry path bounded by `NegotiationRetries`; `RemoveTrack` on a closed pc returns nil; the diff computation in `applyTopology` (pure function over two topologies — extract it so it is testable without pion). |
+| **Media, deterministic** | `media` | Unit, no network. | The negotiation serializer: a second `AddTrack` while `negotiating` produces **exactly one** follow-up offer. **`negotiationProbe`: the handler is reachable *during* `SetRemoteDescription` — pins §7.1's clear-before ordering, whose violation is otherwise invisible.** **Pion-behaviour pins: `RemoveTrack` alone fires no `OnNegotiationNeeded`, while a manual `CreateOffer` at that point yields `a=recvonly` — so a pion upgrade that changes this fails a test instead of shipping duplicate offers.** The retry never calls `CreateOffer` from `have-local-offer` and re-sends `LocalDescription()` instead; `NegotiationAnswerTimeout` re-sends and stays bounded by `NegotiationRetries`; `RemoveTrack` on a closed pc returns nil; `DisableBackup` zero value leaves promotion ENABLED; the backup-edge admission rule accepts iff `BackupOf(sender)==self` and fails closed otherwise; the diff computation in `applyTopology` (pure function over two topologies — extract it so it is testable without pion). |
 | **Media, integration** | `media` | `-race`, real loopback pion, as today. | Mid-call re-parent: a leaf moved from R1 to R2 keeps receiving, with the old session closed *after* the new one connects; a dropped source's downstream legs are actually removed (the §7.4 fix); backup promotion on a killed parent. |
 | **Wire** | `signaling` | `-race`, two real WS clients, as today. | The three new frame types round-trip; `SendRoom` reaches every member; a dead socket is reaped by the WS ping within `WSPingInterval + WSPingTimeout`; origin rejection. |
 | **Boundary policy** | `policy` | Table-driven, pure. | `ValidMeetID` accepts/rejects the frozen pattern's edges (leading `-`, 64 vs 65 chars, uppercase); `ParseOrigins` rejects a mid-string `*`; **`Origins.Match` accepts exactly the set `Origins.Patterns()` makes `websocket.Accept` accept** — asserted against the REAL library (this test lives in `signaling`, which may import both), never against a second copy of the matcher. That one assertion is the entire justification for the package existing (§2.4). |
@@ -4652,7 +4815,41 @@ second expression of it, in rank 1, is removed.
   WI-9's `cmd/server` test must still assert **the wiring passes it**. Constants agreeing while
   `main` forgets to pass them is precisely what one test alone would miss.
 
-### 15.13 Where I think a reviewer is wrong
+### 15.13 v2.5 — WI-4 (`media`) corrections, measured against pion v4.2.16
+
+Five of these are places §7 was **wrong about real pion**, found by verifying against the
+vendored source rather than by reading the spec. They are corrections of fact, not of taste.
+
+| # | Finding | Ruling | § |
+|---|---|---|---|
+| 1 | §7.2 claimed `RemoveTrack` renegotiates. It does not: `checkNegotiationNeeded` returns **false** for a removal (offer `sendrecv`, answer `recvonly`, transceiver `recvonly`), so the handler never runs — while a manual `CreateOffer` there *does* yield a correct `a=recvonly`. | **Corrected. `pendingLocalChange` ratified**, set by `RemoveTrack` and **nowhere else**. Froze the asymmetry against the removed `renegotiate` flag in a table, because they are visually identical and opposite in effect: one raced a trigger pion supplies, this one supplies a trigger pion withholds. Left alone, the forwarded track stays in the far end's SDP forever. | 7.2 |
+| 2 | §7.1 cleared `negotiating` **after** `SetRemoteDescription`, but pion re-fires negotiation-needed *inside* that call — so our handler early-returns, pion's flag is consumed, and **the renegotiation is lost permanently and silently**. | **Corrected to clear BEFORE.** The most dangerous item in the set. Clearing first is safe *because* of the two-guard design — `SignalingState()` catches the window where `SetRemoteDescription` fails with the flag already cleared. That guard is the one §15.14 declined to delete when a reviewer called it near-dead code; this is why it had to stay. `negotiationProbe` pins it, since the bug produces a missing renegotiation rather than a failure. | 7.1 |
+| 3 | §7.1's retry re-entered the full path, but pion forbids `SetLocal(offer)` from `have-local-offer`. | **Corrected into two shapes by failure point:** failed at `CreateOffer`/`SetLocalDescription` (still `stable`) ⇒ full path; failed at send, or answer timeout (`have-local-offer`) ⇒ **re-send `LocalDescription()` verbatim**. The second is also semantically right: the offer exists and is committed; the far end simply never saw it. | 7.1 |
+| 4 | §7.5 had no far-end story — a backup edge is not in the tree, so `Offers` is meaningless and the backup parent drops the offer. Promotion deadlocks as specified. | **Specified as §7.5a.** Promoter forces itself offerer (only an offer can add m-lines, and the far end cannot know a connection is coming); backup parent accepts a first offer from a topology-unknown sender **iff `topo.BackupOf(sender) == self`** against its own current topology. Stated as the authorization it is: the warrant is a fence-accepted `Backups` assignment; it **fails closed** on rev disagreement; the exemption lasts exactly promotion → ratification; and it is a consistency check, not a security boundary (§13.9). | 7.5a |
+| 5 | Role inversion deadlocks the edge: the far end re-creates its session later, still baked as offerer, and correctly drops our offer — we wait in `have-local-offer`, it waits for an offer already discarded. | **`NegotiationAnswerTimeout = 2s` added**, re-sending the existing offer via the item-3 rule and reusing the retry ladder so the total stays bounded. 2s is ~10x the worst realistic SDP round trip; the worst-case total deliberately exceeds `ReparentConnectTimeout` so the re-parent abandons on its own bound and the two timeouts never fight. | 7.1 |
+
+**Also ruled.**
+
+- **`media` imports `metrics` — RATIFIED.** §2.3 omitted the edge while §7.5 froze
+  `OnReparented func(metrics.Reparented)`; WI-4 implemented §7.5 and no cycle results.
+  Respecifying the callback as positional parameters to dodge the type is strictly worse —
+  the same argument §5.8 already made for `Publisher` taking a struct.
+- **`RouterConfig.Backup bool` → `DisableBackup bool`.** "Default true" is unachievable for a
+  plain bool, so a caller who forgets the field silently gets failover **disabled** — the
+  wrong direction to fail in for the whole point of Phase 5. Inverting makes the zero value
+  the safe case, which is the operative Go principle and the only one of the three options
+  that does not depend on a caller remembering. `-backup` keeps its `true` CLI default;
+  `cmd/peer` is the single place the polarity flips.
+
+**KNOWN GAP recorded (not a ruling).** `overlay.Fence` shipped after WI-4 branched, so
+`applyTopology` currently enforces only the **ordering** half of §6.5 — `Supersedes`, counted
+in `Router.StaleRejected`. The **authorization** half (`Fence.Accept`, plus `Reset` /
+`AdoptAnnouncement` wiring in `cmd/peer`) is routed but not yet in. Until it lands, §6.5 is
+**partially enforced**: a stale-rev push is rejected, but a push from a peer that is not the
+announced coordinator is not. Recorded here so no reader takes §6.5 as fully realised, and so
+the follow-up is visible rather than assumed.
+
+### 15.14 Where I think a reviewer is wrong
 
 - **"`Supersedes` should be deleted."** Not taken. It is genuinely needed for *ordering* —
   the coordinator sequencing its own trees, the dashboard detecting a stale snapshot. The
@@ -4665,5 +4862,5 @@ second expression of it, in rank 1, is removed.
 
 ---
 
-*This document is FROZEN at v2.4. Amendments go through the owner, in this file, recorded in
+*This document is FROZEN at v2.5. Amendments go through the owner, in this file, recorded in
 §15. Implementers: build what is written, and report what is wrong.*
