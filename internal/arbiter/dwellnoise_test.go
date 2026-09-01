@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/SammyUrfen/conclave/internal/arbiter"
+	"github.com/SammyUrfen/conclave/internal/overlay"
 )
 
 // TestDwellSurvivesChallengerJitter is a REGRESSION TEST FOR A BUG THE SENSORS
@@ -89,5 +90,42 @@ func TestDwellStillRejectsARealTargetChange(t *testing.T) {
 	m := h.meet("m")
 	if m.Coordinator != "carol" {
 		t.Errorf("coordinator = %q, want carol: a materially fitter candidate must take the role", m.Coordinator)
+	}
+}
+
+// TestScoreQuantumBracketsBothScales earns the constant's value from both directions.
+// TestDwellSurvivesChallengerJitter already fails if the quantum is too SMALL to
+// absorb sensor noise; on its own that is satisfied by making the quantum enormous,
+// which would erase every real fitness difference and reduce the election to a name
+// sort. This is the upper bound.
+//
+// The two scales it must sit between:
+//   - below: measurement noise, ~0.0005 of score on a quiet link.
+//   - above: the smallest term that carries meaning, the 0.15 uptime weight.
+func TestScoreQuantumBracketsBothScales(t *testing.T) {
+	const sensorNoise = 0.0005 // 0.35 weight x 0.3ms jitter / 300ms useful range
+
+	if arbiter.ScoreQuantum <= sensorNoise {
+		t.Errorf("ScoreQuantum %v does not absorb sensor noise %v; candidate order will follow jitter",
+			arbiter.ScoreQuantum, sensorNoise)
+	}
+	// The uptime weight is the smallest term in Score. A quantum that large would put
+	// a peer with two minutes of proven stability in the same bucket as one that
+	// joined a second ago.
+	if arbiter.ScoreQuantum >= 0.15 {
+		t.Errorf("ScoreQuantum %v is at least the uptime weight 0.15; a real fitness difference "+
+			"would be quantized away", arbiter.ScoreQuantum)
+	}
+
+	// Stated as its consequence: two peers differing by one full weight term must
+	// still be ranked apart.
+	base := arbiter.Fitness{
+		CPUFreePct: 100, RTTServerMs: 0, LossPct: 0, UptimeSec: arbiter.StableUptimeSec,
+		NAT: overlay.NATDirect, Live: true, Coordinatable: true,
+	}
+	worse := base
+	worse.UptimeSec = 0 // costs exactly the 0.15 uptime weight
+	if gap := arbiter.Score(base) - arbiter.Score(worse); gap <= arbiter.ScoreQuantum {
+		t.Errorf("a full uptime term is worth %v, within one quantum %v", gap, arbiter.ScoreQuantum)
 	}
 }

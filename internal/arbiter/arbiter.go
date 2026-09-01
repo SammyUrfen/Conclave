@@ -787,8 +787,15 @@ func (a *Arbiter) candidates(ms *meetState, now time.Time) []candidate {
 		out = append(out, candidate{id: id, name: ps.name, score: Score(f)})
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].score != out[j].score {
-			return out[i].score > out[j].score
+		// Compare BUCKETS, not raw scores. Two peers whose fitness differs by less
+		// than one quantum are not distinguishable evidence, and ordering them by the
+		// difference makes the ranking follow measurement noise — see ScoreQuantum.
+		// Bucketing is a plain total order (it is just a number), unlike an
+		// epsilon-tolerant comparator, which is not transitive and would hand
+		// sort.Slice an inconsistent ordering.
+		bi, bj := bucket(out[i].score), bucket(out[j].score)
+		if bi != bj {
+			return bi > bj
 		}
 		if out[i].name != out[j].name {
 			return out[i].name < out[j].name
@@ -927,14 +934,36 @@ func (a *Arbiter) elect(ms *meetState, now time.Time) bool {
 		return false
 	}
 
+	// NOTE ON WHAT MAKES THE DWELL REACHABLE AT ALL, because it is not obvious from
+	// here: the dwell restarts whenever the target changes, so a target that changes
+	// every second is a dwell that never elapses and a role that can never move. That
+	// was harmless while every eligible peer scored identically and candidates() fell
+	// through to its name tiebreak. It stopped being harmless when RTTServerMs and
+	// CPUPct became MEASURED — two comparable peers then differ by microseconds of
+	// jitter and trade places about once a second. A live three-peer meet sat on the
+	// arbiter for five minutes announcing nothing.
+	//
+	// The fix is upstream, in candidates(): the ranking compares QUANTIZED scores, so
+	// a difference smaller than the sensors can meaningfully report cannot reorder
+	// anybody. See ScoreQuantum. TestDwellSurvivesChallengerJitter reproduces the bug
+	// and pins the fix.
+	//
+	// RESIDUAL, stated rather than papered over: two peers whose scores straddle a
+	// bucket boundary land in different buckets and can still trade places. A
+	// pending-target stickiness rule was written and then DELETED, because absorbing
+	// that case also absorbs an exact tie — and then the pending target, which is
+	// whichever peer happened to join first, decides a tie that
+	// TestTiesBreakDeterministically requires the name order to decide. Narrowing it
+	// to strictly-worse-but-within-a-quantum did satisfy both, but no test could be
+	// built that distinguished it from bucketing alone at reasonable cost, and
+	// unpinned mechanism is worse than a documented gap.
 	want := a.wantedMove(ms, chal.score, now)
 	if want == "" {
 		ms.clearPending()
 		return false
 	}
 
-	// Dwell: the same wanted move, at the same target, sustained. A change of either
-	// restarts the clock, which is what stops a flapping metric from moving the role.
+	// Dwell: the same wanted move, at the same target, sustained.
 	if ms.pendingReason != want || ms.pendingTarget != chal.id {
 		ms.pendingReason, ms.pendingTarget, ms.pendingSince = want, chal.id, now
 	}
