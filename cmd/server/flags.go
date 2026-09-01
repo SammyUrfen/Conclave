@@ -11,6 +11,7 @@ import (
 	"github.com/SammyUrfen/conclave/internal/arbiter"
 	"github.com/SammyUrfen/conclave/internal/coordinator"
 	"github.com/SammyUrfen/conclave/internal/logging"
+	"github.com/SammyUrfen/conclave/internal/meetconfig"
 	"github.com/SammyUrfen/conclave/internal/metrics"
 	"github.com/SammyUrfen/conclave/internal/overlay"
 	"github.com/SammyUrfen/conclave/internal/policy"
@@ -402,34 +403,17 @@ func millis(d time.Duration) int64 { return int64(d / time.Millisecond) }
 // arbiter. What remains testable is the translation itself, which is a strictly
 // smaller thing to guard than two independent literals.
 func (f *serverFlags) coordinatorConfig(socketDetection time.Duration) coordinator.Config {
-	return coordinatorConfigFrom(f.meetCoordinatorConfig(socketDetection))
-}
-
-// coordinatorConfigFrom is the translator, and it is a free function taking the wire
-// type on purpose: an elected peer performs exactly this translation on the
-// announcement it receives, so keeping it independent of serverFlags is what lets that
-// code be the same shape rather than a re-derivation.
-func coordinatorConfigFrom(cc arbiter.CoordinatorConfig) coordinator.Config {
-	return coordinator.Config{
-		MaxDepth:          cc.MaxDepth,
-		StreamKbps:        cc.StreamKbps,
-		DefaultUploadKbps: cc.DefaultUploadKbps,
-		// The pointer is a LOCAL API convenience and never crosses the wire: nil is
-		// coordinator.Config's zero value and resolves to the safe stability-preserving
-		// default, while Stickiness(0) is an unambiguous request for memoryless. Here
-		// the value is always known, so it is always an explicit request — including
-		// when it is 0, which is the case the pointer exists for.
-		StickinessMs:      coordinator.Stickiness(cc.StickinessMs),
-		Dwell:             cc.Dwell(),
-		RecomputeCooldown: cc.RecomputeCooldown(),
-		DegradedAfter:     cc.DegradedAfter(),
-		GoneAfter:         cc.GoneAfter(),
-		JoinSettle:        cc.JoinSettle(),
-		SocketDetection:   cc.SocketDetection(),
-		// SelfName stays empty: this coordinator runs inside the arbiter process, not
-		// on an elected peer, which is exactly what the empty value means (§5.8). It is
-		// also the one field that must NOT travel — it is the holder's own identity.
-	}
+	// meetconfig.Coordinator is the SHARED translator, and sharing it is the point: an
+	// elected peer runs the identical conversion on the announcement it receives, so
+	// the arbiter's in-process coordinator and a peer's reach the same configuration
+	// from the same frame. It lives in its own package because Go cannot import a main
+	// package and the dependency graph forbids arbiter and coordinator importing each
+	// other (docs/PLAN.md §2.3).
+	//
+	// SelfName is deliberately left as the translator leaves it — empty — because that
+	// empty value is what marks a coordinator running inside the arbiter process (§5.8).
+	// An elected peer sets its own name there.
+	return meetconfig.Coordinator(f.meetCoordinatorConfig(socketDetection))
 }
 
 // validateMeetConfig fails startup on a meet configuration that cannot drive a
