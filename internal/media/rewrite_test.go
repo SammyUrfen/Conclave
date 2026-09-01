@@ -323,3 +323,46 @@ func newSenders(t *testing.T, n int) []*webrtc.RTPSender {
 	}
 	return out
 }
+
+// TestRTPRewriterIgnoresOutOfOrder pins the boundary the switch rebases off.
+//
+// A NACK retransmission or a reordered packet arrives with an OLDER sequence number.
+// Advancing the leg's high-water mark on it drags the mark backwards, so the next
+// Switch rebases from there and the new upstream is spliced on top of a range the
+// child has already seen — a duplicate-sequence overlap, which a jitter buffer reads
+// as corruption rather than as loss.
+//
+// The high-water mark must therefore only ever move FORWARD, in uint16 wrapping
+// order, while the retransmitted packet itself is still forwarded (dropping it would
+// defeat the NACK that asked for it).
+func TestRTPRewriterIgnoresOutOfOrder(t *testing.T) {
+	w := &rtpRewriter{}
+	for _, p := range []*rtp.Packet{
+		vp8Pkt(100, 1000, true), vp8Pkt(101, 4000, false), vp8Pkt(102, 7000, false),
+	} {
+		if w.Rewrite(p) == nil {
+			t.Fatal("packet dropped before any switch")
+		}
+	}
+	// A retransmission of an already-sent packet: forwarded, but it must not move
+	// the mark back to 100.
+	if got := w.Rewrite(vp8Pkt(100, 1000, true)); got == nil {
+		t.Fatal("a retransmitted packet was dropped; the NACK that asked for it goes unanswered")
+	} else if got.SequenceNumber != 100 {
+		t.Errorf("retransmit rewritten to seq %d, want 100 (offsets are unchanged)", got.SequenceNumber)
+	}
+
+	w.Switch()
+	out := w.Rewrite(vp8Pkt(60000, 900000, true))
+	if out == nil {
+		t.Fatal("the keyframe after a switch was dropped")
+	}
+	if out.SequenceNumber != 103 {
+		t.Errorf("post-switch seq = %d, want 103; rebasing off a retransmitted packet would "+
+			"restart at 101 and overlap sequence numbers the child has already seen",
+			out.SequenceNumber)
+	}
+	if out.Timestamp != 7000+TimestampGapTicks {
+		t.Errorf("post-switch ts = %d, want %d", out.Timestamp, 7000+TimestampGapTicks)
+	}
+}
