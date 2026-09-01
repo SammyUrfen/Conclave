@@ -73,6 +73,41 @@ type Report struct {
 	// reports in hand and no volunteers among them should say so out loud rather
 	// than sit silent — that is a configuration fact, not a transient one.
 	Coordinatable bool `json:"coordinatable"`
+	// PeerRTT is this node's MEASURED round-trip to other peers, in milliseconds —
+	// the input BuildTree's min-latency rank needs and, before this existed, never
+	// had. The coordinator copies it into overlay.Node.RTT verbatim.
+	//
+	// It is an ORDERED SLICE and not the map[string]float64 that overlay.Node.RTT
+	// itself uses, for exactly the reason metrics.Heartbeat.Children is a slice: the
+	// value shapes the tree, and while encoding/json marshals a map in sorted key
+	// order, it hands the PRODUCER a map to iterate — and Go randomises that. Two
+	// peers holding identical measurements could then emit frames that differ, and
+	// the first tree of an epoch would depend on a hash seed. Call Normalize before
+	// sending.
+	//
+	// PARTIAL AND POSSIBLY STALE, by construction. A peer can only measure a path it
+	// has a PeerConnection over, so this covers its current tree neighbours plus
+	// neighbours it held recently enough to still remember (media.Router keeps them
+	// for RTTMemory). A peer it has never been connected to is simply absent, and
+	// BuildTree already treats a missing entry as unknown/worst-case. omitempty
+	// because a peer with nothing measured — every peer, on its first report — must
+	// emit no key at all rather than an empty array a receiver could read as
+	// "measured, and all zero".
+	PeerRTT []PeerRTT `json:"peer_rtt,omitempty"`
+}
+
+// PeerRTT is one measured round-trip from the reporting node to another peer.
+type PeerRTT struct {
+	Name  string  `json:"name"`
+	RTTMs float64 `json:"rtt_ms"`
+}
+
+// Normalize puts PeerRTT into the canonical order (name ascending), so two peers
+// holding the same measurements produce byte-identical frames. A sender must call
+// it; a receiver may call it defensively. It is idempotent. Name is a total order
+// because a meet rejects duplicate names.
+func (r *Report) Normalize() {
+	sort.Slice(r.PeerRTT, func(i, j int) bool { return r.PeerRTT[i].Name < r.PeerRTT[j].Name })
 }
 
 // The liveness family. HeartbeatInterval sets the cadence; everything else is

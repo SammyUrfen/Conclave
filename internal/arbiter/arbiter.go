@@ -787,8 +787,15 @@ func (a *Arbiter) candidates(ms *meetState, now time.Time) []candidate {
 		out = append(out, candidate{id: id, name: ps.name, score: Score(f)})
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].score != out[j].score {
-			return out[i].score > out[j].score
+		// Compare BUCKETS, not raw scores. Two peers whose fitness differs by less
+		// than one quantum are not distinguishable evidence, and ordering them by the
+		// difference makes the ranking follow measurement noise — see ScoreQuantum.
+		// Bucketing is a plain total order (it is just a number), unlike an
+		// epsilon-tolerant comparator, which is not transitive and would hand
+		// sort.Slice an inconsistent ordering.
+		bi, bj := bucket(out[i].score), bucket(out[j].score)
+		if bi != bj {
+			return bi > bj
 		}
 		if out[i].name != out[j].name {
 			return out[i].name < out[j].name
@@ -927,14 +934,36 @@ func (a *Arbiter) elect(ms *meetState, now time.Time) bool {
 		return false
 	}
 
+	// NOTE ON WHAT MAKES THE DWELL REACHABLE AT ALL, because it is not visible from
+	// here: the dwell restarts whenever the target changes, so a target that changes
+	// every second is a dwell that never elapses and a role that can never move.
+	//
+	// That was harmless while every eligible peer scored identically and candidates()
+	// fell through to its name tiebreak — the ordering was then perfectly stable. It
+	// stopped being harmless when RTTServerMs and CPUPct became MEASURED: two
+	// comparable peers differ by microseconds of jitter and trade places about once a
+	// second. A live three-peer meet run with -coordinate -elect sat on the arbiter
+	// for five minutes announcing nothing but its bootstrap.
+	//
+	// The fix is upstream in candidates(), which ranks on QUANTIZED scores so that a
+	// difference smaller than the sensors can meaningfully report cannot reorder
+	// anybody (see ScoreQuantum). After it, the same live scenario promoted a peer at
+	// epoch 2, and instrumentation counted 8 challenger flips over 370 samples where
+	// before it flipped on nearly every one.
+	//
+	// RESIDUAL, measured rather than assumed: two peers whose drifting scores straddle
+	// a bucket boundary still trade places while they cross it, which DELAYS a
+	// handover without preventing one — the stable intervals between crossings are
+	// longer than the dwell, and the drift stops once the uptime term saturates.
+	// TestDwellSurvivesABucketBoundary pins that, and records the stickiness rule that
+	// was written for this case and deleted because it also swallowed exact ties.
 	want := a.wantedMove(ms, chal.score, now)
 	if want == "" {
 		ms.clearPending()
 		return false
 	}
 
-	// Dwell: the same wanted move, at the same target, sustained. A change of either
-	// restarts the clock, which is what stops a flapping metric from moving the role.
+	// Dwell: the same wanted move, at the same target, sustained.
 	if ms.pendingReason != want || ms.pendingTarget != chal.id {
 		ms.pendingReason, ms.pendingTarget, ms.pendingSince = want, chal.id, now
 	}

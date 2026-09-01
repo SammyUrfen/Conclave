@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
@@ -22,6 +23,16 @@ import (
 // translation can be unit-tested with a fake. *Session satisfies it.
 type rtcpWriter interface {
 	WriteRTCP([]rtcp.Packet) error
+}
+
+// rtcpReader is the slice of an RTPSender the drain needs: just ReadRTCP.
+// *webrtc.RTPSender satisfies it. Declared here for the same reason as rtcpWriter —
+// without it drainRTCP's loop can only be exercised through a negotiated
+// PeerConnection, so the one line that hands packets to handleRTCP is unreachable
+// from a test, and "the dispatch is correct but the loop never calls it" is exactly
+// the failure a loss reading of 0 cannot be distinguished from.
+type rtcpReader interface {
+	ReadRTCP() ([]rtcp.Packet, interceptor.Attributes, error)
 }
 
 // rtpTrack is the slice of a downstream track the fan-out needs: just WriteRTP.
@@ -62,6 +73,12 @@ type forwarder struct {
 	spawn func(fn func())
 
 	pliForwarded atomic.Int64 // upstream PLIs sent; asserted by the relay test
+
+	// loss is the uplink-loss sensor, fed from drainRTCP's reception reports. It
+	// carries its own mutex rather than living under f.mu because it is written on
+	// every child's drain goroutine and read on the metrics reporter's, and it shares
+	// no invariant with the source map f.mu guards.
+	loss lossTracker
 
 	mu      sync.RWMutex
 	sources map[string]*forwardSource // keyed by SOURCE peer name
@@ -253,7 +270,7 @@ func (f *forwarder) registerOut(src, dst string, track rtpTrack, sender *webrtc.
 	f.meter.addPeer(1)
 	f.spawn(func() {
 		defer f.meter.addPeer(-1)
-		f.drainRTCP(src, sender)
+		f.drainRTCP(src, dst, sender)
 	})
 }
 
@@ -457,18 +474,44 @@ func (f *forwarder) fanout(src string, gen uint64, pkt *rtp.Packet) {
 // interceptor chain (NACK responder, reports) and what catches the child's keyframe
 // requests. On PLI/FIR it asks the source for a keyframe. It returns when the child
 // leaves (its sender closes), which is the signal to drop this leg's meter count.
-func (f *forwarder) drainRTCP(src string, sender *webrtc.RTPSender) {
+func (f *forwarder) drainRTCP(src, dst string, sender rtcpReader) {
+	// The child's last reported loss must not outlive the child: a departed leg's
+	// final bad report would otherwise derate this relay permanently.
+	defer f.loss.forget(dst)
 	for {
 		pkts, _, err := sender.ReadRTCP()
 		if err != nil {
 			return // io.ErrClosedPipe when the child's sender stops → child gone
 		}
-		for _, p := range pkts {
-			switch p.(type) {
-			case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
-				// Normalise PLI and FIR to one upstream PLI — we don't need FIR's
-				// per-request sequence bookkeeping, just "send a keyframe".
-				f.requestUpstreamKeyframe(src)
+		f.handleRTCP(src, dst, pkts)
+	}
+}
+
+// handleRTCP dispatches one batch of RTCP arriving from downstream child dst on
+// source src's forwarded track. It is split out of drainRTCP's read loop so the
+// dispatch is reachable from a test: drainRTCP owns a *webrtc.RTPSender, which cannot
+// be faked, and "the sensor is correct but nothing ever calls it" is precisely the
+// failure a loss reading of 0 is indistinguishable from.
+func (f *forwarder) handleRTCP(src, dst string, pkts []rtcp.Packet) {
+	for _, p := range pkts {
+		switch pkt := p.(type) {
+		case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
+			// Normalise PLI and FIR to one upstream PLI — we don't need FIR's
+			// per-request sequence bookkeeping, just "send a keyframe".
+			f.requestUpstreamKeyframe(src)
+		case *rtcp.ReceiverReport:
+			// The child telling us what IT lost of what WE sent. This loop is the
+			// only place in the process that already sees it, which is why the
+			// uplink-loss sensor lives here rather than in a second RTCP reader:
+			// pion v4 collects no RTPSender stats at all, so GetStats cannot answer
+			// this (see TestPionPopulatesSelectedPairRTT).
+			//
+			// An EMPTY report records nothing. A peer that has received no media yet
+			// sends a receiver report with no reception blocks, and treating that as
+			// "measured, zero loss" would let a silent leg mask a genuinely lossy
+			// sibling in worstPct.
+			for _, rr := range pkt.Reports {
+				f.loss.observe(dst, fractionLost(rr))
 			}
 		}
 	}

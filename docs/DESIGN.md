@@ -15,9 +15,10 @@
 > **Honesty rule.** Every claim here is checkable in the repository. Where something is
 > designed but unmeasured, unbuilt, or unproven, §8 says so.
 >
-> **Status.** Phases 0–6 of 7 implemented. Phase 7 (simulcast/SVC, TURN) untouched.
-> 40,256 lines of Go: 17,505 non-test, 22,751 test. Base commit for every number in this
-> document: `8bacee6` on `integration/phase5`.
+> **Status.** Phases 0–6 of 7 implemented, plus the telemetry sensors that Phase 6's
+> election logic was written against (§8.1). Phase 7 (simulcast/SVC, TURN) untouched.
+> 48,126 lines of Go: 20,061 non-test, 28,065 test. Numbers in §9 predating the sensor
+> work were taken at `8bacee6` on `integration/phase5`.
 
 ---
 
@@ -1840,48 +1841,79 @@ reports the contract's version of events is a document that cannot be checked.
 Stated plainly and specifically, because a design document that oversells is worse than one
 that admits its edges. Everything here is checkable in the code.
 
-### 8.1 The telemetry is mostly declared, not measured — and this has teeth
+### 8.1 The telemetry is measured now — and what that changed, including a bug
 
-`metrics.Report` has seven fields. In a live run, `cmd/peer.sampleReport` populates **four**:
+`metrics.Report` has eight fields. In a live run, `cmd/peer`'s `telemetry.sample`
+populates all of them:
 
 | Field | Live source |
 |---|---|
-| `Name` | `-name` flag |
+| `Name`, `Coordinatable` | flags |
 | `UploadKbps` | **`-upload-kbps` flag** (default 3000). No bandwidth probe exists. |
 | `NAT` | **`-nat` flag** (`direct`\|`turn`). No NAT detection exists. |
-| `Coordinatable` | `-coordinatable` flag |
-| `RTTServerMs` | **never populated — always 0** |
-| `LossPct` | **never populated — always 0** |
-| `CPUPct` | **never populated — always 0** |
+| `CPUPct` | **`/proc/stat` deltas** (`metrics.CPUSampler`). Host-wide busy %, Linux only; reports nothing elsewhere. |
+| `RTTServerMs` | **WebSocket protocol ping** to the arbiter (`metrics.RTTProbe` → `signaling.Client.Ping`). |
+| `LossPct` | **RTCP receiver reports** from downstream children, worst leg (`media.lossTracker`). |
+| `PeerRTT` | **The nominated ICE candidate pair's round trip** (`media.rttStore`). |
 
-Three consequences follow, and each is larger than "some fields are TODO":
+Two of those sources are worth explaining, because the obvious choice does not work.
 
-**(a) The degradation machinery cannot fire in production.** The dwell arms only when
-`LossPct ≥ 5` or `RTTServerMs ≥ 400` or `CPUPct ≥ 90`. All three are structurally zero live,
-so `DegradationDwell`, `Node.Impaired`, rank 0b's impairment filter, and the `LossPct` capacity
-derate are exercised **only in `simnet`**, where the values are injected. The logic is real and
-tested; the sensors are not built.
+**pion collects no sender stats at all.** The textbook source for uplink loss and RTT
+is `RemoteInboundRTPStreamStats` — the RTCP Receiver Report the far end sends back
+about our outbound stream. pion v4.2.16 declares the type and never produces it:
+`PeerConnection.GetStats` calls `collectStats` on the ICE gatherer, the ICE transport,
+data channels, the SCTP transport, certificates, the media engine, and every
+`RTPReceiver` — there is no `RTPSender` collector (`peerconnection.go:2732-2780`). So
+loss is taken instead from the `rtcp.ReceiverReport`s the forwarder's drain loop
+**already reads** for keyframe requests, which costs nothing extra, and RTT from the
+ICE candidate pair, which is better for the purpose anyway: it needs no media flowing,
+both ends measure the same path, and it exists as soon as the pair is nominated.
+`TestPionPopulatesSelectedPairRTT` pins it.
 
-**(b) Voluntary election cannot fire in production.** With CPU, RTT and loss all zero, every
-reported/coordinatable/non-TURN peer scores
-`0.30 + 0.35 + 0.20 + 0.15·min(uptime/120, 1)` — that is, **0.85 to 1.0**. So
-`DemoteBelowScore = 0.35` can never be crossed, and `PromoteMarginScore = 0.20` can never be
-met, because the only varying term is worth at most 0.15. In a live deployment the election
-therefore reduces to: **bootstrap** (a meet with members and no coordinator) and **failover**
-(the incumbent is not live), tie-broken by uptime then name. Promotion and demotion are
-tested, and unreachable without sensors. Do not demo this as "elects the fittest machine" — it
-elects on the inputs it has.
+**Pairwise RTT is remembered, not just measured.** `BuildTree`'s min-latency rank reads
+`Node.RTT[candidate]`, and a peer only holds a PeerConnection to its *current* tree
+neighbours — so a sensor that forgot a peer when its edge closed would give the
+incumbent parent a real number and leave every challenger at `unknownRTT`. No
+challenger could win and `-stickiness-ms` could never bind. `media.RTTMemory` keeps a
+measurement for 2 minutes after the edge goes, which is what turns a former parent into
+a comparable candidate.
 
-**(c) Pairwise RTT is unmeasured too**, so `BuildTree`'s min-latency rank (rank 2) has no live
-data and attachment falls through to fewest-children then name. This means the stickiness
-margin is also **inert live** — an incumbent always wins, because no challenger can beat an
-unknown RTT. That is not a bug, and the honest framing is precise: the anti-thrash property is
-*stronger* live than in simulation, and the min-latency property is *only* exercised in
-simulation.
+Three consequences follow, and each is sharper than "the fields are populated now".
 
-The genuinely measured signals are: the heartbeat's realized state (parent, children, and each
-edge's pion `PeerConnectionState`), the fence `(Epoch, Rev)`, the stale-rejection counter, and
-the upload meter's byte count — which is logged locally and never reaches the wire.
+**(a) The degradation machinery can fire in production.** The dwell arms on
+`LossPct ≥ 5`, `RTTServerMs ≥ 400`, or `CPUPct ≥ 90`, and all three are now real
+numbers. A failed control-link probe reports `metrics.UnreachableRTTMs` (1000) rather
+than its measured ~0 elapsed time — a closed socket returns instantly, and recording
+that would score a peer whose arbiter connection just died *better* than a healthy peer
+on a 20 ms link.
+
+**(b) Voluntary demotion requires all three signals, and this is arithmetic, not
+policy.** `Score` weights `0.30 cpu + 0.35 rtt + 0.20 loss + 0.15 uptime` and
+`DemoteBelowScore` is `0.35` on a **strict** `<`. A settled peer that is maximally bad
+on CPU *and* RTT but clean on loss scores exactly `0.20 + 0.15 = 0.35` and cannot be
+demoted. CPU exhaustion alone removes 0.30 of a possible 1.0 and never comes close. So
+live demotion needs a loss signal too, which in this system means the peer must also be
+a relay with children actually losing packets. `TestScoreFloorOfAFullyDegradedPeer`
+pins the numbers.
+
+**(c) Measuring the inputs broke the election, and the fix is `ScoreQuantum`.** This is
+the finding worth carrying forward, because nothing about it is visible in the code it
+broke. While every eligible peer scored identically, `candidates()` fell through to its
+name tiebreak and "the best challenger" was perfectly stable. With real sensors two
+comparable peers differ by microseconds of RTT and trade places about once a second —
+and the election dwell restarts whenever its target changes. A live three-peer meet sat
+on the arbiter for five minutes announcing nothing but its bootstrap. The dwell's own
+comment says it exists so "a flapping metric" cannot move the role; the defect was the
+same mechanism failing the other way, with a flapping metric *pinning* it. Candidate
+ranking now compares scores quantized to `ScoreQuantum` (0.01) — twenty times the
+sensor noise, fifteen times smaller than the smallest meaningful term — so a difference
+the sensors cannot support cannot reorder anybody. A residual remains and is measured
+rather than assumed: a pair whose drifting scores straddle a bucket boundary still
+trade places while crossing it, which *delays* a handover without preventing one.
+
+What is still **declared rather than measured**: `UploadKbps` and `NAT`, both flags.
+There is no bandwidth probe and no NAT detection; `overlay.NATRelayed` remains a
+modelled constraint.
 
 ### 8.2 No authentication, anywhere
 
@@ -2088,34 +2120,79 @@ no -race:  media 13.926s  cmd/peer 0.526s  everything else 0.1–0.3s each
 | 5–6 | Churn under both oracles | 5 seeds × 200 steps, `Validate` + `ValidateLocalRepair` green at every step |
 | baseline | The pre-Phase-5 end-to-end run at `c2d25f0` | **322 VP8 frames** relayed through a computed tree, clean shutdown — *recorded in the build log, not in the repository; treat it as a run note rather than a committed artifact* |
 
-### 9.5 Live end-to-end verification of Phases 5 and 6
+### 9.5 Live end-to-end verification
 
-> ### ⚠️ PLACEHOLDER — RESULTS PENDING
->
-> A live end-to-end verification run of the Phase 5 and Phase 6 behaviours is **in progress at
-> the time of writing** and its findings are not yet incorporated. This section will be
-> replaced with the measured results.
->
-> What the run is expected to establish, against the pre-Phase-5 baseline at `c2d25f0`
-> (322 VP8 frames relayed through a computed relay tree, clean shutdown):
->
-> - **Relay kill → backup promotion.** A relay is killed mid-call; a child promotes its
->   precomputed backup without asking the coordinator, and the media gap is bounded by one
->   keyframe interval rather than by `GoneAfter`. Frame counts before, during, and after.
-> - **Coordinator kill → election and migration.** The sitting coordinator is killed; the
->   arbiter elects a successor, the epoch advances, peers adopt the announcement, the new
->   coordinator rebuilds from peers' realized state and publishes `Rev = 1` under the new
->   epoch. Whether media flowed uninterrupted through the handover.
-> - **The fence doing visible work.** A nonzero `stale_rejected` count at a peer during the
->   handover window — the observable proof that an `E`-stamped push was refused after the
->   `E+1` announcement landed.
-> - **The dashboard against live data**, including the realized-vs-intended divergence during
->   convergence.
->
-> **Until this section is filled in, Phases 5 and 6 are verified by the automated suite —
-> including deterministic simulation of the control plane and real-pion integration tests of
-> the media plane — but not by a live multi-process run.** Any claim about live failover or
-> live migration should be stated with that qualification.
+Multi-process runs on one host. Everything below is from a process's own log or the
+arbiter's HTTP surface, not from a test harness.
+
+**Phases 5–6, earlier runs.** 323 decodable VP8 frames through a computed relay (no
+regression against the pre-Phase-5 baseline of 322); a relay killed with 3 children put
+its orphans back on media in 0.76 s with nobody else moved; a killed coordinator had a
+successor announced 0.4 ms later at a bumped epoch; the dashboard held live data with
+zero console errors and never rolled an epoch backwards.
+
+**The telemetry sensors.** A three-peer meet, one peer's control link behind a
+125 ms-each-way TCP proxy:
+
+```
+peer      rtt_server_ms   cpu_pct   fitness
+alpha             0.320      3.60     0.839
+bravo             0.260      3.60     0.839
+charlie         121.459      3.60     0.698     <- behind the proxy
+```
+
+Loading the host to saturation moved `cpu_pct` 3.6 → 99.30 and fitness 0.839 → 0.551
+on the same peers. Before the sensors every one of these was structurally 0 and every
+peer scored 0.85–1.0.
+
+**The election, before and after `ScoreQuantum`.** The same three-peer shape run with
+`-coordinate -elect`: **before**, the arbiter held the meet for five minutes and logged
+one announcement (its own bootstrap), because the two comparable peers traded places on
+raw score about once a second and restarted the dwell. **After**, `epoch 2,
+coordinator alpha, reason promotion`, 95.2 s after bootstrap — and instrumentation
+counted 8 challenger flips over 370 evaluations where before it flipped on nearly every
+one.
+
+**Live demotion.** A four-process meet inside an unprivileged user+network namespace,
+with the sitting coordinator impaired on all three axes at once (nftables dropping 40%
+of its media UDP, a 125 ms-each-way control-link proxy, and a namespaced `/proc/stat`
+standing in for a saturated machine): `epoch 2, reason demotion`,
+reproduced across two runs. The victim held the role until t+60 s, lost it in the
+following interval, and the successor then held it for four more minutes without
+flapping.
+
+Note *which* peer replaced it, both times: the one advertising **500 kbit/s**, over a
+candidate advertising 9000. That is not a defect — `UploadKbps` does not appear in
+`arbiter.Fitness` at all, so the two score alike on the control-plane axes and the name
+tiebreak decides. §2.1's control/data-plane split, visible in a live log line rather
+than only in the reflection test that enforces it.
+
+**The backup-parent path, and the A/B that finally exercised it.** Cutting a relay's
+media with `nft` while leaving its WebSocket alive is what the backup path was designed
+for, and it is a failure `SIGKILL` cannot produce:
+
+| Fault | Orphan detection | `via_backup` | Relay health at the coordinator |
+|---|---|---|---|
+| `SIGKILL` the relay | **9 ms** | `false` | gone — reaped, tree repaired centrally |
+| Drop the relay's media UDP only | **8.2 s** | **`true`** | **healthy** — still heartbeating |
+
+Under the UDP cut both children reached `disconnected` at 6.2 s (ICE consent
+freshness), waited out `ParentDisconnectGrace`, promoted their precomputed backup at
+8.2 s, and the new edge connected in **5 ms**. The coordinator never acted: it still
+saw the relay as healthy. Under `SIGKILL` the socket closes instantly and the
+coordinator's push arrives in 9 ms, so the peer-local path never runs — which is
+exactly why every previous attempt logged `via_backup=false`.
+
+**One thing that run also found**, and it is a real limitation rather than a harness
+artefact: the promotion reported `ok: false, reason: "new parent connected but carried
+no media"`. The promoter forces itself offerer (§4.2, because `Offers()` is meaningless
+on an edge outside the tree), but only an *offer* can add forwarded m-lines (§5.12) —
+so the new parent answers, cannot publish the forwarded tracks in that exchange, and
+`ReparentMediaTimeout` (3 s) expires before any media arrives. The edge is still
+committed and the meet converges once the coordinator ratifies and the parent
+renegotiates as offerer, but the *fast* path's media-evidence clause is unsatisfiable
+on a backup edge for any peer that expects forwarded media. **Failover restores the
+tree peer-locally; it does not restore media within one keyframe interval.**
 
 ---
 

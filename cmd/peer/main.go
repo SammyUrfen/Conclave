@@ -15,10 +15,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -96,6 +98,9 @@ type callConfig struct {
 	managed                                   bool
 	uploadKbps                                int
 	nat                                       overlay.NATType
+	// mediaPorts is the UDP range media is confined to; the zero value means
+	// "ephemeral", which is what a peer run without -media-ports gets.
+	mediaPorts [2]uint16
 
 	// heartbeat is the liveness cadence this peer declares on every beat.
 	//
@@ -152,7 +157,14 @@ func parseArgs(args []string) (options, error) {
 		"on primary-parent failure, promote the coordinator's precomputed backup parent without asking (tree mode)")
 	coordinatable := fs.Bool("coordinatable", true,
 		"may this peer be elected coordinator; false declines (a laptop on battery) (managed mode)")
+	mediaPorts := fs.String("media-ports", "",
+		"confine media (ICE/SRTP) to these UDP ports, e.g. 47000-47019; empty lets the OS choose (call mode)")
 	if err := fs.Parse(args); err != nil {
+		return options{}, err
+	}
+
+	ports, err := parseMediaPorts(*mediaPorts)
+	if err != nil {
 		return options{}, err
 	}
 
@@ -184,6 +196,7 @@ func parseArgs(args []string) (options, error) {
 		heartbeat:     *heartbeat,
 		backup:        *backup,
 		coordinatable: *coordinatable,
+		mediaPorts:    ports,
 	}
 	if err := validate(cfg, *timeout); err != nil {
 		return options{}, err
@@ -304,6 +317,119 @@ func parseNAT(s string) (overlay.NATType, error) {
 // function of the command line today; when real sensors land (RTT, loss, CPU) they
 // fold in here and nothing else moves — which is why metrics.Reporter takes a
 // sampler rather than a value.
+// telemetry is the peer's live sensor bundle: everything a Report carries that is
+// MEASURED rather than declared on the command line.
+//
+// Every sensor is a func seam and every one is optional, which is the whole shape of
+// the type. A probe-mode peer has no Router, a non-Linux host has no /proc/stat, and
+// a peer whose control link has just died has no fresh RTT — none of those may fault
+// the peer, and none may be papered over with a zero. metrics.Reporter already
+// applies that rule to a failed send; this applies it to a failed reading.
+//
+// Each sensor returns (value, ok) rather than a bare value, and the ok is
+// load-bearing rather than defensive. Report.CPUPct and RTTServerMs are float64s
+// whose zero means BOTH "not measured" and "perfect", and arbiter.Score reads the
+// perfect meaning — so a sensor with nothing to say must leave the field untouched,
+// not write its own zero.
+type telemetry struct {
+	// cfg is the declared half: the flags, unchanged.
+	cfg callConfig
+	// cpu reports host CPU busy percent (metrics.CPUSampler.Sample). nil off Linux.
+	cpu func() (float64, bool)
+	// rtt reports the last measured round trip to the arbiter
+	// (metrics.RTTProbe.LastMs). nil before the probe is started.
+	rtt func() (float64, bool)
+	// links reports measured pairwise RTT and worst-leg uplink loss
+	// (media.Router.LinkStats). nil until the Router exists.
+	links func() ([]metrics.PeerRTT, float64)
+}
+
+// sample builds one Report: the declared half from the flags, plus whatever the
+// sensors currently have to say.
+func (t *telemetry) sample() metrics.Report {
+	rep := sampleReport(t.cfg)
+	if t.cpu != nil {
+		if pct, ok := t.cpu(); ok {
+			rep.CPUPct = pct
+		}
+	}
+	if t.rtt != nil {
+		if ms, ok := t.rtt(); ok {
+			rep.RTTServerMs = ms
+		}
+	}
+	if t.links != nil {
+		rep.PeerRTT, rep.LossPct = t.links()
+	}
+	// LAST LINE OF DEFENCE, and it is here rather than only in the sensors because
+	// this is where the value becomes a frame. A NaN or an infinity marshals to
+	// INVALID JSON — encoding/json returns an error instead of bytes — so one bad
+	// reading would end this peer's telemetry entirely and the coordinator would
+	// watch it go quiet with nothing logged to say why. Each sensor clamps at its own
+	// boundary too; a reader should not have to trust three packages to know that a
+	// report is always sendable.
+	rep.CPUPct = finite(rep.CPUPct)
+	rep.RTTServerMs = finite(rep.RTTServerMs)
+	rep.LossPct = finite(rep.LossPct)
+	for i := range rep.PeerRTT {
+		rep.PeerRTT[i].RTTMs = finite(rep.PeerRTT[i].RTTMs)
+	}
+	// Ordered before it goes out, as metrics.Report.PeerRTT requires: this value
+	// becomes overlay.Node.RTT and shapes the tree, so two peers holding identical
+	// measurements must emit identical frames.
+	rep.Normalize()
+	return rep
+}
+
+// finite maps a non-finite reading to 0 — "not measured" — because that is the only
+// value that is both marshallable and honest about a sensor that has malfunctioned.
+func finite(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0
+	}
+	return v
+}
+
+// parseMediaPorts reads the -media-ports flag: "lo-hi", or a bare port meaning a
+// range of one, or empty for pion's ephemeral default.
+//
+// It fails loud on anything unusable, because the alternative is far worse than a
+// startup error: a peer given an impossible range gathers no candidates, never
+// connects, and reports nothing that points at the flag. Bad config should stop a
+// peer at startup, not surface as a mysterious missing stream later.
+func parseMediaPorts(s string) ([2]uint16, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return [2]uint16{}, nil
+	}
+	lo, hi, found := strings.Cut(s, "-")
+	if !found {
+		hi = lo
+	}
+	parse := func(field string) (uint16, error) {
+		n, err := strconv.Atoi(strings.TrimSpace(field))
+		// Port 0 is excluded deliberately: to the kernel it means "pick any", so a
+		// range starting at 0 would silently disable the confinement this flag exists
+		// to provide.
+		if err != nil || n < 1 || n > 65535 {
+			return 0, fmt.Errorf("invalid -media-ports %q: %q is not a port in 1-65535", s, strings.TrimSpace(field))
+		}
+		return uint16(n), nil
+	}
+	min, err := parse(lo)
+	if err != nil {
+		return [2]uint16{}, err
+	}
+	max, err := parse(hi)
+	if err != nil {
+		return [2]uint16{}, err
+	}
+	if max < min {
+		return [2]uint16{}, fmt.Errorf("invalid -media-ports %q: the high port %d is below the low port %d", s, max, min)
+	}
+	return [2]uint16{min, max}, nil
+}
+
 func sampleReport(cfg callConfig) metrics.Report {
 	return metrics.Report{
 		Name:       cfg.name,
@@ -329,13 +455,14 @@ func routerConfigFor(
 	onCoordinator func(payload []byte),
 ) media.RouterConfig {
 	rc := media.RouterConfig{
-		ICEServers: iceServers,
-		SendMedia:  cfg.send,
-		MediaPath:  cfg.mediaPath,
-		RecordPath: cfg.recordPath,
-		Topology:   topo,
-		SelfName:   cfg.name,
-		Managed:    cfg.managed,
+		ICEServers:     iceServers,
+		MediaPortRange: cfg.mediaPorts,
+		SendMedia:      cfg.send,
+		MediaPath:      cfg.mediaPath,
+		RecordPath:     cfg.recordPath,
+		Topology:       topo,
+		SelfName:       cfg.name,
+		Managed:        cfg.managed,
 		// THE POLARITY FLIP, and the only one in the tree. -backup reads positively
 		// to an operator ("do the failover"); media spells it negatively so that its
 		// ZERO value is the safe case — a caller who forgets the field gets failover
@@ -1166,12 +1293,54 @@ func runCall(ctx context.Context, logger *slog.Logger, cfg callConfig) error {
 	}
 
 	if cfg.managed {
+		// The live sensors. Each is started or primed HERE, at the edge, and handed
+		// to telemetry as a closure — no globals, and every seam visible at one site.
+		// The first report carries no CPU reading, and deliberately nothing is done
+		// about that. /proc/stat counts in 10 ms jiffies, so priming the baseline at
+		// startup would diff two reads microseconds apart, accumulate zero jiffies,
+		// and report nothing anyway — it only looks like it saves a cycle. The second
+		// report, one interval later, carries the first real interval.
+		cpu := &metrics.CPUSampler{}
+
+		// The control-link probe. It runs on its own goroutine rather than inside the
+		// sampler because Reporter.report calls sample() and then send() in sequence:
+		// a probe that blocked inside sample would delay the telemetry frame by
+		// exactly as long as the link is slow, which is when the frame matters most.
+		probe := metrics.NewRTTProbe(logger, metrics.DefaultInterval, clk,
+			func(ctx context.Context) error {
+				// A bounded wait, not the call's whole lifetime: an unbounded ping on
+				// a wedged socket would freeze RTTServerMs at its last good value
+				// forever, which reads as a healthy link. The budget is the report
+				// interval — waiting longer than the cadence that consumes the value
+				// buys nothing.
+				pingCtx, cancel := context.WithTimeout(ctx, metrics.DefaultInterval)
+				defer cancel()
+				return client.Ping(pingCtx)
+			})
+		wg.Add(1)
+		go func() { defer wg.Done(); probe.Run(callCtx) }()
+
+		tel := &telemetry{
+			cfg: cfg,
+			cpu: cpu.Sample,
+			rtt: probe.LastMs,
+			// Read through the variable, not captured by value: router is assigned
+			// above but LinkStats must be resolved per call anyway, and a nil check
+			// keeps a probe-mode peer from dereferencing one that was never built.
+			links: func() ([]metrics.PeerRTT, float64) {
+				if router == nil {
+					return nil, 0
+				}
+				return router.LinkStats()
+			},
+		}
+
 		// The reporter is decoupled from signaling: it samples a Report and ships it
 		// through this send closure, the only thing that knows about the wire.
 		// Telemetry is best-effort — a send error is the reporter's to log, never the
 		// peer's to fail on.
 		reporter := metrics.NewReporter(logger, metrics.DefaultInterval, clk,
-			func() metrics.Report { return sampleReport(cfg) },
+			tel.sample,
 			func(rep metrics.Report) error {
 				// Tee to the local coordinator first. The server will not forward this
 				// peer's own frames back to it, so if this process is hosting the

@@ -109,6 +109,22 @@ type SessionConfig struct {
 	// happens, which is right for a Session constructed directly in a test.
 	OnNegotiationFailed func()
 
+	// MediaPortRange confines ICE candidate gathering to [min, max] UDP ports. The
+	// zero value means "let pion pick ephemeral ports", which is the default and what
+	// every existing caller gets.
+	//
+	// It is an operator knob first: anyone opening a firewall or forwarding ports
+	// through a NAT has to know which ports a peer will use, and pinning them is the
+	// standard answer every WebRTC deployment reaches for. It is also what makes
+	// per-peer network fault injection possible without root — with each peer on its
+	// own range, one nftables rule inside an unprivileged network namespace can cut a
+	// single peer's MEDIA while leaving its control socket, and every other peer,
+	// untouched. That is the shape of failure the backup-parent path exists for and
+	// the one a SIGKILL cannot produce, because killing a process closes its control
+	// socket too and the coordinator repairs the tree before the peer-local fast path
+	// has a chance to run.
+	MediaPortRange [2]uint16
+
 	// Spawn runs a function as a goroutine the OWNER joins on shutdown — the Router
 	// passes its WaitGroup-tracked spawner. The Session uses it for the retry timer
 	// wait, which must not outlive the process it belongs to. Nil ⇒ a bare `go`,
@@ -220,7 +236,19 @@ func NewSession(cfg SessionConfig) (*Session, error) {
 	if err := webrtc.RegisterDefaultInterceptors(me, ir); err != nil {
 		return nil, fmt.Errorf("register interceptors: %w", err)
 	}
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(me), webrtc.WithInterceptorRegistry(ir))
+	opts := []func(*webrtc.API){webrtc.WithMediaEngine(me), webrtc.WithInterceptorRegistry(ir)}
+	if cfg.MediaPortRange != [2]uint16{} {
+		// Fail loud on a range pion rejects (max < min). Bad config must stop the peer
+		// here rather than surface later as a peer that gathers no candidates and
+		// never connects, with nothing in the log pointing at the flag.
+		var se webrtc.SettingEngine
+		if err := se.SetEphemeralUDPPortRange(cfg.MediaPortRange[0], cfg.MediaPortRange[1]); err != nil {
+			return nil, fmt.Errorf("media port range %d-%d: %w",
+				cfg.MediaPortRange[0], cfg.MediaPortRange[1], err)
+		}
+		opts = append(opts, webrtc.WithSettingEngine(se))
+	}
+	api := webrtc.NewAPI(opts...)
 
 	pc, err := api.NewPeerConnection(webrtc.Configuration{ICEServers: cfg.ICEServers})
 	if err != nil {
@@ -357,6 +385,16 @@ func (s *Session) AddRecvOnlyVideo() error {
 
 // ConnectionState reports the current PeerConnection state.
 func (s *Session) ConnectionState() webrtc.PeerConnectionState { return s.pc.ConnectionState() }
+
+// stats returns pion's stats report for this session's PeerConnection. It exists so
+// selectedPairRTTMs can read the nominated ICE candidate pair's round trip without
+// the rest of the package touching the pc directly.
+//
+// It is NOT cheap — pion walks every transceiver, transport and certificate to build
+// the report — so callers must not hold Router.mu across it. Router.LinkStats
+// snapshots the sessions under the lock, releases it, and calls this outside, the
+// same shape Realized already uses for ConnectionState.
+func (s *Session) stats() webrtc.StatsReport { return s.pc.GetStats() }
 
 // Close tears down the PeerConnection (unblocking any track reads/writes) and
 // retires any pending negotiation retry. It is idempotent: the Router closes a
