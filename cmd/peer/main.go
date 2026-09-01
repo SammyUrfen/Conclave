@@ -362,7 +362,8 @@ func routerConfigFor(
 // below can be tested against the very same fence type the Router holds.
 type coordinatorAdopter func(epoch uint64, coordinatorID string) bool
 
-// adoptAnnouncement decodes a TypeCoordinator body and hands it to the fence.
+// adoptAnnouncement decodes a TypeCoordinator body, hands it to the fence, and
+// reports whether it was adopted and whether it names THIS peer as coordinator.
 //
 // This is the authorization half of §6.5, and it is the last link in it: media
 // enforces the fence on every pushed topology, but a fence that never learns WHO the
@@ -374,29 +375,73 @@ type coordinatorAdopter func(epoch uint64, coordinatorID string) bool
 // resets there, on its Run goroutine; a second reset from here could land AFTER an
 // adoption and silently unfence the peer, which is a privilege-escalation regression
 // rather than a cosmetic one.
-func adoptAnnouncement(log *slog.Logger, selfName string, adopt coordinatorAdopter, payload []byte) bool {
+//
+// self is returned as well as logged so the Phase 6 wiring that starts and stops an
+// in-process coordinator has the predicate ready — and tested — rather than
+// rediscovering it at the call site.
+func adoptAnnouncement(log *slog.Logger, selfID func() string, adopt coordinatorAdopter, payload []byte) (adopted, self bool) {
 	var ann arbiter.Announcement
 	if err := json.Unmarshal(payload, &ann); err != nil {
 		// A malformed announcement is dropped, not fatal: the arbiter re-broadcasts
 		// the current announcement on every membership change, so the next one
 		// repairs this peer.
 		log.Warn("bad coordinator announcement", slog.Any("error", err))
-		return false
+		return false, false
 	}
+	// Compared by the SERVER-ASSIGNED ID, never by -name: an announcement names the
+	// coordinator by id, so a peer matching it against its own name could never
+	// recognise itself and would silently decline the job it was just given. The id
+	// is "" until the joined frame lands, which reads as "not me" — the safe answer
+	// in that window, and the reason the empty-id guard is here rather than implied.
+	id := selfID()
+	self = id != "" && id == ann.CoordinatorID
 	if !adopt(ann.Epoch, ann.CoordinatorID) {
-		return false
+		return false, self
 	}
 	log.Info("coordinator announced",
 		slog.Uint64("epoch", ann.Epoch),
 		slog.String("coordinator", ann.Coordinator),
 		slog.String("coordinator_id", ann.CoordinatorID),
 		slog.String("reason", string(ann.Reason)),
-		// Compared by NAME because that is the vocabulary this peer knows itself by;
-		// its server-assigned id is media's, not ours. Reported rather than acted on:
-		// hosting the coordinator control loop in-process is Phase 6 wiring that also
-		// needs the peer's server-stamped id, which media does not yet expose.
-		slog.Bool("self", ann.Coordinator != "" && ann.Coordinator == selfName))
-	return true
+		slog.Bool("self", self))
+	return true, self
+}
+
+// overlayReporter is the slice of media.Router the heartbeat reads: this peer's
+// control-plane authority and its REALIZED overlay position. Declared here, narrow
+// and consumer-side, so the beat's contents are testable against a fake instead of
+// against a live PeerConnection — and so a drift in the Router's signatures breaks
+// the build rather than quietly beating stale data.
+type overlayReporter interface {
+	Fence() overlay.Fence
+	Realized() (parent string, parentState string, children []metrics.ChildLink)
+}
+
+// realizedBeat samples the half of a heartbeat that only the media layer knows: the
+// epoch and revision this peer has actually ADOPTED, and the parent and children it
+// has actually CONNECTED.
+//
+// It reports exactly what Realized returns and adds nothing. That restraint is the
+// contract, not laziness: media deliberately reports the pending target of a
+// re-parent in flight as NEITHER parent nor child, because the obvious "every
+// session that is not my parent is a child" fixup would hand a rebuilding
+// coordinator an edge pointing the wrong way — our future parent listed as our
+// current child. Our realized parent stays the OLD one until media arrives over the
+// new edge. Any filtering, defaulting or repair here would re-introduce exactly the
+// divergence rebuild-from-peers (§6.6) exists to eliminate.
+//
+// Name, Seq and IntervalMs are stamped by beater.next after this returns, so a
+// provider cannot misreport the identity a coordinator keys on.
+func realizedBeat(r overlayReporter) metrics.Heartbeat {
+	f := r.Fence()
+	parent, parentState, children := r.Realized()
+	return metrics.Heartbeat{
+		Epoch:       f.Epoch,
+		Rev:         f.Rev,
+		Parent:      parent,
+		ParentState: parentState,
+		Children:    children,
+	}
 }
 
 // shouldBeat reports whether this peer sends liveness heartbeats.
@@ -429,13 +474,9 @@ func controlFrame(t signaling.Type, body any) (signaling.Message, error) {
 // it has actually connected, as opposed to what the coordinator believes it told it
 // to connect. That distinction is what makes rebuild-from-peers possible.
 //
-// Production fills the fence half (Epoch/Rev, from media.Router.Fence) and leaves
-// the EDGE half empty, because media exposes no accessor for it: Router.Stats is
-// keyed by runtime peer id and the name↔id map is private, so cmd/peer cannot name
-// its own parent or children. That gap costs nothing the liveness FSM consumes — a
-// frame ARRIVING is what proves a peer alive — but it does starve §6.6's
-// rebuild-from-peers, so the accessor is requested in the WI-8 report. Filling it in
-// is one function body here and nothing else.
+// Production supplies realizedBeat over the live media.Router. It is a seam rather
+// than a direct call so the beat's contents can be asserted against a fake, and so a
+// harness can beat without a PeerConnection.
 type realizedFunc func() metrics.Heartbeat
 
 // beater is the peer's liveness producer: one metrics.Heartbeat every cadence, on
@@ -648,7 +689,7 @@ func runCall(ctx context.Context, logger *slog.Logger, cfg callConfig) error {
 	// happens-before every read.
 	var router *media.Router
 	rcfg := routerConfigFor(cfg, topo, iceServers, clk, reparents.post, func(payload []byte) {
-		adoptAnnouncement(logger, cfg.name, router.AdoptCoordinator, payload)
+		adoptAnnouncement(logger, router.SelfID, router.AdoptCoordinator, payload)
 	})
 	router = media.NewRouter(logger, client, rcfg)
 	logger.Info("running call",
@@ -683,13 +724,10 @@ func runCall(ctx context.Context, logger *slog.Logger, cfg callConfig) error {
 
 	if shouldBeat(true, cfg) {
 		beats := newBeater(logger, cfg.name, cfg.heartbeat, clk,
-			func() metrics.Heartbeat {
-				// What this peer has actually ADOPTED, read back from the fence media
-				// enforces pushes against — so a coordinator can spot a peer running
-				// behind and re-push to it specifically.
-				f := router.Fence()
-				return metrics.Heartbeat{Epoch: f.Epoch, Rev: f.Rev}
-			},
+			// What this peer has actually adopted and actually connected — the
+			// ground truth a coordinator promoted mid-call rebuilds the previous
+			// tree from, rather than inheriting its predecessor's beliefs (§6.6).
+			func() metrics.Heartbeat { return realizedBeat(router) },
 			func(h metrics.Heartbeat) error {
 				msg, err := controlFrame(signaling.TypeHeartbeat, h)
 				if err != nil {
