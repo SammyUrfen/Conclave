@@ -300,6 +300,17 @@ func TestCoordinatorConfigWireShape(t *testing.T) {
 			if f.Type.Kind() == reflect.Uint64 {
 				t.Errorf("field %s is uint64; a JS reader would silently round it past 2^53", f.Name)
 			}
+			// No pointers. coordinator.Config.StickinessMs is a *float64 — the right
+			// shape THERE, where nil must resolve to a safe default. This type must
+			// not inherit it: a pointer field leaves == compiling while silently
+			// comparing addresses, and == is what the Resolved design and every
+			// "did the config change" check rely on. A well-meaning sync of the two
+			// types is the exact way this would break, so it is pinned rather than
+			// described.
+			if f.Type.Kind() == reflect.Ptr {
+				t.Errorf("field %s is a pointer; == would compare addresses and the "+
+					"struct-level Resolved flag would stop meaning anything", f.Name)
+			}
 		})
 	}
 
