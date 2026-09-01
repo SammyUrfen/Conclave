@@ -2,7 +2,7 @@
 
 > **Living doc.** Tracks every library and standard-library package Conclave depends on, why it was chosen over the alternatives, and where it sits on the phase roadmap. Kept in sync with the code; if the code and this table disagree, the code wins and this doc is the bug.
 >
-> **Module:** `github.com/SammyUrfen/conclave` · **Go:** 1.26.4 · **Last reviewed:** 2026-07-20 (Phase 4 complete: coordinator computes the tree + `simnet`). Phase 4 added **zero external dependencies** — the metrics plane, fan-in, `BuildTree`, and `simnet` are pure stdlib.
+> **Module:** `github.com/SammyUrfen/conclave` · **Go:** 1.26.4 · **Last reviewed:** post–**Phase 6** (churn/handover, election + migration, and the dashboard). **Phases 5 and 6 added exactly one direct dependency** — `pion/rtp`, needed to rewrite RTP sequence/timestamp continuity across a re-parent. Everything else those phases introduced (the fence, the arbiter, hysteresis, the virtual clock, the whole `/api` surface, and the frontend) is stdlib or hand-written.
 
 ---
 
@@ -44,13 +44,16 @@ The `RWMutex` row below is therefore the road *not* taken for the coordinator (k
 | `time` (`Ticker`) | The metrics `Reporter` emits telemetry on a fixed cadence: `select` over the ticker and `ctx.Done()`, first report hoisted out of the loop so there's no initial silence. | **Live (Phase 4)** | `Ticker` is the natural clock for a heartbeat. It feeds the anti-thrash rule: metrics arrive continuously, but the tree only recomputes on a threshold event (join/leave/first report), never on every tick. |
 | `sync/atomic` + `sync.WaitGroup` | Lock-free upload counter (`meter`); leak-free goroutine joins (Router pumps + forwarder drains; the peer's reporter goroutine). | **Live (Phase 2–4)** | `atomic` for a monotonic counter on the hot path (cheaper than a mutex, no invariant spanning fields); `WaitGroup` for "spawn N, join all N" barriers, explicit over a hand-rolled counter. |
 | `sync` (`RWMutex`) | *Considered* for the coordinator's overlay/metrics state (many readers, rare writers). | Not used (Phase 4 chose channels) | The coordinator instead **owns all state in one goroutine and funnels every input over a channel** ("share memory by communicating") — no locks to reason about, and every recompute sees a consistent snapshot. `RWMutex` stays the right tool for genuinely read-mostly *shared* state if a future surface needs it; the call is made per-structure, not globally. |
-| `time` (`Timer`) | One-shot deadlines: election/handover timeouts, "parent silent for T seconds → failover," epoch-fencing grace windows, the dwell timer for hysteresis. | Planned (Phase 5–6) | `Timer` (or `context.WithTimeout` layered on it) for single-fire deadlines. Central to migration correctness — a stale coordinator that misses its fencing deadline must be provably out. |
+| `time` (`Timer`) | One-shot deadlines: the degradation dwell, gone/degraded thresholds, the rebuild window, the join settle, the recompute cooldown, re-parent and negotiation timeouts. | **Live (Phase 5–6)** — but **never called directly in the control plane.** | Every one of these goes through `clock.Clock`, and `make check-determinism` fails the build if a control-plane package touches `time.Now`/`NewTimer`/`NewTicker`/`After` at all. Two shipped refinements are worth naming: the coordinator **multiplexes every deadline in the process onto ONE timer** — six classes ordered by `(time, class, room, peer)` — because a `select` cannot watch a dynamic set of channels, and because one wake channel is what makes the `Sync` barrier a *complete* drain. And the **arbiter arms no timer at all**: every action it can take requires a live peer, and a live peer is by definition heartbeating. Its test harness makes that structural — its fake clock's `NewTimer` **panics**, so re-introducing a timer is a failing test rather than a review note. |
+| `time` (types only) | `time.Time`, `time.Duration`, durations as flag values. | **Live** | The types are fine everywhere; it is the *clock reads and waits* that are gated. |
 
 ---
 
 ## Third-party — live now
 
-Two external dependencies are imported and exercised today, verified green under `go test -race ./...`: WebSocket for signaling (control plane) and pion for WebRTC media (data plane).
+**Five direct `go.mod` requires**, in two ecosystems: `coder/websocket` for signaling (control
+plane) and pion — `webrtc/v4`, `rtp`, `rtcp`, `interceptor` — for WebRTC media (data plane). All
+are exercised under `go test -race ./...`.
 
 | Component | Role | Status | Why this one |
 |---|---|---|---|
@@ -59,13 +62,51 @@ Two external dependencies are imported and exercised today, verified green under
 
 ---
 
-## Third-party — planned
-
-One external dependency remains, entering at Phase 7.
+### `pion/rtp` — the Phase 5 addition, and why it was unavoidable
 
 | Component | Role | Status | Why this one |
 |---|---|---|---|
-| `coturn` (external service) | **TURN relay** server for peers behind symmetric NAT / CGNAT that STUN can't traverse. Such peers are forced to be **leaves**, never relays. | Planned (Phase 7) | Not a Go import — a standalone TURN daemon Conclave connects to. `coturn` is the de-facto standard, well-hardened TURN/STUN implementation; reimplementing TURN is squarely outside the learning target. STUN covers most peers; TURN is the fallback of last resort because relayed media costs bandwidth on infrastructure we run. |
+| `github.com/pion/rtp` v1.10.2 | Direct access to RTP header fields so `internal/media/rewrite.go` can hold a per-leg `(sequence, timestamp)` **offset** and rewrite each forwarded packet across an upstream switch. | **Live (Phase 5)** | `TrackLocalStaticRTP.WriteRTP` rewrites SSRC and payload type per binding but passes **sequence number and timestamp through untouched**. That is exactly right while one source feeds one leg forever, and exactly wrong the instant a *second, unrelated* upstream feeds the same leg after a re-parent: the child sees a stream that jumps backwards and forwards in sequence space, which pion's own NACK and jitter-buffer interceptors read as catastrophic loss. **A keyframe cannot fix this** — a keyframe repairs reference state, and the damage here is to transport ordering, one layer below. Offsets rather than a counter, because gaps *within* an upstream must survive to the child (a lost packet has to stay visible or loss reporting silently stops working) while the discontinuity *between* upstreams must not. |
+
+---
+
+## Third-party — planned
+
+One external dependency remains, and **it was not built**.
+
+| Component | Role | Status | Why this one |
+|---|---|---|---|
+| `coturn` (external service) | **TURN relay** server for peers behind symmetric NAT / CGNAT that STUN can't traverse. Such peers are forced to be **leaves**, never relays. | **Not built (Phase 7).** `overlay.NATRelayed` exists and the builder honours it, but it is *declared* by the peer's `-nat turn` flag; there is no NAT classification, no coturn, and no TURN credential in `ICEServers`. | Not a Go import — a standalone TURN daemon Conclave connects to. `coturn` is the de-facto standard, well-hardened TURN/STUN implementation; reimplementing TURN is squarely outside the learning target. STUN covers most peers; TURN is the fallback of last resort because relayed media costs bandwidth on infrastructure we run. |
+
+---
+
+## The frontend — deliberately zero dependencies
+
+`web/` is the dashboard UI: **vanilla ES modules and hand-written CSS. No npm, no bundler, no
+transpile, no framework, no `package.json`.** The directory that is committed is byte-for-byte
+the directory that is served by GitHub Pages, so what you debug against a local `file://` tree is
+what is live.
+
+This is the same rule as the Go side, applied to the browser: a build step here would buy
+nothing (the app is a few hundred lines of DOM construction and a WebSocket client) and would put
+a toolchain — and a supply chain — between the source and the artefact. The one place it costs
+something is testing: there is a single hand-run harness,
+`web/tests/reconnect-backoff.test.html`, and nothing else is automated.
+
+The single external asset reference is a font *stack* (`Fira Code`, `JetBrains Mono`, then system
+monospace fallbacks) — a preference, not a download.
+
+---
+
+## Deployment — not a Go dependency, but part of the product
+
+`deploy/` carries a multi-stage **distroless, non-root Dockerfile**, plus a
+`docker-compose.yml` + `Caddyfile` pair that issues a locally-trusted certificate so `wss://` can
+be rehearsed without a public hostname. **Caddy is a rehearsal tool, not a runtime dependency** —
+the binary speaks plain HTTP and expects a platform (Render, Fly, Spaces) to terminate TLS in
+front of it. That is why `-public-url` is mandatory behind a terminator: the server cannot know
+whether something in front of it terminates TLS and **will not guess**, because guessing
+`https://` would break every plain deployment instead.
 
 ---
 
@@ -82,7 +123,14 @@ The Makefile wires these into `make fmt / vet / test / lint / check`. Some ship 
 | `golangci-lint` | Meta-linter running many linters (incl. `staticcheck`, `govet`) in one pass. | **Must be installed** | `make lint` runs it **if present, else falls back to `go vet`**. Installing it upgrades `make lint` in place with no Makefile change. |
 | `go test -race` | Unit/table tests under the race detector. | **Installed** (part of Go) | `make test` and `make check`. The core verification gate — green at Phase 0. `-race` needs the C toolchain; `gcc 16` is present, so it works here. |
 
-**Toolchain status summary:** installed and in use today — `gofmt`, `go vet`, `go test -race`. Must be installed by the owner to reach full lint coverage — `goimports`, `staticcheck`, `golangci-lint`.
+**One project-specific gate joins them:** `make check-determinism` is a `grep` in the Makefile,
+not a tool — it fails the build if `internal/{overlay,simnet,coordinator,arbiter}` (test files
+included) reaches for the wall clock. It is a build gate rather than a review note because the
+failure mode it catches — a silently un-replayable control plane — is invisible in a diff.
+`make check` = `fmt` + `vet` + `check-determinism` + `test -race`, and CI runs the same four
+commands spelled out separately so a red job names which one failed.
+
+**Toolchain status summary:** installed and in use today — `gofmt`, `go vet`, `go test -race`, plus the determinism grep. Must be installed by the owner to reach full lint coverage — `goimports`, `staticcheck`, `golangci-lint`.
 
 ---
 
@@ -90,5 +138,6 @@ The Makefile wires these into `make fmt / vet / test / lint / check`. Some ship 
 
 - **No consensus library.** The central server is the election **arbiter** and single source of truth for who is coordinator. This sidesteps split-brain **by construction** — it does **not** make the system fault-tolerant against the central server itself. Raft/Paxos among home PCs was explicitly rejected; a single arbiter is the deliberate trade (simplicity and no split-brain, at the cost of a control-plane single point of failure).
 - **No web framework, ORM, or DI container.** Nothing here needs one, and each would be dependency surface working against the "explain the primitive" ethos.
-- **Dependency count is a feature.** As of Phase 4: still **two ecosystems**, four `go.mod` direct entries — `coder/websocket` for signaling, and pion for media (`webrtc/v4` + `interceptor` + `rtcp`). **Phase 4 added none:** the whole control plane it introduced (telemetry types, the channel fan-in coordinator, the pure `BuildTree`/`Validate`, and the `simnet` deterministic harness) is stdlib only — exactly the "from-scratch where the mechanism *is* the point" split, since the graph builder and election logic are the learning target. Every future addition should have to justify itself against this table.
+- **Dependency count is a feature.** As of Phase 6: **two ecosystems, five direct `go.mod` entries** — `coder/websocket` for signaling, and pion for media (`webrtc/v4` + `interceptor` + `rtcp` + `rtp`). Phase 4 added none; Phases 5–6 added exactly one (`pion/rtp`, for a reason no amount of hand-writing avoids — see above). Everything those two phases introduced that *is* the learning target — the epoch fence, the arbiter, the health FSM, the sticky builder and its oracles, the virtual clock, the whole REST/WS surface and the frontend — is stdlib or hand-written. Every future addition should have to justify itself against this table.
+- **`internal/overlay` goes further than the module boundary.** It imports exactly five standard-library packages — `encoding/json`, `fmt`, `math`, `os`, `sort` — and **nothing else at all**: no pion, no `clock`, no other `internal/` package. That is a hard requirement, not an accident, and it is what lets the whole control algorithm be tested in milliseconds and lets `simnet` drive the real control plane without a media stack.
 - **These are choices, not verdicts.** `gorilla/websocket` vs `coder/websocket`, `Mutex` vs channel, `slog` vs `zap` — each row states a preference with a reason, not a claim that the alternative is bad. Any of them can be revisited if a phase surfaces a concrete wall.

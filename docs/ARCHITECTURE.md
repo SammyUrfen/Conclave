@@ -2,7 +2,9 @@
 
 > **What this document is.** The conceptual narrative and the trade-off record for conclave — *why* the system is shaped the way it is, not *how* to run it. If you want commands and milestones, read [`ROADMAP.md`](./ROADMAP.md); if you want package responsibilities, read the code. This file exists so that a future maintainer (probably future-me) can reconstruct the reasoning behind every load-bearing decision without re-deriving it.
 >
-> **Status:** living document, kept in sync with the roadmap. Ground truth as of **Phase 4 complete** (elected peer-SFU + coordinator computes the tree from telemetry + `simnet` harness). Everything past Phase 4 (hysteresis/failover, election/migration, simulcast/TURN) is design intent, labelled by phase.
+> **Status:** living document, kept in sync with the roadmap. Ground truth as of **Phase 6 complete** — elected peer-SFU, coordinator computes the tree from telemetry, hysteresis + backup parents + peer-local failover, and coordinator election/migration under an arbiter-minted epoch fence. **Phase 7 (simulcast/SVC, TURN/coturn) is not built**; only its observability slice shipped, reshaped as the arbiter's `/api` surface plus a static Pages frontend.
+>
+> **Where this document sits.** It is the *original conceptual narrative* — the why, written before and during the build. [`DESIGN.md`](./DESIGN.md) is the post-build synthesis and is the better single explanation of the finished system; where the two differ in detail, `DESIGN.md` and the code win. This file has been reconciled against the code, and the places where the build superseded the plan are marked **Shipped** or struck through in prose.
 >
 > **One-line framing:** an **SFU (Selective Forwarding Unit) that is *elected* from among the participants and can *migrate***.
 
@@ -168,13 +170,15 @@ Three properties are load-bearing:
 
 **3. Each overlay edge is one WebRTC peer connection.** Audio, video, and a data channel are multiplexed over a single `RTCPeerConnection` per neighbor. The central server never appears on an `══` edge.
 
-> **NAT, briefly.** STUN gives most peers a directly reachable candidate. Peers that STUN can't punch through fall back to **TURN (coturn)**, which relays their media through a rendezvous server. STUN peers can be relays; TURN-bound peers cannot (see property 2). TURN is Phase 7 work.
+> **NAT, briefly.** STUN gives most peers a directly reachable candidate. Peers that STUN can't punch through fall back to **TURN (coturn)**, which relays their media through a rendezvous server. STUN peers can be relays; TURN-bound peers cannot (see property 2).
+>
+> **Shipped status:** TURN was Phase 7 work and **Phase 7 was not built.** `overlay.NATRelayed` exists, is honoured by the builder (capacity 0 ⇒ forced leaf) and is exercised in `simnet` — but it is *declared* by the peer's `-nat turn` flag. There is no NAT classification, no coturn, and no TURN credential in `ICEServers`. Property 2 is enforced against an operator's claim, not a measurement.
 
 ---
 
 ## 6. Building the tree: degree-bounded, depth-limited, min-latency
 
-The coordinator's core computation (`internal/overlay`, Phase 4) is a **pure function** — `BuildTree(nodes, constraints) → Graph` — with no I/O, so it is trivially unit-testable in the simulation harness. It optimizes three constraints simultaneously:
+The coordinator's core computation (`internal/overlay`) is a **pure function** — `BuildTree(nodes, prev, constraints) → Topology` — with no I/O, no clock and no randomness, so it is trivially unit-testable in the simulation harness. (`prev` is the stickiness baseline; it arrived in Phase 5 and is what makes local repair fall out of the general builder.) The package imports exactly five standard-library packages and nothing else at all — no pion, no `clock`, no other `internal/` package — and contains **no `range` over a map** in non-test code, so no ordering decision can depend on Go's randomised map iteration. It optimizes three constraints simultaneously:
 
 | Constraint | Meaning | Why |
 |---|---|---|
@@ -195,11 +199,28 @@ Naming the trade-off honestly:
 
 This is the same instinct as any greedy-vs-exact call in scheduling or routing: when the objective is fuzzy and the input churns, a cheap heuristic you can re-run beats an expensive optimum you can't.
 
-**Realized (Phase 4).** `overlay.BuildTree` is exactly this greedy heuristic (attach strongest-upload nodes first so they become the relays; each remaining node to the eligible parent with min RTT, then fewest children, then name); `overlay.Validate` is an independent oracle the tests assert against, and `overlay.PickRoot` is the default root policy (highest-upload non-TURN node). Three honest details worth pinning down:
+**Shipped.** `overlay.BuildTree` is exactly this greedy heuristic, and the choice among candidate parents is a **frozen five-rank lexicographic comparator** rather than a weighted score:
 
-- **The coordinator runs *inside the central server* in Phase 4** — a documented stepping stone. It is already the always-up fan-in point, so hosting the role there defers coordinator-handover to Phase 6, where the role migrates to an elected peer and the server becomes pure arbiter (§8).
-- **RTT is unpopulated live** (measuring pairwise RTT before peers connect is a chicken-and-egg the coordinate-system/probe work of Phase 7 solves). `BuildTree` tolerates missing RTT — an unknown parent scores worst, so with no RTT the tie-break becomes *fewest children*, i.e. **load-balancing** attachment, which is the right default on a LAN. `simnet` injects real latency matrices to exercise the min-latency path.
-- **A not-yet-reported peer is treated as a leaf** (default upload 0) until its first report proves capacity — conservative, because Phase 4's apply is *additive* (it connects new neighbours but does not tear down a dropped one), so a transient wrong-relay tree could not be fully undone. Recompute fires only on a threshold event (join/leave/first report); full hysteresis on degradation is §7 / Phase 5.
+```
+rank 0   hard filters — attached, able to parent, within depth, spare capacity
+rank 0b  impairment (SOFT: impaired candidates are re-admitted if no healthy one survives)
+rank 1   INCUMBENCY — u's parent in prev wins unless a challenger beats it by > StickinessMs
+rank 2   minimum RTT (unknown scores worst)
+rank 3   fewest children (load balance)
+rank 4   name ascending (determinism; no tie survives)
+```
+
+*A scored objective (`cost = α·rtt + β·churn + γ·load`) was rejected on explainability:* a lexicographic ordering answers "why is B parented to R?" by walking four rules, where a weighted sum needs three floats and their weights reconstructed — and with noisy inputs, the extra expressiveness is false precision.
+
+`overlay.Validate` is an independent oracle the tests assert against, `overlay.ValidateLocalRepair` is a second oracle over *transitions*, and `overlay.PickRoot` is the root policy (sticky: an incumbent keeps the root unless a challenger beats it by `RootChangeMarginKbps = 2000`, one stream's worth). Capacity is integer children, `floor(effectiveUpload / StreamKbps)` where `effectiveUpload = UploadKbps × (1 − min(LossPct, 50)/100)`; a TURN-relayed node has capacity 0 and is a forced leaf.
+
+Four honest details worth pinning down:
+
+- **Where the coordinator runs.** Phase 4 hosted it in the central server as a documented stepping stone. Phase 6 kept that as a *mode* (`server -coordinate`) and added the migration (`server -elect`): the role can now be held by the arbiter process or by an elected peer, and it moves between them. What made that a wiring change rather than a rewrite is that `internal/coordinator` imports neither `signaling` nor `media` — every seam is a consumer-defined interface.
+- **RTT is unpopulated live**, and so are loss and CPU (§10). `BuildTree` tolerates missing RTT — an unknown parent scores worst — so live, rank 2 has no data and attachment falls through to *fewest children*, i.e. load-balancing. `simnet` injects real latency matrices to exercise the min-latency path. A precise consequence: with no RTT, no challenger can beat an incumbent, so the **stickiness margin is inert live and the anti-thrash property is stronger live than in simulation**, while the min-latency property is only exercised in simulation.
+- **A not-yet-reported peer is treated as a leaf** (`-default-upload-kbps 0`) until its first report proves capacity. It is also structurally barred from being rooted: `Node.Provisional` makes a provisional root *impossible*, not merely unlikely. The join settle is a composite — that invariant, plus a `JoinSettle = 1500ms` window that re-arms on every join, plus "everyone reported" as the fast path, plus `MinBuildableMembers = 2`.
+- **~~Apply is additive~~ — superseded.** Phase 4's apply only connected new neighbours and never tore down a dropped one, which is why an unreported peer had to be treated conservatively. Phase 5 replaced it with **diff-and-apply**: `diffTopology` is a pure diff of *(self, wanted tree, current reality)* whose baseline is **reality**, not the previously pushed tree, so a partially realized state converges rather than diverging. Legs are added before they are removed ("a child must never lose a source it is about to regain"), and three conditions force a full session re-create rather than a patch — the offerer role inverted, *our* relay-ness changed, and the *peer's* relay-ness changed.
+- **Stickiness makes the builder path-dependent, deliberately.** A builder whose output depends only on the current node set is a *memoryless* builder — that was Phase 4, and its memorylessness is the defect stickiness exists to fix. So two identical fleets reached by different histories can hold different, equally valid trees. Measured: 120 first-report permutations of one fleet converge to **9 distinct valid trees and 1 identical root**. Path-independence and minimal-disruption rebuilds are mutually exclusive; this project chose the second (`DESIGN.md` §5.2).
 
 ---
 
@@ -220,7 +241,18 @@ The mechanism that enforces "sustained" is **hysteresis** (a dwell/debounce): a 
 - Dwell **too short** → the system reacts to transient blips, thrashes, and interrupts streams for no reason.
 - Dwell **too long** → real failures take too long to notice, and failover is sluggish.
 
-The answer is not a magic number; it's making the dwell **configurable** and testing both extremes deterministically in `simnet` (Phase 5).
+The answer is not a magic number; it's making the dwell **configurable** and testing both extremes deterministically in `simnet`.
+
+**Shipped.** Three health states, not two: `healthy → degraded → gone`. Collapsing `degraded` into `gone` would make every GC pause a re-parenting event; collapsing it into `healthy` would leave the operator blind to a node about to fail. **Degraded is visible but not actionable** — it colours the dashboard and arms `DegradationDwell`, and never re-parents anything by itself.
+
+Two details are load-bearing and were not obvious from the plan:
+
+- **Thresholds multiply the cadence the *peer* declared, not a server constant.** `metrics.DegradedAfter(interval) = 3×interval` and `GoneAfter(interval) = 8×interval`, read from `Heartbeat.IntervalMs`. Hardcoding `3 × HeartbeatInterval` would declare a perfectly healthy peer running `-heartbeat 2s` dead every time.
+- **…which opens a hole that a floor closes.** A peer running `-heartbeat 500ms` shrinks its own `GoneAfter` to 4 s, below the 7 s worst case for detecting a dead socket (`WSPingInterval + WSPingTimeout`). The *peer* breaks the invariant, so no flag validation can catch it; every per-node threshold is therefore floored at the socket-detection window. The inequality must run that way round — the health FSM must be the **slower** detector — or a peer gets ejected from the tree while the Hub still considers it present, with no event able to bring it back. The complementary rule: **`gone` never deletes a node's record**, and a heartbeat from a `gone` peer *resurrects* it, because the frame arriving is itself proof the socket is live.
+
+**Backup parents, shipped, with the honest caveats.** Backup capacity is *not* reserved — at 4–8 peers on residential upload, halving usable fan-out to insure one recompute is a bad trade — but backup **fan-in is capped** at `BackupOvershootAllowance = 1`. Without that cap, one relay's death promotes its whole subtree onto whichever node they all named, so the overshoot would be the size of the failed subtree exactly when the survivors can least absorb it. The invariant is `B ∉ Subtree(ParentOf(u))`, which is stronger than the obvious `B ∉ Subtree(u)` and is what rules out the sibling trap (a sibling passes the weaker rule and is orphaned by the very same failure). Cost, stated plainly: in a tight fleet some nodes get **no backup at all**, and **the root's direct children never have one by construction** — with `-max-depth 2` that is a large fraction of the meet.
+
+**Ratification, not correction.** When a peer reports a successful self-promotion, the coordinator patches its *working copy* so the chosen backup becomes the incumbent parent and *then* rebuilds. Rebuilding from the pre-failure tree would make stickiness see the *dead* parent as incumbent, find it ineligible, and re-choose freely — two interruptions where one was needed. It ratifies only a promotion reported against the currently published `(Epoch, Rev)`.
 
 Two more principles keep churn cheap:
 
@@ -250,18 +282,39 @@ Election fitness is scored on **control-plane** qualities (compute headroom, net
 
 So when the server promotes a new coordinator, it bumps the epoch. The new coordinator's instructions carry the new, higher epoch; any straggling instruction from the old coordinator still carries the old, lower one and is **rejected on arrival.** A stale actor cannot do damage no matter how confused it is about its own status — the fence, not perfect timing, is what guarantees correctness. This is the same **fencing-token** idea used by distributed locks and the *term* in Raft; here it's cheap because a single writer (the server, §4) hands out the epochs with no coordination needed.
 
-**State handover — two options, both on the table:**
+**Shipped — and the rule above is only half of it.** As stated, "ignore a *lower* epoch" is a privilege-escalation bug waiting to happen: it says nothing about a *higher* one, so any peer could promote itself by stamping a bigger number on a self-computed tree. (The frozen contract really did mandate exactly that, and the review caught it.) The code splits the two questions into two functions:
 
-| Approach | How | Trade-off |
+- **`Topology.Supersedes`** answers *"which of these two trees is more recent"* — a lexicographic `(Epoch, Rev)` comparison. Its call sites are enumerated in its doc comment and the enumeration *is* the safety property: the coordinator ordering its own successive trees, and the dashboard detecting a stale snapshot. **Never the peer's apply path.**
+- **`overlay.Fence.Accept(from, topo)`** answers *"may I apply this"*, and accepts only if **all** of: the peer has been told who is in charge (`f.Epoch != 0`); the sender *is* that node (`from == f.CoordinatorID`, and `From` is server-stamped, so a peer cannot forge it); `topo.Epoch == f.Epoch` — **exact equality, a higher epoch is rejected**; and `topo.Rev > f.Rev`.
+
+The third clause being equality rather than `>=` is the whole design: **a peer may learn about a new coordinator only from the arbiter, never from the node claiming the job.** The cost is one extra round trip on handover, bounded and well inside the rebuild window. Supporting rules: the **zero `Fence` is the unauthorised state** (a peer that has been told nothing obeys nobody); `AdoptAnnouncement` is the *only* method that may raise the epoch; `Applied` is separate from `Accept`, so a failed apply is retried by the next push rather than silently skipped; and `Reset()` — called on `TypeJoined` and nowhere else — is what closes the arbiter-restart hole, since a restarted arbiter has no meets, so every peer must rejoin, and rejoining drops its authority to zero.
+
+Two counters, not one. **`Epoch`** is the arbiter-minted coordinator *term*; **`Rev`** is the sitting coordinator's revision within that term, starting at 1 and resetting to 0 when the epoch advances. A single counter cannot both fence handovers and order one coordinator's successive trees without letting one writer forge the other's authority — a coordinator able to mint the number could fence the arbiter's own announcement. This is **Raft's `(term, index)` split, for the same reason.**
+
+**State handover — the decision, and what was rejected.**
+
+| | **Snapshot-and-ship** | **Rebuild-from-peers** |
 |---|---|---|
-| **Snapshot-and-ship** | Outgoing coordinator serializes its authoritative state and transfers it to the incoming one | Faster warm-up, but relies on the outgoing node being alive and cooperative — useless if it *crashed* |
-| **Rebuild-from-peers** | New coordinator reconstructs state from peers re-reporting their metrics | Survives a hard crash of the old coordinator, but there's a rebuild window before the new one has a full picture |
+| How | The outgoing coordinator serializes {topology, per-node reports, dwell state, backups} and ships it via the arbiter | The new coordinator starts empty. Every peer, on adopting the new epoch, immediately sends an out-of-cycle heartbeat + report carrying its **realized** parent/children |
+| Warm-up | Instant | ≤ `RebuildWindow` (3 s) |
+| Works on a crash | **No.** Needs the outgoing node alive and cooperative — the case that matters least | **Yes.** Identical code path either way |
+| New wire surface | A versioned snapshot message kept in sync with coordinator internals | **None.** Reuses `Heartbeat` + `Report`, already exercised every second |
+| Fidelity | The old coordinator's *beliefs*, which may already disagree with what peers realized | Peers' *ground truth* |
+| Failure mode | A path exercised only on graceful handover — i.e. almost never — silently rots | The only path, exercised on every handover including every test |
 
-The pragmatic answer is likely **both**: snapshot-and-ship on a graceful, planned handover; rebuild-from-peers as the fallback when the coordinator died without warning.
+> **Shipped: rebuild-from-peers, and only that.** Snapshot-and-ship is not implemented, not even as a fast path. An earlier revision of this document said the pragmatic answer was "likely both"; that was wrong and the build rejected it.
 
-On role change, the outgoing coordinator must also **cancel its entire in-flight control loop** — in Go, `context` cancellation propagated through the coordinator's goroutines, so a demoted node stops emitting instructions promptly rather than racing the new one. (Framed for a systems engineer: this is leader failover with fencing — a problem you've solved before; Go just gives you `context.Context` and a monotonic epoch as the primitives.)
+The deciding argument is **not** the 3 seconds. It is that **a fallback path that only runs on crashes is a path that is never tested, and is therefore broken when you need it.** Building both means the graceful path gets all the exercise and the crash path gets all the bugs — in the phase whose entire purpose is surviving a crash.
 
-Because every interleaving of this is hard to reproduce with real media, **all of it is developed against `simnet`** (Phase 4's deterministic in-memory network) with injected failures and replay, *then* demonstrated once on a real handover. Testing election on live cameras would be slow and flaky; the deterministic harness is the only sane way to cover the interleavings.
+The 3-second cost is also smaller than it looks, and this is the honest framing: **the data plane does not need the coordinator.** During the rebuild window every relay keeps forwarding, every peer keeps receiving, and every peer still holds the backup parent from the last published tree — so even a *parent failure during the rebuild window* is handled locally. What is suspended for ≤3 s is re-optimization, not the call.
+
+One refinement matters enough to record, because it changed a stated limitation into the real one: the reconstruction is validated over the **reduced heard-from node set**, not the full roster. Validating over the full roster meant one member whose heartbeat was lost made the reconstruction "disconnected", failed `Validate`, and dropped to `prev = nil` — **a global re-parent caused by one dropped frame**, while the limitations section claimed the trigger was "heavy churn". Reduced, an unheard-from member is simply *absent from `prev`*, which the builder already handles: absent means "newcomer", and newcomers attach after incumbents. One lost heartbeat now moves one node instead of all of them.
+
+On role change, the outgoing coordinator **cancels its entire in-flight control loop** — `context` cancellation through the coordinator's goroutines, plus dropping in-flight pushes — so a demoted node stops emitting promptly rather than racing the new one.
+
+Because every interleaving of this is hard to reproduce with real media, **all of it is developed against `simnet`** — now over a virtual clock, driving the real `coordinator` loop — with injected failures and replay. Testing election on live cameras would be slow and flaky; the deterministic harness is the only sane way to cover the interleavings. **Honest status:** the handover is covered by the automated suite; a live multi-process demonstration of Phases 5–6 has not been recorded (`DESIGN.md` §9.5).
+
+> **And a limit on what the election can actually decide live.** The promotion/demotion triggers described above — "nearing capacity", "degraded" — read `CPUPct`, `LossPct` and `RTTServerMs` from `metrics.Report`, and **none of those three is ever populated in production code**. Every eligible peer therefore scores 0.85–1.0 in `arbiter.Score`, so `DemoteBelowScore` cannot be crossed and `PromoteMarginScore` cannot be met. Live, the election reduces to **bootstrap** (a meet with members and no coordinator) and **failover** (the incumbent is not live), tie-broken by uptime then name. Voluntary handover is implemented and simnet-tested; it is unreachable without sensors. See §10.
 
 ---
 
@@ -276,11 +329,12 @@ Each concept above is de-risked by a specific, runnable phase. Full detail lives
 | A participant can forward others' media — the peer-SFU (§2) | **Phase 3** ⭐ | A leaf receives another peer's media *forwarded by a relay*; only the relay's upload scales |
 | Control/data split + coordinator computes the tree (§3, §6) | **Phase 4** | Metrics fan-in; greedy `BuildTree` runs from live telemetry; `simnet` harness exists |
 | Greedy tree builder, testable pure function (§6) | **Phase 4** | Property tests: depth ≤ bound, no relay over-subscribed, TURN nodes are leaves |
-| Hysteresis, backup parents, local repair (§7) | **Phase 5** | Killing a relay re-parents only its subtree; failover within a keyframe; thrash suppressed |
-| Coordinator election, migration, epoch fencing (§8) | **Phase 6** | Server-arbitrated handover; stale-epoch instructions rejected; tree survives coordinator loss |
-| Simulcast/SVC (the real upload fix), TURN, demo | **Phase 7** | One relay serves heterogeneous downstreams cheaply; TURN-only peer participates as a leaf |
+| Hysteresis, backup parents, local repair (§7) | **Phase 5** ✅ | Backup assignment under `B ∉ Subtree(ParentOf(u))` with a fan-in cap; peer-local make-before-break failover; diff-and-apply; three health states with peer-declared, floored thresholds. Local repair falls out of stickiness rather than a bespoke `Repair()`. |
+| Coordinator election, migration, epoch fencing (§8) | **Phase 6** ✅ | Single-writer epoch minting; `Fence.Accept` (exact-epoch) split from `Supersedes` (ordering); rebuild-from-peers handover; lost-announcement repair; vacancy at a bumped epoch. Verified by the automated suite, **not** by a live multi-process run. |
+| Observability (the graph, epoch, failover events) | **pulled forward into 5–6** ✅ | Not the planned server-rendered `/debug` page: the arbiter's `/api` REST + WS surface (`internal/dashboard`) plus a separate zero-build static frontend (`web/`) on GitHub Pages. Read-mostly, eventually consistent, and it labels *realized* vs *intended* rather than averaging them. |
+| Simulcast/SVC (the real upload fix), TURN | **Phase 7** ⬜ | **Not built.** A relay forwards one layer to every downstream; `NATRelayed` is a flag-declared constraint, not a detection. |
 
-Stopping after **Phase 3 or 4** already yields a coherent, unusual portfolio piece: *an elected peer-SFU with a metrics-driven, simulation-tested graph builder.* Phases 5–7 are hard mode.
+Stopping after **Phase 3 or 4** already yields a coherent, unusual portfolio piece: *an elected peer-SFU with a metrics-driven, simulation-tested graph builder.* Phases 5–6 were built; Phase 7 was not.
 
 ---
 
@@ -301,8 +355,16 @@ This is a **learning / portfolio** project, not a product. Being explicit about 
 
 - **The central server is a control-plane SPOF.** If it's down, no joins, no re-optimization, no election, no handover. Existing media keeps flowing (§4), but the room can't adapt. We accept this trade for the split-brain safety it buys.
 - **Trust model.** A relay is a *participant's machine* forwarding other participants' media. Participants must trust relays not to be malicious. There is no Byzantine-fault tolerance — a lying or hostile peer (fabricated metrics, dropped media) is **not** defended against. The epoch fence (§8) defeats *stale* actors, not *dishonest* ones.
-- **Bandwidth heterogeneity is only partly solved before Phase 7.** Until simulcast/SVC lands, a relay forwards a single quality layer to all downstreams; a slow downstream and a fast one get the same stream. Adaptive per-consumer layers are the Phase 7 fix.
-- **The mesh-ceiling and latency numbers are targets/illustrations, not measurements** — the `2 Mbps/stream` figure in §1 and the `150/400 ms` budget in §5 are working assumptions. The *real* numbers are what Phase 2 (mesh ceiling) and later phases exist to produce. **This document proves a design is coherent; it does not prove the system performs.** Only a run does that.
-- **Everything past Phase 0 is design intent.** As of this writing the codebase serves `/healthz` and structured logs and nothing else. Treat phase-labelled sections as *plans*, and this file as the record of *why* — to be reconciled against reality as each phase actually lands.
+- **Bandwidth heterogeneity is not solved.** Phase 7 was not built: a relay forwards a single quality layer to all downstreams, so a slow downstream and a fast one get the same stream. Adaptive per-consumer layers remain the fix and remain unwritten.
+- **The telemetry is mostly declared, not measured — and this has teeth.** In a live run, `cmd/peer.sampleReport` populates four of `metrics.Report`'s seven fields, all from flags: `Name`, `UploadKbps` (`-upload-kbps`, default 3000 — **there is no bandwidth probe**), `NAT` (`-nat` — **there is no NAT detection**), and `Coordinatable`. `RTTServerMs`, `LossPct` and `CPUPct` are **never populated anywhere in production code.** Three consequences, each bigger than "some fields are TODO":
+  - *The degradation machinery cannot fire live.* The dwell arms only on `LossPct ≥ 5`, `RTTServerMs ≥ 400` or `CPUPct ≥ 90` — all structurally zero — so `DegradationDwell`, `Node.Impaired`, rank 0b's impairment filter and the loss-derated capacity are exercised **only in `simnet`**, where the values are injected.
+  - *Voluntary election cannot fire live.* Every eligible peer scores `0.30 + 0.35 + 0.20 + 0.15·min(uptime/120, 1)` = **0.85 to 1.0**, so `DemoteBelowScore = 0.35` is uncrossable and `PromoteMarginScore = 0.20` unmeetable. The election reduces to bootstrap and failover, tie-broken by uptime then name. **Do not demo this as "elects the fittest machine."**
+  - *Pairwise RTT is unmeasured*, so `BuildTree`'s min-latency rank has no live data and the stickiness margin is inert live (§6).
+  The logic is real and tested; the sensors are not built. The genuinely measured signals are the heartbeat's realized state (parent, children, each edge's pion `PeerConnectionState`), the fence `(Epoch, Rev)`, the stale-rejection counter, and the upload meter's byte count.
+- **No authentication, anywhere.** No token, password, credential, JWT or TLS termination in any non-test file. Anyone who can reach `/ws` can join any meet under any unused name; anyone who can reach `/api` can create meets and read every meet's telemetry. What exists instead: server-stamped identity, the epoch fence, an origin allow-list on both the WS upgrade and CORS, unguessable `crypto/rand` meet ids, and bounded state (`MaxMeets`, `MaxEndedMeets`, `maxSubscribersPerMeet`, a snapshot min-interval). The `-demo` routes — evict a peer, force an election — are a DoS primitive and are therefore **not registered at all** unless the flag is set: `404`, not `403`, because an unregistered route cannot be reached by a bug in a permission check.
+- **The arbiter's state is entirely in memory.** Meets, the epoch counter, and the 20-entry tombstone ring do not survive a restart, and epochs restart at 1. The hole is closed by *behaviour* rather than persistence: a restarted arbiter has no meets, so every peer must rejoin, and `TypeJoined` resets each peer's fence to the unauthorised zero state.
+- **Structural limits of the tree design.** The root's direct children have no backup, by construction, and with `-max-depth 2` that is a large fraction of the meet. Backup capacity is not reserved, so a failover can transiently oversubscribe a relay by one child. Trees are path-dependent, so two identical fleets reached by different histories may hold different valid trees — anyone comparing two runs and expecting identical topologies is applying the wrong invariant. And `PickRoot`'s `RootChangeMarginKbps = 2000` means a meet whose strongest machine arrives *second* runs permanently on its second-best relay; that is intended (re-rooting re-parents everyone) and it is a real cost.
+- **The measurements that exist, and what they do not prove.** Phase 2's meter measured a per-stream bitrate; the "≈4.6 Mbit/s at 4 peers, ≈6 Mbit/s at 5" ceiling is **arithmetic on it**, not an observed cross-machine collapse — every live run so far has been multiple processes on one host over loopback, so there is no real NAT traversal, no real packet loss, and no real congestion control in any result. PLI *plumbing* is proven; keyframe *response* is not, because file and synthetic sources have no live encoder. There are **no benchmarks and no fuzz targets** in the repository. **This document proves a design is coherent; only a run proves the system performs.**
+- **Where the truth lives.** Each phase-labelled section above has been reconciled against the code as of Phase 6. `docs/PLAN.md` is the frozen Phase 5–6 contract and is **historical** — it was amended six times during the build and several sections describe things that later changed. Where a doc, the contract, and the code disagree, **the code is the truth**; `DESIGN.md` §7 lists the places the contract was wrong.
 
 *This is a living document. When a phase changes a decision recorded here, update the section and note what changed — the value of this file is that it stays true.*

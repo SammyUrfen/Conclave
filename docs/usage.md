@@ -1,8 +1,8 @@
 # conclave — Usage
 
-How to run and drive the two binaries: the central `server` and the `peer`. Everything below is real, current behavior — every log line and HTTP response in this doc was captured from the actual binaries, not hand-written. Anything not yet built is marked **Planned (Phase N)**.
+How to run and drive the two binaries — the central `server` (the **arbiter**) and the `peer` — plus the browser dashboard. Every flag below was captured from `-help` on the current build; every log line and HTTP response is real output, not hand-written. Anything not built is marked **Not built**.
 
-> **Status — Phase 4 (coordinator computes the tree).** The `server` answers `GET /healthz`, hosts the WebSocket signaling hub at `GET /ws?room=<id>&name=<label>`, and — with `-coordinate` — runs the **coordinator**: it ingests peer telemetry, computes a relay tree, and pushes it. The `peer` has three call flavours: a plain 2-peer/mesh call, a **static tree** (`-topology tree.json -name …`, Phase 3), and a **managed** call (`-managed`, Phase 4) where it reports telemetry and realises the pushed tree. Media flows peer-to-peer over WebRTC (SRTP/UDP); the server only relays signaling frames and computes topology — it never touches media.
+> **Status — Phase 6.** The `server` answers `GET /healthz`, hosts the WebSocket signaling hub at `GET /ws?room=<id>&name=<label>`, mounts the browser-facing `/api/` surface, and — with `-coordinate` — runs the **coordinator** (ingest telemetry, compute a relay tree, push it). With `-elect` it also **arbitrates the coordinator role among peers**, minting the epoch that fences a handover. The `peer` has four flavours: a health probe, a plain mesh call, a **static tree** (`-topology`), and a **managed** call (`-managed`) where it reports telemetry, realises the pushed tree, and fails over to a precomputed backup parent on its own. Media flows peer-to-peer over WebRTC (SRTP/UDP); the server relays signaling frames and computes topology, and **never touches media**.
 
 ---
 
@@ -10,11 +10,11 @@ How to run and drive the two binaries: the central `server` and the `peer`. Ever
 
 | Need | Version / note |
 |---|---|
-| Go | 1.26.4 (uses Go 1.22+ method-aware routing: `"GET /healthz"`) |
-| C compiler | gcc present — only needed because `make test` runs `-race`, which links cgo |
-| `make` | optional; every target is just a thin wrapper over `go build`/`go run`/`go test` |
+| Go | 1.26.4 (uses Go 1.22+ method-aware routing and `r.PathValue`) |
+| C compiler | only for `-race`, which `make test`/`make check` run — links cgo |
+| `make` | optional; every target is a thin wrapper over `go build`/`go run`/`go test` |
 
-Optional tooling the Makefile *prefers but degrades without*: `golangci-lint` (falls back to `go vet`), `goimports`, `staticcheck`. Not yet installed on this machine.
+Optional tooling the Makefile *prefers but degrades without*: `golangci-lint` (falls back to `go vet`), `goimports`, `staticcheck`.
 
 ---
 
@@ -22,56 +22,93 @@ Optional tooling the Makefile *prefers but degrades without*: `golangci-lint` (f
 
 ```console
 $ make build          # -> ./bin/server and ./bin/peer
-$ ./bin/server &      # start the central node (text logs, :9000)
+$ ./bin/server -coordinate &
 $ ./bin/peer          # probe it once; exits 0 if healthy
 ```
 
-Or skip the build step and use `go run` via make:
-
-```console
-$ make run-server                    # foreground; Ctrl-C to stop cleanly
-$ make run-peer                      # in another shell
-```
+Then open `web/index.html` in a browser and point it at `localhost:9000`.
 
 ---
 
-## The two binaries
+## `server` — the arbiter
 
-### `server` — central bootstrap / (future) election arbiter
+Always-up control node: meet rendezvous, the signaling relay, epoch minting, election arbitration, and the `/api` surface the dashboard reads. **It is never in the media path.**
 
-Always-up control node. Today it serves `GET /healthz`; from Phase 1 on it grows room rendezvous, the WebSocket signaling relay, and — the reason it exists — the role of **election arbiter and single source of truth for "who is coordinator."**
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `-addr` | `:9000` | TCP address to listen on, `host:port`. `:9000` binds all interfaces on port 9000; `127.0.0.1:9000` binds loopback only. |
-| `-log-level` | `info` | Minimum level to emit: `debug` \| `info` \| `warn` \| `error`. Case-insensitive; `warning` is accepted as `warn`. Unknown value → startup error (exit 1). |
-| `-log-format` | `text` | `text` (human `key=value`) or `json` (one object per line). Any unrecognized value falls back to `json` rather than erroring. |
-| `-coordinate` | `false` | **Phase 4.** Run the coordinator: observe room membership/telemetry and push a computed relay tree to managed peers. Off ⇒ a plain signaling relay (Phases 1–3 unchanged). |
-| `-max-depth` | `2` | Coordinator: max relay-tree depth in hops root→leaf (latency accumulates per hop, so kept small). |
-| `-stream-kbps` | `2000` | Coordinator: assumed per-stream upload cost. A node's child capacity = its advertised upload budget ÷ this. |
-| `-default-upload-kbps` | `0` | Coordinator: upload budget assumed for a peer that hasn't reported yet. `0` ⇒ treat it as a **leaf** until its first report proves it can relay (conservative; prevents a transient wrong-relay tree). |
-
-### `peer` — participant node (probe + call)
-
-A conclave participant with two modes. **Probe** (default) is the Phase 0 health check that proves the two binaries can reach each other. **Call** (`-call`) is the Phase 1 WebRTC path: join a signaling room and establish a peer-to-peer media connection with the other peer in it.
+### Core
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `-server` | `http://localhost:9000` | Base URL of the server. A bare `host:port` is accepted as shorthand for `http://host:port`. In probe mode the scheme must be `http`/`https`; in call mode `ws`/`wss` are also accepted and the target becomes `ws(s)://host/ws`. A missing host or empty value is rejected (exit 1). |
-| `-log-level` | `info` | Same semantics as the server. |
-| `-log-format` | `text` | Same semantics as the server. |
-| `-timeout` | `5s` | **Probe mode only.** Overall deadline for the probe, as a Go duration (`500ms`, `5s`, `2m`). Bounds DNS + connect + read together, so a hung or slow server can't wedge the peer forever. |
-| `-call` | `false` | **Call mode switch.** Join a room and establish a WebRTC call instead of probing `/healthz`. Enables the flags below; the call runs until `Ctrl-C`. |
-| `-room` | `default` | Room to join (`/ws?room=<id>`). Peers in the same room discover each other and connect. |
-| `-send` | `false` | Add an outbound video track — i.e. offer media to the peer. Implied by `-media`. |
-| `-media` | `""` | VP8 IVF file to stream (looped). Empty sends synthetic, non-decodable frames that still prove the transport (RTP flows, the far side's `OnTrack` fires). |
-| `-record` | `""` | Write the first received track to this IVF file. Empty just counts packets. A real VP8 sender produces a playable file. |
-| `-stun` | `""` | STUN server URL, e.g. `stun:stun.l.google.com:19302`. Empty is fine on one host (host candidates connect directly); needed for two machines behind NAT. |
-| `-name` | `""` | **Tree modes.** This peer's stable label in the topology (e.g. `relay`, `leaf-b`). Required by `-topology` and `-managed` so the peer can locate itself; carried to the server as `?name=`. |
-| `-topology` | `""` | **Static tree (Phase 3).** Path to a JSON tree file (edges in names). Enables tree mode; requires `-name`; fails loud on a malformed tree. Empty ⇒ full mesh. |
-| `-managed` | `false` | **Managed tree (Phase 4).** Report telemetry and realise the coordinator's pushed tree. Requires `-name`; mutually exclusive with `-topology`. |
-| `-upload-kbps` | `3000` | **Managed mode.** Advertised upload budget for forwarding others' media. High ⇒ likely a relay; `0` ⇒ a forced leaf. |
-| `-nat` | `direct` | **Managed mode.** Declared NAT class: `direct` \| `turn`. `turn` (symmetric/CGNAT) forces this peer to a leaf. Unknown value → startup error (exit 1). |
+| `-addr` | `:9000` | TCP address to listen on, `host:port`. `:9000` binds all interfaces; `127.0.0.1:9000` binds loopback only. |
+| `-log-level` | `info` | `debug` \| `info` \| `warn` \| `error`. Case-insensitive; `warning` is an accepted alias. Unknown value → **startup error**, exit 1. |
+| `-log-format` | `text` | `text` (human `key=value`) or `json` (one object per line). Unknown value → **startup error** (the parse step exists precisely so `-log-format tex` cannot start a server that silently logs JSON). |
+
+### Roles
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-coordinate` | `false` | Run the coordinator **in this process**: compute and push relay trees from peer telemetry. Off ⇒ a plain signaling relay. |
+| `-elect` | `false` | Arbitrate the coordinator role among peers: mint the epoch, elect, announce, and hand over. With `-coordinate` too, the arbiter holds the role until a peer earns it. |
+| `-dashboard` | `true` | Mount the `/api/` dashboard surface. |
+| `-demo` | `false` | Register the **DESTRUCTIVE** demo routes (evict a peer, force an election). See the warning below. |
+| `-public-url` | `""` | Externally reachable base URL used to build join commands; empty ⇒ derive from `-addr`. **Mandatory behind a TLS terminator.** |
+| `-allowed-origins` | `http://localhost:*,http://127.0.0.1:*,https://sammyurfen.github.io` | Comma-separated browser origin allow-list, applied to **both** CORS and the WS upgrade. A trailing `*` is a **port** wildcard only. |
+
+### Coordinator tuning (only meaningful with `-coordinate`)
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-max-depth` | `2` | Max relay-tree depth in hops root→leaf. Latency accumulates per hop, so keep it small. |
+| `-stream-kbps` | `2000` | Assumed per-stream upload cost. A node's child capacity = its (loss-derated) upload budget ÷ this. |
+| `-default-upload-kbps` | `0` | Budget assumed for a peer that has not reported yet. `0` ⇒ treat it as a leaf until its first report proves capacity. |
+| `-stickiness-ms` | `25` | RTT margin (ms) a challenger must beat an incumbent parent by before the peer is re-parented. **`0` ⇒ memoryless rebuilds** — that is Phase 4's behaviour, and the defect stickiness exists to fix. |
+| `-root-change-margin-kbps` | `2000` | Extra upload a challenger needs before the subnet is **re-rooted** (one stream's worth). Note: `overlay` froze this as a compile-time constant, so **only the default is achievable** — any other value is refused at startup rather than silently ignored. |
+| `-join-settle` | `1.5s` | How long to wait after a join for telemetry before building anyway. Re-armed on **every** join, so a burst coalesces into one build. |
+| `-recompute-cooldown` | `5s` | Minimum interval between two published trees for one meet. A join bypasses it; a relaxed build does **not**. |
+| `-dwell` | `10s` | How long metrics must stay bad before sustained degradation counts. |
+| `-degraded-after` | `3s` | Silence before a peer is marked degraded. Must be **strictly less** than `-gone-after`. |
+| `-gone-after` | `8s` | Silence before a peer is declared gone — the repair **backstop**, deliberately slow. Must be **≥ the Hub's socket-detection window** (5s ping interval + 2s timeout = 7s) or the server refuses to start. |
+
+### Election tuning (only meaningful with `-elect`)
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-election-dwell` | `20s` | Sustained window before a **voluntary** coordinator handover. |
+| `-min-term` | `1m0s` | Floor between two voluntary handovers. |
+
+> **These two knobs are currently unreachable in production.** Voluntary promotion and demotion read `CPUPct`, `LossPct` and `RTTServerMs`, and **none of those is ever populated** — so every eligible peer scores 0.85–1.0 and neither `DemoteBelowScore` nor `PromoteMarginScore` can be crossed. Live, the election fires only on **bootstrap** (a meet with members and no coordinator) and **failover** (the incumbent is not live). The dwell/term flags still gate the code path; there is just nothing that trips it. See `DESIGN.md` §8.1.
+
+> ### ⚠️ `-demo` registers a DoS primitive
+> The two demo routes let an **unauthenticated** caller terminate a participant's connection and force a control-plane transition. There is no authentication anywhere on this surface, by design. The routes are therefore **not registered at all** unless the flag is set — you get `404`, not `403`, because an unregistered route cannot be reached by a bug in a permission check. Turn it on for a demo; turn it off after. It is logged loudly at startup.
+
+---
+
+## `peer` — a participant
+
+Four modes, selected by flags.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-server` | `http://localhost:9000` | Base URL of the server. A bare `host:port` is accepted. A missing host is rejected with a hint (`-server :9000` mirrors the server's own `-addr :9000` and is easy to type by mistake). |
+| `-log-level` / `-log-format` | `info` / `text` | As the server. |
+| `-timeout` | `5s` | **Probe mode.** Overall deadline for the health probe. |
+| `-call` | `false` | **Call mode.** Join a room and establish a WebRTC call instead of probing `/healthz`. |
+| `-room` | `default` | Room (meet) to join. |
+| `-send` | `false` | Add an outbound video track. Implied by `-media`. |
+| `-media` | `""` | VP8 IVF file to send (looped); empty sends synthetic frames. |
+| `-record` | `""` | Write the first received track to this IVF file; empty just counts packets. |
+| `-stun` | `""` | STUN server URL. Empty is fine on one host. |
+| `-name` | `""` | Stable topology name (`relay`, `leaf-b`, …). Required by `-topology` and `-managed`. Must match `^[a-z0-9][a-z0-9_-]{0,63}$`. |
+| `-topology` | `""` | **Static tree.** Path to a JSON tree file (edges in names). Requires `-name`; fails loud on a malformed tree. Empty ⇒ full mesh. |
+| `-managed` | `false` | **Managed tree.** Report telemetry and realise the coordinator's pushed tree. Requires `-name`; mutually exclusive with `-topology`. |
+| `-upload-kbps` | `3000` | *(managed)* Advertised upload budget for forwarding others' media. **Declared, not measured.** |
+| `-nat` | `direct` | *(managed)* Declared NAT class `direct` \| `turn`. `turn` ⇒ forced leaf. **Declared, not detected.** |
+| `-coordinatable` | `true` | *(managed)* May this peer be elected coordinator? `false` declines — a laptop on battery. |
+| `-heartbeat` | `1s` | *(managed)* Liveness beat interval. **Declared on the wire**, and what the coordinator computes its degraded/gone thresholds from. Anything under 1 ms is refused, because the wire carries whole milliseconds. |
+| `-backup` | `true` | *(managed/tree)* On primary-parent failure, promote the coordinator's precomputed backup parent **without asking**. |
+
+**A flag set in the wrong mode warns rather than failing:** `WARN flag has no effect in this mode flag=upload-kbps`. Only flags you explicitly set are named. The five managed-only flags are `-backup`, `-coordinatable`, `-heartbeat`, `-nat`, `-upload-kbps`.
+
+> **Why `-backup` is a positive flag over a negative field.** `RouterConfig` carries `DisableBackup bool`, not `Backup bool`, because "default true" is unachievable for a plain Go bool — a caller who forgot the field would silently get **failover disabled**, the wrong direction to fail in for the entire point of the phase. The CLI keeps the positive polarity because flags express non-zero defaults fine; `cmd/peer` is the single place the polarity flips.
 
 ---
 
@@ -91,7 +128,8 @@ Run `make` (or `make help`) for the live list. Pass binary flags through the `AR
 | `make vet` | `go vet ./...`. |
 | `make tidy` | `go mod tidy`. |
 | `make lint` | `golangci-lint run` if installed, else prints an install hint and runs `go vet`. |
-| `make check` | `fmt` + `vet` + `test` — the pre-commit gate. |
+| `make check-determinism` | Fail if a control-plane package (`overlay`, `simnet`, `coordinator`, `arbiter`) reaches for the wall clock instead of the injected `clock.Clock`. Silent on success. |
+| `make check` | `fmt` + `vet` + `check-determinism` + `test` — **the pre-commit gate**. |
 | `make clean` | Remove `./bin`, `coverage.out`, `coverage.html`. |
 
 **Passing flags via `ARGS`:**
@@ -317,17 +355,149 @@ connects only to the relay — and `out.ivf` is `leaf-b`'s VP8 forwarded through
 - **Upload budget shapes the tree.** Give two peers high `-upload-kbps` and the builder
   makes a two-level tree under the depth bound; mark a peer `-nat turn` and it is forced
   to a leaf no matter how much upload it claims.
-- **Additive apply (Phase 4 scope).** A *new* peer joining attaches cleanly; mid-call
-  re-parenting/teardown and a new upstream source's renegotiation are Phase 5. Keep one
-  clearly-strongest relay so the root doesn't change mid-call.
+- **~~Additive apply~~ — superseded in Phase 5.** Apply is now a **diff** of *(self, wanted
+  tree, current reality)*: edges are added, removed, re-legged and re-created as needed, and
+  the baseline is reality, so a partially realized state converges. Mid-call re-parenting
+  works; see the failover section above.
 - **Deterministic testing.** All the graph/churn logic is exercised media-free by the
   `simnet` harness (`go test ./internal/simnet/...`) — see `docs/testing.md`.
 
 ---
 
+### Failover and election — a managed room that heals (Phase 5–6)
+
+Same setup as above, plus `-elect` on the server. Nothing extra on the peers: `-backup`
+defaults to `true`, and the coordinator assigns a warm secondary parent to every node it can.
+
+```console
+$ make run-server ARGS="-coordinate -elect -log-level debug"
+… msg="arbiter starting" coordinate=true elect=true dashboard=true demo=false socket_detection=7s
+… msg="coordinator enabled" max_depth=2 stream_kbps=2000 stickiness_ms=25 join_settle=1.5s dwell=10s gone_after=8s
+```
+
+**Kill a relay.** Its children do not wait for the coordinator: a child that sees its parent's
+`PeerConnection` reach `failed` — or sit `disconnected` for 2 s — opens a session to its
+precomputed backup **make-before-break** (the old parent stays open and receiving until the new
+one carries media), rewrites RTP continuity on every downstream leg, requests a keyframe, and
+only then closes the old session. It reports the promotion; the coordinator **ratifies** it
+into its working copy rather than second-guessing it, then rebuilds. Success requires **media**,
+not merely ICE.
+
+**Kill the coordinator.** The arbiter notices (its own liveness view, not the coordinator's),
+mints `Epoch+1`, and broadcasts the announcement. Every peer adopts it, resets `Rev` to 0, and
+sends one immediate out-of-cycle heartbeat and report. The new coordinator accumulates for up
+to `RebuildWindow` (3 s), reconstructs a stickiness baseline **from what peers say they have
+realized**, validates it, and publishes `Rev = 1` under the new epoch.
+
+What to watch for, and what each thing means:
+
+- `stale_rejected` becoming non-zero at some peer during the window — **that is the fence doing visible work**, not a fault. It is the observable proof that an old-epoch push was refused.
+- `announce_repair` on the dashboard — a peer missed the announcement and the arbiter re-sent it verbatim. Expected occasionally; persistent means that peer is barely reachable.
+- The meets **list** and the meet **detail** disagreeing for a few seconds — one is REALIZED, one is INTENDED. See `troubleshooting.md`.
+- **Media should keep flowing throughout.** The data plane does not need the coordinator; what is suspended for ≤3 s is re-optimization, not the call.
+
+> **Honest status.** These behaviours are covered by the automated suite — deterministic
+> simulation of the control plane and real-pion integration tests of the media plane — but a
+> **live multi-process run of Phases 5 and 6 has not been recorded** (`DESIGN.md` §9.5). State
+> any claim about live failover or live migration with that qualification.
+
+---
+
+## The dashboard
+
+The dashboard is a **separate static site**, not a page served by the arbiter. It is vanilla ES
+modules and hand-written CSS with **no build step** — the directory that is committed is
+byte-for-byte the directory that is served — and it is published to GitHub Pages by
+`.github/workflows/pages.yml` on any push touching `web/`.
+
+It is **read-mostly and eventually consistent**: an operator's lens on the same data the
+coordinator uses, not a control surface. A `seq` gap triggers a resync; that is the only
+consistency mechanism.
+
+### Three ways to run it
+
+```console
+# 1. Straight off the filesystem, against a local server.
+$ make run-server ARGS="-coordinate"
+$ xdg-open web/index.html          # then type localhost:9000 in the server field
+
+# 2. No server at all — the fixtures.
+#    web/js/mockApi.js drives the whole UI from web/fixtures/*.json.
+
+# 3. The published Pages site, pointed at YOUR machine.
+#    Open https://sammyurfen.github.io/… and type localhost:9000.
+```
+
+### Pointing the Pages site at a local server
+
+This works out of the box, and the reason is worth knowing because it does **not** generalise:
+
+| Arbiter reachable at | From the `https://` Pages site | Why |
+|---|---|---|
+| `ws://localhost:9000` | **works** | W3C *Secure Contexts* classifies `localhost`, `127.0.0.1` and `[::1]` as potentially trustworthy, and mixed-content blocking exempts them. Every major browser implements this. |
+| `ws://192.168.1.5:9000` | **blocked** | The exemption is by **hostname**, not by network. Your own LAN does not count. |
+| `wss://arbiter.example.com` | **works** | A real certificate. This is the hosted path. |
+
+So the frontend picks the scheme from *both* what you typed and how the page itself was loaded:
+a loopback host stays plaintext regardless; any other host follows the page's own scheme. The
+default `-allowed-origins` already lists the Pages origin and any localhost port, so nothing
+else is needed. For a `wss://` rehearsal, `deploy/docker-compose.yml` + `Caddyfile` issue a
+locally-trusted certificate — see `deploy/README.md`.
+
+If the dashboard shows **`rejected`** and stops retrying, that is an origin refusal: add your
+origin to `-allowed-origins`. Note that a page served from **the arbiter's own origin is not
+auto-allowed** — self-origin auto-allow is the DNS-rebinding vector.
+
+### The `/api` surface
+
+Mounted at `/api/` when `-dashboard` is on (the default). Every non-2xx carries the same
+envelope: `{"api_version":1,"error":{"code":"…","message":"…","details":{}}}`.
+
+| Method + path | Does |
+|---|---|
+| `GET /api/meets` | List meets — the **REALIZED** view (reconstructed from heartbeats) plus the ended-meet tombstone ring. Also carries `demo_enabled`. |
+| `POST /api/meets` | Create a meet. An **empty body is legal** and is the normal call: the arbiter generates an unguessable `crypto/rand` id. `201` + `Location:` + a `join` block. |
+| `GET /api/meets/{id}` | One meet, the full **INTENDED** snapshot — the same object the WS stream sends as its first frame. |
+| `GET /api/meets/{id}/events` | WebSocket: snapshot, then the live event stream. |
+| `POST /api/demo/meets/{id}/evict` | *(`-demo` only)* Terminate a participant's connection. `name` required. `202`. |
+| `POST /api/demo/meets/{id}/elect` | *(`-demo` only)* Force an election. `name` **optional** — empty means "the best candidate", the arbiter's own default. `202`. |
+
+```console
+$ curl -sS localhost:9000/api/meets
+{"api_version":1,"demo_enabled":false,"meets":[],"ended":[]}
+
+$ curl -sS -X POST localhost:9000/api/meets
+# 201, and the join block is the point:
+#   "join": { "ws_url": "ws://localhost:9000/ws?room=k3f9xq2b",
+#             "peer_command": "peer -call -managed -server http://localhost:9000 -room k3f9xq2b -name your-name" }
+```
+
+The placeholder is `your-name`, lowercase-with-a-hyphen, because it must itself be a **valid
+peer name** — an earlier `YOUR_NAME` produced a copy button that handed out a command rejected
+the instant it was pasted unchanged.
+
+**CORS behaves differently from the upgrade, deliberately.** A matching origin is **echoed**,
+never `*`. A request with **no** `Origin` (curl, a health checker) is answered normally with no
+CORS headers at all. A **non-matching** origin gets the normal response **minus**
+`Access-Control-Allow-Origin` — the browser blocks it, and the server does *not* 403, because a
+distinguishable error would leak the allow-list to a probing page. The event-stream **upgrade**,
+by contrast, *is* a 403.
+
+### Demo controls
+
+With `-demo` on, the meet detail view grows an **Evict** dropdown (pick a member) and a
+**Force election** control (pick a member, or leave it empty for "best candidate"). Both are
+`202 Accepted` and both **publish a `demo` event to everyone watching the meet**, including the
+colleague looking at the same screen — which is why the event carries the caller's remote
+address. The panel renders only when `demo_enabled` is true on `GET /api/meets`, derived
+server-side from the same nil check that decides whether the routes exist, so the button and
+the route cannot disagree. An older server that omits the field is treated as demo-**off**.
+
+---
+
 ## The `/healthz` contract
 
-`server` exposes a single route today, wired with Go 1.22+ **method-aware** patterns (`mux.HandleFunc("GET /healthz", …)`). The mux itself enforces the method, so the handler never inspects `r.Method`.
+`server` exposes three route groups: `GET /healthz`, `GET /ws`, and `/api/` (when `-dashboard` is on). The first two are wired with Go 1.22+ **method-aware** patterns, so the mux enforces the method and the handler never inspects `r.Method`. The `/api/` handlers deliberately do the opposite — they register without a method and dispatch on `r.Method` themselves — because the contract requires the `{code, message, details}` envelope on **every** non-2xx, and `ServeMux`'s own 404 and 405 responses are plain text.
 
 | Request | Result |
 |---|---|
@@ -374,7 +544,7 @@ Records below the chosen level are dropped. Order: `debug < info < warn < error`
 
 | Level | Effect today | Use when |
 |---|---|---|
-| `debug` | No extra output yet — Phase 0 code emits only INFO/ERROR records. Wired for later. | Future: verbose tracing of signaling/ICE. |
+| `debug` | Mechanism detail: SDP/ICE exchange, per-tick metrics, `forwarded keyframe request upstream`, `meet is settling`, re-parent state transitions. | A call that will not reach `connected`, or a tree that will not settle. |
 | `info` (default) | Shows startup, per-request, and probe-outcome lines. | Normal dev. |
 | `warn` / `error` | Suppresses the INFO lines above — e.g. `-log-level error` hides `server is healthy` and `http server listening`, surfacing only problems. | Quiet CI, or when you only care about failures. |
 
@@ -426,14 +596,16 @@ This is the first appearance of **context-as-lifecycle** (`signal.NotifyContext`
 
 ---
 
-## What this does *not* prove yet (Phase 1 limitations)
+## What this does *not* prove
 
-- **Two peers, not a mesh.** A room can hold more, but each `peer` only wires up one remote peer's media policy cleanly; N-way mesh (and feeling its upload ceiling) is *Phase 2*, and forwarding media *through* a participant — the elected peer-SFU — is *Phase 3*.
-- **No relay/SFU, no election, no metrics.** Media is direct peer-to-peer; there is no coordinator, no graph, no telemetry yet. *(Planned: Phases 3–6.)*
-- **Synthetic media isn't decodable.** Without `-media`, the sender emits opaque bytes — enough to prove RTP flows and `OnTrack` fires, but the recorded `.ivf` won't play. Use a real VP8 `.ivf` for a watchable result.
-- **Recorded IVF header dimensions are `ivfwriter` defaults** (it writes a fixed header), not the sender's frame size — the VP8 frames inside still decode at their true resolution.
-- **`/healthz` is liveness, not readiness.** It reports "the process is up and routing," not "a call could succeed."
-- **No TLS / auth.** Plain HTTP/WS, no authentication, no origin allow-list configured — fine for `localhost` bring-up, not for anything exposed.
-- **`-log-level debug` now traces negotiation** — `sent offer`, `sent answer`, `rolled back local offer`, per-candidate sends — which is exactly what to turn on when a call won't reach `connected` (diff the two peers' state timelines).
+- **Phases 5 and 6 have no recorded live run.** They are verified by the automated suite — deterministic simulation of the control plane plus real-pion integration tests of the media plane — but not by a live multi-process demonstration of failover and migration (`DESIGN.md` §9.5).
+- **Every live run so far has been single-host.** Multiple processes on one machine over loopback: no cross-machine result, no real NAT traversal, no real packet loss, no real congestion control. The "≈6 Mbit/s at 5 peers" figure is arithmetic on a measured per-stream bitrate, not an observed collapse.
+- **The telemetry is mostly declared, not measured.** `-upload-kbps` and `-nat` are operator claims; `RTTServerMs`, `LossPct` and `CPUPct` are **never populated in production**. The consequences are concrete: the degradation dwell cannot arm, voluntary promotion/demotion cannot fire, and `BuildTree`'s min-latency rank has no data. All of it is exercised in `simnet`, where the values are injected.
+- **Synthetic media isn't decodable.** Without `-media`, the sender emits opaque bytes — enough to prove RTP flows and `OnTrack` fires, but the recorded `.ivf` won't play.
+- **Keyframe *response* is unproven.** File and synthetic sources have no live encoder, so PLI *plumbing* (including the upstream SSRC translation) is proven and "recover on demand" awaits a browser sender.
+- **Recorded IVF header dimensions are `ivfwriter` defaults**, not the sender's frame size — the VP8 frames inside still decode at their true resolution.
+- **`/healthz` is liveness, not readiness.** It reports "the process is up and routing", not "a call could succeed".
+- **No authentication, anywhere.** No token, password, credential, JWT or TLS termination in any non-test file. Anyone who can reach `/ws` can join any meet under any unused name; anyone who can reach `/api` can create meets and read every meet's telemetry. What exists instead is server-stamped identity, the epoch fence, the origin allow-list, unguessable meet ids, and bounded state. Fine for `localhost` bring-up; see `deploy/README.md` before exposing anything.
+- **No simulcast, no SVC, no TURN.** Phase 7 was not built. A relay forwards one quality layer to every downstream, and `-nat turn` is a declared constraint rather than a detected one.
 
-For the full phase plan and the architecture rationale (why the control plane is centralized while the data plane is decentralized, why the relay tree stays shallow, why election uses a central arbiter instead of Raft), see `docs/ROADMAP.md`.
+For the phase plan see [`ROADMAP.md`](./ROADMAP.md); for why the system is shaped this way, [`DESIGN.md`](./DESIGN.md) is the single best explanation.
