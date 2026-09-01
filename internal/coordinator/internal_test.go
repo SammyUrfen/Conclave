@@ -324,6 +324,19 @@ func TestReconstructObserved(t *testing.T) {
 			if s := edgeString(got); s != tc.want {
 				t.Fatalf("edges = %q, want %q", s, tc.want)
 			}
+			// Every emitted edge's parent is already placed. This pins the property
+			// that keeps WI-3's finding (1) — deriveWorking leaving an orphan out of
+			// processingOrder's incumbent list — unreachable through the Phase 6
+			// handover path: a reconstruction is a single connected BFS from one root
+			// or it is nothing, so it can never produce the disconnected-fragment
+			// shape that finding is about.
+			placed := map[string]bool{got.Root: true}
+			for i, e := range got.Edges {
+				if !placed[e.Parent] {
+					t.Fatalf("edge %d (%s>%s) names an unplaced parent: %v", i, e.Parent, e.Child, got.Edges)
+				}
+				placed[e.Child] = true
+			}
 			if got.Epoch != 7 {
 				t.Fatalf("the baseline must carry the new term, got epoch %d", got.Epoch)
 			}
