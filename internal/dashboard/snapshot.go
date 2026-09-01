@@ -26,6 +26,22 @@ const (
 	provenanceIntended = "intended"
 )
 
+// The frozen convergence enum (§9.4b). Three values because the comparison genuinely has
+// three outcomes; see meetBody.Convergence for why this is not a boolean.
+const (
+	// convergenceConverged: a tree is published and every member's realized parent
+	// matches the one it assigns.
+	convergenceConverged = "converged"
+	// convergenceDiverged: at least one member's realized parent disagrees. This is
+	// convergence lag, a failed apply, or a fenced-out peer.
+	convergenceDiverged = "diverged"
+	// convergenceNoTree: there is nothing to compare against — no tree published, or
+	// one with no edges. It is NOT a fault and NOT health; WHY there is no tree is
+	// answered by the build-state events (`settling` versus `unbuildable`, §5.9), which
+	// is deliberately not duplicated here.
+	convergenceNoTree = "no_tree"
+)
+
 // snapshotBody returns the §9.3 detail body, which is also the WS `snapshot` frame's
 // data, subject to the snapshotMinInterval read bound.
 //
@@ -144,8 +160,10 @@ func (s *Server) buildMeetBody(meet arbiter.Meet, snap coordinator.RoomSnapshot)
 	for _, m := range snap.Members {
 		body.Nodes = append(body.Nodes, nodeOf(m, topo, meet.Coordinator))
 		// A node has DIVERGED when the parent its heartbeat reports differs from the
-		// one the published tree assigned. With no published tree there is nothing to
-		// diverge from, so the answer is "converged" rather than "everyone is wrong".
+		// one the published tree assigned. With no published tree at all there is
+		// nothing to diverge FROM, so the comparison is skipped entirely and
+		// convergenceOf reports no_tree — not "everyone is wrong", and not the
+		// "converged" a bare emptiness check used to fall into.
 		if topo != nil && topo.ParentOf(m.Name) != m.Parent {
 			body.Diverged = append(body.Diverged, m.Name)
 		}
@@ -160,8 +178,27 @@ func (s *Server) buildMeetBody(meet arbiter.Meet, snap coordinator.RoomSnapshot)
 		return body.Nodes[i].ID < body.Nodes[j].ID
 	})
 	sort.Strings(body.Diverged)
-	body.Converged = len(body.Diverged) == 0
+	body.Convergence = convergenceOf(topo, body.Diverged)
 	return body
+}
+
+// convergenceOf classifies the realized-versus-intended comparison (§9.4b).
+//
+// The order of the tests matters and is the whole design. A real disagreement is
+// reported even when the tree has no edges, because a peer still naming a parent under a
+// tree that assigns none is exactly the fenced-out or lagging peer this field exists to
+// reveal — suppressing the comparison whenever the tree looks empty would hide the one
+// case worth seeing. Only once nobody disagrees does "no edges" mean "nothing to
+// compare", which covers both a meet with no tree yet and a single-node tree whose sole
+// member is trivially its own root.
+func convergenceOf(topo *overlay.Topology, diverged []string) string {
+	if len(diverged) > 0 {
+		return convergenceDiverged
+	}
+	if topo == nil || len(topo.Edges) == 0 {
+		return convergenceNoTree
+	}
+	return convergenceConverged
 }
 
 // nodeOf renders one member. Parent and Children are REALIZED (the peer's own last

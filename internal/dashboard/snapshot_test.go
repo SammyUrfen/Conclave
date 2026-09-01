@@ -33,7 +33,7 @@ func TestGetMeetSnapshot(t *testing.T) {
 		"api_version": float64(APIVersion), "id": "standup", "epoch": float64(3), "rev": float64(11),
 		"coordinator": "alice", "coordinator_id": "p2", "arbiter_is_coordinator": false,
 		"root": "alice", "at_unix_ms": float64(testAt.UnixMilli()),
-		"stale_rejected": float64(0), "converged": true, "provenance": "intended",
+		"stale_rejected": float64(0), "convergence": "converged", "provenance": "intended",
 	} {
 		if body[k] != want {
 			t.Errorf("%s = %#v, want %#v", k, body[k], want)
@@ -207,8 +207,8 @@ func TestSnapshotDivergence(t *testing.T) {
 		Subnet: subnet,
 	})
 	_, body := doJSON(t, ts, http.MethodGet, "/api/meets/standup", "", nil)
-	if body["converged"] != false {
-		t.Errorf("converged = %v, want false", body["converged"])
+	if body["convergence"] != "diverged" {
+		t.Errorf("convergence = %v, want \"diverged\"", body["convergence"])
 	}
 	var got []string
 	dv, ok := body["diverged"].([]any)
@@ -244,6 +244,103 @@ func TestSnapshotWithoutCoordinator(t *testing.T) {
 	// even with no coordinator snapshot (§9.4b).
 	if body["epoch"] != float64(3) {
 		t.Errorf("epoch = %v, want 3 from the arbiter", body["epoch"])
+	}
+}
+
+// TestConvergenceStates is the three-state contract for §9.4b's realized-vs-intended
+// comparison.
+//
+// The load-bearing case is "no tree": with nothing published there is nothing to compare,
+// and the old boolean reported converged=true because len(Diverged)==0 fell out of the
+// formula. Vacuously true and actively misleading — "converged" next to an empty subnet
+// reads as HEALTHY, so an operator watching a meet that failed to build saw a green
+// signal. That is the same failure class as reap-time EndedAt and the un-renamed
+// `fitness`: when a value cannot be computed, say so rather than emitting whatever the
+// formula happens to produce.
+//
+// The last case is why the rule is not simply "no edges ⇒ no_tree": a peer still naming a
+// parent under a tree that has none is genuinely disagreeing with the coordinator, and
+// blanket-suppressing the comparison would hide exactly the fenced-out or lagging peer
+// this field exists to reveal.
+func TestConvergenceStates(t *testing.T) {
+	member := func(name, realizedParent string) coordinator.MemberSnapshot {
+		return coordinator.MemberSnapshot{
+			ID: "p-" + name, Name: name, Health: coordinator.HealthHealthy,
+			Parent: realizedParent,
+			Report: metrics.Report{Name: name, NAT: overlay.NATDirect, Coordinatable: true},
+		}
+	}
+	twoNode := &overlay.Topology{
+		Epoch: 1, Rev: 1, Root: "alice",
+		Edges: []overlay.Edge{{Parent: "alice", Child: "bob"}},
+	}
+	rootOnly := &overlay.Topology{Epoch: 1, Rev: 1, Root: "alice"}
+
+	tests := []struct {
+		name         string
+		topo         *overlay.Topology
+		members      []coordinator.MemberSnapshot
+		want         string
+		wantDiverged []string
+	}{
+		{
+			name: "a tree everyone agrees with", topo: twoNode,
+			members: []coordinator.MemberSnapshot{member("alice", ""), member("bob", "alice")},
+			want:    "converged", wantDiverged: []string{},
+		},
+		{
+			name: "a tree someone disagrees with", topo: twoNode,
+			members: []coordinator.MemberSnapshot{member("alice", ""), member("bob", "carol")},
+			want:    "diverged", wantDiverged: []string{"bob"},
+		},
+		{
+			name: "no tree published at all", topo: nil,
+			members: []coordinator.MemberSnapshot{member("alice", ""), member("bob", "")},
+			want:    "no_tree", wantDiverged: []string{},
+		},
+		{
+			name: "a single-node tree has no edge to compare", topo: rootOnly,
+			members: []coordinator.MemberSnapshot{member("alice", "")},
+			want:    "no_tree", wantDiverged: []string{},
+		},
+		{
+			name: "an edgeless tree still surfaces a peer that names a parent", topo: rootOnly,
+			members: []coordinator.MemberSnapshot{member("alice", ""), member("bob", "alice")},
+			want:    "diverged", wantDiverged: []string{"bob"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			subnet := &fakeSubnet{}
+			subnet.set(coordinator.RoomSnapshot{
+				RoomID: "m", Epoch: 1, Rev: 1, At: testAt, Topo: tt.topo, Members: tt.members,
+			})
+			_, ts := newTestServer(t, Config{
+				Meets:  &fakeMeets{live: []arbiter.Meet{{ID: "m"}}},
+				Subnet: subnet,
+			})
+			_, body := doJSON(t, ts, http.MethodGet, "/api/meets/m", "", nil)
+			if body["convergence"] != tt.want {
+				t.Errorf("convergence = %#v, want %q", body["convergence"], tt.want)
+			}
+			// The superseded boolean must be GONE, not merely joined by the new field:
+			// leaving it would let the UI keep reading the value that caused the bug.
+			if _, present := body["converged"]; present {
+				t.Errorf("body still carries the `converged` boolean, which cannot "+
+					"represent the third state: %v", body["converged"])
+			}
+			dv, ok := body["diverged"].([]any)
+			if !ok {
+				t.Fatalf("diverged = %#v, want an array", body["diverged"])
+			}
+			var got []string
+			for _, d := range dv {
+				got = append(got, d.(string))
+			}
+			if fmt.Sprint(got) != fmt.Sprint(tt.wantDiverged) && !(len(got) == 0 && len(tt.wantDiverged) == 0) {
+				t.Errorf("diverged = %v, want %v", got, tt.wantDiverged)
+			}
+		})
 	}
 }
 
