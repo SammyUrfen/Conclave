@@ -86,7 +86,10 @@ func TestDiffTopologyKeepsAPromotedBackupChild(t *testing.T) {
 			// answerer side of an unmodelled edge and a is the offerer on a real one.
 			name: "ratification hands the edge to the normal machinery",
 			next: ratified, live: live("b"),
-			wantRemove: nil, wantRecreate: []string{"c"},
+			// b also appears because moving c off it made b a leaf, and that
+			// genuinely changes the track set b publishes on its edge to a. It is
+			// collateral of the tree change, not of the exemption.
+			wantRemove: nil, wantRecreate: []string{"b", "c"},
 		},
 		{
 			// Exit 2 — the coordinator placed c somewhere else. It has acted on the
@@ -94,7 +97,8 @@ func TestDiffTopologyKeepsAPromotedBackupChild(t *testing.T) {
 			// a peer that is not ours.
 			name: "the coordinator placing the child elsewhere ends the exemption",
 			next: movedElsewhere, live: live("b"),
-			wantRemove: []string{"c"},
+			// Same collateral, both ways: b stopped being a relay and d started.
+			wantRemove: []string{"c"}, wantRecreate: []string{"b", "d"},
 		},
 		{
 			// Exit 3 — the warrant itself is withdrawn. The assignment is what

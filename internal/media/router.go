@@ -180,6 +180,11 @@ type peerLink struct {
 	// leaf to relay or demoted back, and a re-creation has to be agreed by both.
 	relayEdge     bool
 	peerRelayEdge bool
+	// backupFor is set only on a session accepted under §7.5a — a child that
+	// promoted us as its backup parent — and holds the parent it was failing over
+	// FROM. Empty on every ordinary edge. It is the "before" half of the question
+	// "has the coordinator acted on that failure yet".
+	backupFor string
 }
 
 // NewRouter constructs a Router over an already-dialed signaling client.
@@ -561,7 +566,7 @@ func (r *Router) currentParent() string {
 func (r *Router) liveState() liveState {
 	st := liveState{
 		roles: map[string]bool{}, relayEdge: map[string]bool{}, peerRelay: map[string]bool{},
-		parent: r.currentParent(),
+		backupChild: map[string]string{}, parent: r.currentParent(),
 	}
 	// A re-parent in flight means the tree already says our parent is the new one
 	// while reality is still the old one. The diff must see reality.
@@ -577,6 +582,9 @@ func (r *Router) liveState() liveState {
 		st.roles[name] = link.session.Offerer()
 		st.relayEdge[name] = link.relayEdge
 		st.peerRelay[name] = link.peerRelayEdge
+		if link.backupFor != "" {
+			st.backupChild[name] = link.backupFor
+		}
 	}
 	r.mu.Unlock()
 	if r.fwd != nil {
@@ -948,6 +956,15 @@ func (r *Router) deliver(ctx context.Context, msg signaling.Message) {
 		r.startPeerOpt(ctx, msg.From, peerOpts{offerer: &no})
 		r.mu.Lock()
 		link = r.peers[msg.From]
+		if link != nil {
+			// Remember WHICH failure this edge answers. Without it the next
+			// unrelated push sees a live neighbour the tree does not name, calls it
+			// a stranger, and drops the parent this child has only just failed over
+			// to — inside the window failover exists to survive.
+			if topo := r.topo; topo != nil {
+				link.backupFor = topo.ParentOf(r.nameByID[msg.From])
+			}
+		}
 		r.mu.Unlock()
 	}
 	if link == nil {
