@@ -118,19 +118,46 @@ func mustJSON(t *testing.T, v any) []byte {
 	return b
 }
 
-// joinAndReport delivers a member's join and its first telemetry frame, which is the
-// production sequence: metrics.Reporter emits immediately on Run.
+// joinAndReport delivers a member's join and its first telemetry frame together,
+// which is what a peer that connects and immediately reports produces.
 func joinAndReport(t *testing.T, loop *realLoop, net *Network, name string) {
 	t.Helper()
-	var node overlay.Node
-	for _, n := range net.OverlayNodes() {
-		if n.Name == name {
-			node = n
-		}
-	}
 	id := peerID(net, name)
 	loop.c.PeerJoined(testRoom, id, name)
-	loop.c.Metrics(testRoom, id, mustJSON(t, ReportOf(node)))
+	loop.c.Metrics(testRoom, id, mustJSON(t, ReportOf(nodeNamed(net, name))))
+}
+
+// joinAll announces every member without any telemetry, and reportAll then delivers
+// the first reports in the scenario's arrival order.
+//
+// The split is the whole reason these scenarios are meaningful, and it is a
+// distinction the first version of this file got wrong. JOIN order and REPORT order
+// are two different variables: the loop rebuilds on every membership threshold, so a
+// meet that grows one peer at a time legitimately gets an incremental, sticky build
+// history, and its final tree is a function of that history. Report-order invariance
+// (docs/PLAN.md §12.3) is a claim about the SETTLED path — a known roster whose
+// telemetry arrives in some order — and only this split can pose that question.
+func joinAll(t *testing.T, loop *realLoop, net *Network) {
+	t.Helper()
+	for _, name := range net.order {
+		loop.c.PeerJoined(testRoom, peerID(net, name), name)
+	}
+}
+
+func reportAll(t *testing.T, loop *realLoop, net *Network, order []string) {
+	t.Helper()
+	for _, name := range order {
+		loop.c.Metrics(testRoom, peerID(net, name), mustJSON(t, ReportOf(nodeNamed(net, name))))
+	}
+}
+
+func nodeNamed(net *Network, name string) overlay.Node {
+	for _, n := range net.OverlayNodes() {
+		if n.Name == name {
+			return n
+		}
+	}
+	return overlay.Node{Name: name}
 }
 
 // TestScenarioDrivesTheRealCoordinator is the base integration scenario: a whole
@@ -144,22 +171,26 @@ func TestScenarioDrivesTheRealCoordinator(t *testing.T) {
 	}
 	loop := startCoordinator(t, sc, "coordinator")
 
-	sc.At(0, func() {
-		for _, name := range sc.Reporters() {
-			joinAndReport(t, loop, sc.Net(), name)
-		}
-	})
-	// Past the join settle, so the first build's eligibility window has closed.
-	sc.At(coordinator.JoinSettle+100*time.Millisecond, func() {})
+	sc.At(0, func() { joinAll(t, loop, sc.Net()) })
+	sc.At(100*time.Millisecond, func() { reportAll(t, loop, sc.Net(), sc.Reporters()) })
+	// Past the join settle, so the first build's eligibility window has closed even
+	// if the early exit had not already fired.
+	sc.At(coordinator.JoinSettle+200*time.Millisecond, func() {})
 
 	if err := sc.Run(); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
-	ev, ok := loop.rec.Last(coordinator.EventTopology)
-	if !ok {
+	built := loop.rec.OfKind(coordinator.EventTopology)
+	if len(built) == 0 {
 		t.Fatalf("the coordinator published no tree; events = %v", loop.rec.Kinds())
 	}
+	// Exactly one: no tree is published while the roster is still settling, and the
+	// early exit then fires once, when the last report lands.
+	if len(built) != 1 {
+		t.Errorf("published %d trees on the settled path, want 1 (revs %v)", len(built), revsOf(built))
+	}
+	ev := built[0]
 	if ev.Topo == nil {
 		t.Fatal("EventTopology carried no topology")
 	}
@@ -214,48 +245,53 @@ func TestFencingHandover(t *testing.T) {
 	// Both processes watch the same meet. Only one of them serves it at a time; that
 	// is the whole thing being tested.
 	sc.At(0, func() {
-		for _, name := range sc.Reporters() {
-			joinAndReport(t, c1, sc.Net(), name)
-			joinAndReport(t, c2, sc.Net(), name)
-		}
+		joinAll(t, c1, sc.Net())
+		joinAll(t, c2, sc.Net())
 	})
-	settled := coordinator.JoinSettle + 100*time.Millisecond
+	sc.At(100*time.Millisecond, func() {
+		reportAll(t, c1, sc.Net(), sc.Reporters())
+		reportAll(t, c2, sc.Net(), sc.Reporters())
+	})
+	settled := coordinator.JoinSettle + 200*time.Millisecond
 	sc.At(settled, func() {})
 
 	// The arbiter mints epoch 2 and moves coordination from c1 to c2.
+	var beforeYield []coordinator.Event
 	handover := settled + time.Second
 	sc.At(handover, func() {
+		beforeYield = c1.rec.OfKind(coordinator.EventTopology)
+		c1.rec.Reset()
+		c1.cap.Reset()
 		c1.c.Yield(testRoom, 2)
 		c2.c.SetEpoch(testRoom, 2)
 	})
-	// c2's rebuild window closes on its deadline.
-	afterRebuild := handover + metrics.RebuildWindow + 100*time.Millisecond
-	sc.At(afterRebuild, func() {})
+
+	// REAL CHURN after the handover. Without it this test proves nothing: a
+	// coordinator with nothing to rebuild for is silent whether or not it yielded,
+	// so "c1 published nothing" would be satisfied by a Yield that does not demote.
+	// A departure is a threshold event both processes observe, and c2 — which DID
+	// take the term — publishing for it is the control that proves the event was
+	// live.
+	sc.At(handover+200*time.Millisecond, func() {
+		gone := peerID(sc.Net(), "c")
+		c1.c.PeerLeft(testRoom, gone)
+		c2.c.PeerLeft(testRoom, gone)
+		sc.Net().Leave("c")
+	})
+	// Past c2's rebuild window AND past every recompute cooldown, so neither loop is
+	// merely being throttled at the moment the assertions run.
+	sc.At(handover+8*time.Second, func() {})
 
 	if err := sc.Run(); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
 	t.Run("the demoted coordinator published under its own term first", func(t *testing.T) {
-		evs := c1.rec.OfKind(coordinator.EventTopology)
-		if len(evs) == 0 {
-			t.Fatalf("c1 never published; kinds = %v", c1.rec.Kinds())
+		if len(beforeYield) == 0 {
+			t.Fatalf("c1 never published before the handover; kinds = %v", c1.rec.Kinds())
 		}
-		if got := evs[0].Epoch; got != 1 {
+		if got := beforeYield[0].Epoch; got != 1 {
 			t.Errorf("c1's first tree carried epoch %d, want 1", got)
-		}
-	})
-
-	t.Run("the demoted coordinator publishes nothing after yielding", func(t *testing.T) {
-		for _, ev := range c1.rec.OfKind(coordinator.EventTopology) {
-			if ev.Epoch >= 2 {
-				t.Errorf("c1 published under epoch %d after yielding at 2", ev.Epoch)
-			}
-		}
-		for _, p := range c1.cap.Pushes() {
-			if p.Topo != nil && p.Topo.Epoch >= 2 {
-				t.Errorf("a push from the yielded c1 carried epoch %d; the outbound gate did not close", p.Topo.Epoch)
-			}
 		}
 	})
 
@@ -272,12 +308,60 @@ func TestFencingHandover(t *testing.T) {
 		if got.Rev != 1 {
 			t.Errorf("the new term's first tree is rev %d, want 1 (rev resets with the epoch)", got.Rev)
 		}
+		if contains(got.Nodes(), "c") {
+			t.Errorf("the departed member c is still in the new term's tree %v", got.Edges)
+		}
 		cons := controlConstraints()
 		cons.Root, cons.Epoch, cons.Rev = got.Root, got.Epoch, got.Rev
 		if verr := validateTopology(got, projectionOf(sc.Net()), cons); verr != nil {
 			t.Fatalf("the new term's tree fails Validate: %v", verr)
 		}
 	})
+
+	t.Run("the demoted coordinator publishes nothing, even on churn", func(t *testing.T) {
+		if evs := c1.rec.OfKind(coordinator.EventTopology); len(evs) != 0 {
+			t.Errorf("the yielded c1 published %d tree(s) (epochs %v); Yield must stop the tree",
+				len(evs), epochsOf(evs))
+		}
+		if p := c1.cap.Pushes(); len(p) != 0 {
+			t.Errorf("the yielded c1 pushed %d topolog(ies); the outbound gate did not close", len(p))
+		}
+	})
+
+	t.Run("the demoted coordinator keeps observing", func(t *testing.T) {
+		// Yield drops what this node BELIEVED (the tree), not what it OBSERVED. A
+		// yielded coordinator that stopped tracking membership would make a
+		// re-election pay a full settle for nothing.
+		var sawDeparture bool
+		for _, ev := range c1.rec.OfKind(coordinator.EventMember) {
+			if ev.Node == "c" && !ev.Present {
+				sawDeparture = true
+			}
+		}
+		if !sawDeparture {
+			t.Errorf("the yielded c1 stopped observing membership; kinds = %v", c1.rec.Kinds())
+		}
+	})
+}
+
+// epochsOf lists the epochs of a run of events, for a failure message that says what
+// the loop actually did.
+func epochsOf(evs []coordinator.Event) []uint64 {
+	var out []uint64
+	for _, ev := range evs {
+		out = append(out, ev.Epoch)
+	}
+	return out
+}
+
+// contains reports whether names holds name.
+func contains(names []string, name string) bool {
+	for _, n := range names {
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 // TestStaleEpochDoesNotResumeAYieldedCoordinator: authority only ever moves forward.
@@ -397,7 +481,7 @@ func TestModelAgreesWithTheRealCoordinator(t *testing.T) {
 		names = append(names, n.Name)
 	}
 	for _, order := range permutations(names) {
-		real := convergeReal(t, order)
+		real, _ := convergeReal(t, order)
 		model := convergeModel(t, order)
 		if real != model {
 			t.Fatalf("order %v: the model and the shipped coordinator disagree\n  real: %s\n model: %s", order, real, model)
@@ -405,9 +489,10 @@ func TestModelAgreesWithTheRealCoordinator(t *testing.T) {
 	}
 }
 
-// convergeReal runs one arrival order through the shipped coordinator and returns its
-// converged edge set.
-func convergeReal(t *testing.T, order []string) string {
+// convergeReal runs one report-arrival order through the shipped coordinator on the
+// SETTLED path — every member joins first, then telemetry arrives in `order` — and
+// returns its converged edge set and how many trees it published getting there.
+func convergeReal(t *testing.T, order []string) (string, int) {
 	t.Helper()
 	sc := NewScenario(ScenarioConfig{Constraints: controlConstraints()})
 	for _, n := range controlFleet() {
@@ -416,20 +501,17 @@ func convergeReal(t *testing.T, order []string) string {
 	sc.ReportOrder(order...)
 	loop := startCoordinator(t, sc, "c")
 
-	sc.At(0, func() {
-		for _, name := range sc.Reporters() {
-			joinAndReport(t, loop, sc.Net(), name)
-		}
-	})
-	sc.At(coordinator.JoinSettle+100*time.Millisecond, func() {})
+	sc.At(0, func() { joinAll(t, loop, sc.Net()) })
+	sc.At(100*time.Millisecond, func() { reportAll(t, loop, sc.Net(), sc.Reporters()) })
+	sc.At(coordinator.JoinSettle+200*time.Millisecond, func() {})
 	if err := sc.Run(); err != nil {
 		t.Fatalf("order %v: Run: %v", order, err)
 	}
-	ev, ok := loop.rec.Last(coordinator.EventTopology)
-	if !ok || ev.Topo == nil {
+	built := loop.rec.OfKind(coordinator.EventTopology)
+	if len(built) == 0 || built[len(built)-1].Topo == nil {
 		t.Fatalf("order %v: the shipped coordinator published no tree", order)
 	}
-	return string(mustJSON(t, ev.Topo.Edges))
+	return string(mustJSON(t, built[len(built)-1].Topo.Edges)), len(built)
 }
 
 // convergeModel runs the same arrival order through the model, configured to the same
@@ -462,4 +544,234 @@ func convergeModel(t *testing.T, order []string) string {
 		t.Fatalf("order %v: the model published no tree", order)
 	}
 	return string(mustJSON(t, topo.Edges))
+}
+
+// revsOf lists the revisions of a run of topology events, for a failure message that
+// says what the loop actually did.
+func revsOf(evs []coordinator.Event) []uint64 {
+	var out []uint64
+	for _, ev := range evs {
+		out = append(out, ev.Rev)
+	}
+	return out
+}
+
+// TestRealCoordinatorReportOrderInvariance is docs/PLAN.md §12.3's mandatory property
+// asserted against the SHIPPED loop rather than against a model of it: for a known
+// roster, no permutation of first-telemetry arrival order may change the converged
+// tree, nor the number of trees published on the way there.
+//
+// This is the direct encoding of the root-flap defect where the recompute was a pure
+// function of which WebSocket frame arrived first. simnet already asserted it over
+// the model; until now nothing asserted it over the code that ships.
+func TestRealCoordinatorReportOrderInvariance(t *testing.T) {
+	names := make([]string, 0, len(controlFleet()))
+	for _, n := range controlFleet() {
+		names = append(names, n.Name)
+	}
+	perms := permutations(names)
+	if len(perms) != 120 {
+		t.Fatalf("expected 120 permutations, got %d", len(perms))
+	}
+	want, wantBuilds := "", -1
+	var wantOrder []string
+	for _, order := range perms {
+		got, builds := convergeReal(t, order)
+		if want == "" {
+			want, wantBuilds, wantOrder = got, builds, order
+			continue
+		}
+		if got != want {
+			t.Fatalf("report arrival order changed the shipped loop's converged tree\n order %v: %s\n order %v: %s",
+				wantOrder, want, order, got)
+		}
+		if builds != wantBuilds {
+			t.Fatalf("report arrival order changed how many trees were published: order %v got %d, order %v got %d",
+				wantOrder, wantBuilds, order, builds)
+		}
+	}
+	if wantBuilds != 1 {
+		t.Errorf("the settled path published %d trees, want exactly 1", wantBuilds)
+	}
+}
+
+// TestJoinOrderIsPathDependent is the CHARACTERIZATION that keeps the invariance
+// claim above from being read too broadly. When members arrive one at a time WITH
+// their telemetry, the loop rebuilds on every join — correctly, since each new member
+// has to be placed — so the final tree is a function of the join history. That is the
+// minimal-disruption property working as designed, not a defect, and it is the reason
+// report order and join order must never be conflated in a scenario.
+func TestJoinOrderIsPathDependent(t *testing.T) {
+	names := make([]string, 0, len(controlFleet()))
+	for _, n := range controlFleet() {
+		names = append(names, n.Name)
+	}
+	seen := map[string]bool{}
+	roots := map[string]bool{}
+	for _, order := range permutations(names) {
+		sc := NewScenario(ScenarioConfig{Constraints: controlConstraints()})
+		for _, n := range controlFleet() {
+			sc.Net().Add(n)
+		}
+		sc.ReportOrder(order...)
+		loop := startCoordinator(t, sc, "c")
+		sc.At(0, func() {
+			for _, name := range sc.Reporters() {
+				joinAndReport(t, loop, sc.Net(), name)
+			}
+		})
+		sc.At(coordinator.JoinSettle+200*time.Millisecond, func() {})
+		if err := sc.Run(); err != nil {
+			t.Fatalf("order %v: Run: %v", order, err)
+		}
+		ev, ok := loop.rec.Last(coordinator.EventTopology)
+		if !ok || ev.Topo == nil {
+			t.Fatalf("order %v: no tree", order)
+		}
+		cons := controlConstraints()
+		cons.Root, cons.Epoch, cons.Rev = ev.Topo.Root, ev.Topo.Epoch, ev.Topo.Rev
+		if verr := validateTopology(ev.Topo, projectionOf(sc.Net()), cons); verr != nil {
+			t.Fatalf("order %v: incremental build fails Validate: %v", order, verr)
+		}
+		seen[string(mustJSON(t, ev.Topo.Edges))] = true
+		roots[ev.Topo.Root] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("every join order converged to the same tree; the incremental build history no longer influences the result, so the stability trade-off has changed")
+	}
+	if len(roots) != 1 {
+		t.Errorf("join order changed the converged ROOT (%d distinct); root stickiness is damped by RootChangeMarginKbps, not by history", len(roots))
+	}
+	t.Logf("join-order path dependence: %d distinct converged trees over 120 orders, one root", len(seen))
+}
+
+// goneAfter/degradedAfter are the liveness thresholds for the failover scenario. They
+// are short in VIRTUAL time — the scenario steps past them deliberately — and the
+// only reason they are stated at all is that the other scenarios push liveness out of
+// reach so their assertions cannot be accidentally about the health FSM.
+const (
+	degradedAfter = 2 * time.Second
+	goneAfter     = 4 * time.Second
+)
+
+// TestGoneRelayIsRepairedOutOfTheTree is the Phase 5 story end to end through the
+// SHIPPED loop: a relay stops heartbeating, the health FSM declares it gone, and the
+// coordinator repairs the tree by re-attaching exactly its orphans.
+//
+// It is the scenario that distinguishes a KILL from a LEAVE at the control plane. A
+// departure is announced and removes the member immediately; nobody tells the
+// coordinator about a machine that vanished, so only the liveness timers notice — and
+// the mechanism that then removes it is the projection dropping a HealthGone node,
+// which is what makes the general builder move its subtree and nobody else.
+func TestGoneRelayIsRepairedOutOfTheTree(t *testing.T) {
+	sc := NewScenario(ScenarioConfig{Constraints: controlConstraints()})
+	for _, n := range controlFleet() {
+		sc.Net().Add(n)
+	}
+	rec, cap := NewRecorder(), NewCapture()
+	cfg := controlConfig(sc.Clock())
+	cfg.DegradedAfter, cfg.GoneAfter = degradedAfter, goneAfter
+	c := coordinator.New(slog.New(slog.NewTextHandler(io.Discard, nil)), cfg, cap, rec)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = c.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+	sc.AddBarrier("c", c.Sync)
+
+	loop := &realLoop{c: c, rec: rec, cap: cap}
+	sc.At(0, func() { joinAll(t, loop, sc.Net()) })
+	sc.At(100*time.Millisecond, func() { reportAll(t, loop, sc.Net(), sc.Reporters()) })
+
+	settled := coordinator.JoinSettle + 200*time.Millisecond
+	var before *overlay.Topology
+	sc.At(settled, func() {
+		ev, ok := loop.rec.Last(coordinator.EventTopology)
+		if !ok || ev.Topo == nil {
+			t.Fatalf("no first tree; kinds = %v", loop.rec.Kinds())
+		}
+		before = ev.Topo
+	})
+
+	// Everyone keeps beating except "s", the relay. Beats run past goneAfter and past
+	// the recompute cooldown so the repair is not merely being throttled.
+	for i := 1; i <= 12; i++ {
+		at := settled + time.Duration(i)*time.Second
+		seq := uint64(i)
+		sc.At(at, func() {
+			for _, n := range controlFleet() {
+				if n.Name == "s" {
+					continue // the vanished machine
+				}
+				loop.c.Heartbeat(testRoom, peerID(sc.Net(), n.Name), mustJSON(t, metrics.Heartbeat{
+					Name: n.Name, Seq: seq, Epoch: 1, Rev: 1,
+				}))
+			}
+		})
+	}
+
+	if err := sc.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if before == nil || !before.IsRelay("s") {
+		t.Fatalf("the fixture no longer makes s a relay; first tree = %v", before)
+	}
+	orphans := before.ChildrenOf("s")
+
+	t.Run("the vanished relay is declared gone", func(t *testing.T) {
+		var got string
+		for _, ev := range loop.rec.OfKind(coordinator.EventHealth) {
+			if ev.Node == "s" && ev.Health == coordinator.HealthGone {
+				got = string(ev.Health)
+			}
+		}
+		if got == "" {
+			t.Errorf("s never reached %q; only the liveness timers can notice a vanished machine", coordinator.HealthGone)
+		}
+	})
+
+	t.Run("failover names exactly the orphans", func(t *testing.T) {
+		ev, ok := loop.rec.Last(coordinator.EventFailover)
+		if !ok {
+			t.Fatalf("no failover event; kinds = %v", loop.rec.Kinds())
+		}
+		if ev.Node != "s" {
+			t.Errorf("failover named %q, want s", ev.Node)
+		}
+		want := append([]string(nil), orphans...)
+		sort.Strings(want)
+		if fmt.Sprint(ev.Orphans) != fmt.Sprint(want) {
+			t.Errorf("failover orphans = %v, want %v (exactly what s was carrying)", ev.Orphans, want)
+		}
+	})
+
+	t.Run("the repaired tree drops it and moves only its subtree", func(t *testing.T) {
+		ev, ok := loop.rec.Last(coordinator.EventTopology)
+		if !ok || ev.Topo == nil {
+			t.Fatal("no tree after the failover")
+		}
+		after := ev.Topo
+		if contains(after.Nodes(), "s") || after.Root == "s" {
+			t.Fatalf("the gone relay s is still in the tree %v; the projection did not drop it", after.Edges)
+		}
+		for _, o := range orphans {
+			if after.Depth(o) < 0 {
+				t.Errorf("orphan %q was not re-attached", o)
+			}
+		}
+		var nodes []overlay.Node
+		for _, n := range projectionOf(sc.Net()) {
+			if n.Name != "s" {
+				nodes = append(nodes, n)
+			}
+		}
+		cons := controlConstraints()
+		cons.Root, cons.Epoch, cons.Rev = after.Root, after.Epoch, after.Rev
+		if verr := validateTopology(after, nodes, cons); verr != nil {
+			t.Fatalf("the repaired tree fails Validate: %v", verr)
+		}
+		if rerr := validateRepair(before, after, nodes, cons, overlay.Churn{Gone: []string{"s"}}); rerr != nil {
+			t.Errorf("the repair moved more than one departure justifies: %v", rerr)
+		}
+	})
 }
