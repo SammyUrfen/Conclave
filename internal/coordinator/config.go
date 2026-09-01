@@ -107,6 +107,18 @@ const MaxStrandedRepairs = 3
 // variable whose address is being taken for reasons the reader has to reconstruct.
 func Stickiness(ms float64) *float64 { return &ms }
 
+// ReasonEdgeCorroborated is the Event.Reason on a reparent report the coordinator has
+// declined to treat as a stranding, because it holds INDEPENDENT evidence that the edge
+// is up: the peer's parent reports it as a connected child, and that parent's own
+// upstream is intact.
+//
+// It exists because a peer's "I could not confirm" is evidence about the PEER's ability
+// to observe, not necessarily about the EDGE. A pure source — one that publishes and
+// subscribes to nothing — can never see a track arrive on its upstream leg, so it can
+// never ratify however well that leg is working. Believing its self-assessment over its
+// parent's direct observation is how a working stream gets torn down.
+const ReasonEdgeCorroborated = "peer could not confirm the edge, but its parent reports it connected with an intact upstream"
+
 // ReasonUnratifiable is the Event.Reason on the EventUnbuildable that reports a repair
 // loop giving up: the coordinator believes its tree is correct and the peer cannot
 // confirm it.

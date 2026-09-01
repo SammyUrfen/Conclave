@@ -99,7 +99,7 @@ func (c *Coordinator) snapshotOf(roomID string) RoomSnapshot {
 			Report:        ns.report,
 			Reported:      ns.reported,
 			Parent:        ns.realParent,
-			Children:      append([]string(nil), ns.realChildren...),
+			Children:      childNames(ns.realChildren),
 			StaleRejected: ns.staleRejected,
 			LastBeatSeq:   ns.beatSeq,
 			LastBeatAt:    ns.lastBeatAt,
@@ -131,5 +131,16 @@ func copyTopology(t *overlay.Topology) *overlay.Topology {
 	out := &overlay.Topology{Epoch: t.Epoch, Rev: t.Rev, Root: t.Root}
 	out.Edges = append([]overlay.Edge(nil), t.Edges...)
 	out.Backups = append([]overlay.Backup(nil), t.Backups...)
+	return out
+}
+
+// childNames projects the realized child links onto the names §8.1 froze for
+// MemberSnapshot.Children. The per-edge state is kept internally — it is what makes a
+// parent's report EVIDENCE rather than intent — but the snapshot's shape is contract.
+func childNames(links []metrics.ChildLink) []string {
+	out := make([]string, 0, len(links))
+	for _, ch := range links {
+		out = append(out, ch.Name)
+	}
 	return out
 }

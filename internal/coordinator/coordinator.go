@@ -231,9 +231,16 @@ type nodeState struct {
 	// queue for this peer. It is what lets a peer that missed a push — a reconnect
 	// under an unchanged tree, or a drop on a full queue — be caught up without
 	// republishing a tree everyone else already holds.
-	pushedRev    uint64
-	realParent   string
-	realChildren []string
+	pushedRev  uint64
+	realParent string
+	// realChildren keeps the per-edge STATE, not just the names: a parent listing a
+	// child is its intent, and only the state makes it evidence (see corroborates).
+	// The snapshot projects names out of it, which is what §8.1 froze.
+	realChildren []metrics.ChildLink
+	// realParentState is the pion state of this peer's own upstream edge. It is what
+	// separates a relay that is merely PRESENT from one that is actually attached, and
+	// therefore what keeps corroboration from re-admitting the correlated-failure case.
+	realParentState string
 }
 
 // event kinds funnelled to the Run goroutine.
@@ -1108,10 +1115,8 @@ func (c *Coordinator) onBeat(roomID, peerID string, hb metrics.Heartbeat, stale 
 	ns.beatSeq = hb.Seq
 	ns.lastBeatAt = ns.lastSeen
 	ns.realParent = hb.Parent
-	ns.realChildren = ns.realChildren[:0]
-	for _, ch := range hb.Children {
-		ns.realChildren = append(ns.realChildren, ch.Name)
-	}
+	ns.realParentState = hb.ParentState
+	ns.realChildren = append(ns.realChildren[:0], hb.Children...)
 	c.trackStale(rs, ns, hb, stale)
 	// A peer that reports a CONNECTED upstream edge has attached, which ends the
 	// stranding episode and restores its full repair budget. Ground truth from the
@@ -1197,6 +1202,22 @@ func (c *Coordinator) onReparented(roomID, peerID string, rp metrics.Reparented)
 // Ordinary threshold events still recompute afterwards — the meet is not abandoned, only
 // the fast path for this one peer.
 func (c *Coordinator) onStranded(rs *roomState, ns *nodeState, rp metrics.Reparented) {
+	if by, ok := c.corroborates(rs, ns.name); ok {
+		// The peer cannot confirm this edge; its parent can, and does. The parent's
+		// direct observation is the better evidence — it is, because the peer may be
+		// structurally unable to see the thing it was asked to report.
+		c.log.Info("peer could not confirm its edge, but its parent reports it connected",
+			slog.String("room_id", rs.id), slog.String("name", ns.name),
+			slog.String("corroborated_by", by), slog.String("reason", rp.Reason))
+		ns.strandedRepairs = 0
+		c.publish(rs, Event{Kind: EventReparent, Node: ns.name, NodeID: ns.id,
+			Parent: by, PrevParent: rp.From, Reason: ReasonEdgeCorroborated})
+		// Still a threshold event (§5.4 row 6), so the round runs — but WITHOUT the
+		// urgent bypass and without spending the repair budget, because there is
+		// nothing here to repair.
+		c.recompute(rs, "peer reported an edge its parent corroborates")
+		return
+	}
 	exhausted := ns.strandedRepairs >= MaxStrandedRepairs
 	if exhausted {
 		// Already reported. Re-warning once per beat is how a real signal becomes the
@@ -1234,6 +1255,57 @@ func (c *Coordinator) onStranded(rs *roomState, ns *nodeState, rp metrics.Repare
 		c.publish(rs, Event{Kind: EventUnbuildable, Node: ns.name, NodeID: ns.id,
 			Outcome: OutcomeUnbuildable, Reason: ReasonUnratifiable})
 	}
+}
+
+// corroborates reports whether some member independently vouches for name's upstream
+// edge, and which one.
+//
+// The evidence is a parent's own heartbeat listing name as a CONNECTED child. That is
+// third-party and direction-agnostic: it holds for a peer that only SENDS just as well
+// as for one that receives, which is exactly what an arriving-track check cannot do.
+//
+// The second clause is what keeps §5.6 step 4's property intact, and it is not optional.
+// A relay orphaned by a correlated failure ALSO reports its children as connected — its
+// PeerConnections to them are fine; it simply has nothing to forward. Corroborating on
+// the child edge alone would re-admit precisely the case the media requirement exists to
+// reject, and stickiness would then defend an edge carrying nothing. So the corroborator
+// must itself be attached: either it is the root, which has no upstream and is not
+// thereby orphaned, or its own parent edge is connected.
+//
+// It deliberately does not consult the published tree for the parent's identity. A peer
+// that self-promoted is attached to its backup, not to the tree's assignment, so the
+// question is "does anyone hold this edge", not "does the node we planned for hold it".
+func (c *Coordinator) corroborates(rs *roomState, name string) (string, bool) {
+	if name == "" {
+		return "", false
+	}
+	for _, id := range c.sortedPeerIDs(rs) {
+		p := rs.nodes[id]
+		if p.name == "" || p.name == name || p.health == HealthGone {
+			continue
+		}
+		if !hasConnectedChild(p, name) {
+			continue
+		}
+		if rs.published != nil && rs.published.Root == p.name {
+			return p.name, true // the root has no upstream to be missing
+		}
+		if p.realParent != "" && p.realParentState == "connected" {
+			return p.name, true
+		}
+	}
+	return "", false
+}
+
+// hasConnectedChild reports whether p's last heartbeat named child as CONNECTED. Listing
+// a child is intent; the state is what makes it evidence.
+func hasConnectedChild(p *nodeState, child string) bool {
+	for _, ch := range p.realChildren {
+		if ch.Name == child {
+			return ch.State == "connected"
+		}
+	}
+	return false
 }
 
 func (c *Coordinator) onRoster(roomID string, members []Member) {
