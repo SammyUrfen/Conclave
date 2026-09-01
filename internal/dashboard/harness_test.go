@@ -207,9 +207,66 @@ func testOrigins(t *testing.T) policy.Origins {
 	return o
 }
 
+// logCapture records every slog record a Server emits, so a test can assert the LEVEL
+// something was logged at. Level is the whole contract here: an expected client
+// disconnect and a genuine snapshot failure differ in nothing an assertion on behaviour
+// can see, and the reason the split matters is that a routine disconnect logged at Error
+// makes an operator read normal traffic as faults.
+type logCapture struct {
+	mu   sync.Mutex
+	recs []capturedRecord
+}
+
+type capturedRecord struct {
+	level slog.Level
+	msg   string
+}
+
+func (c *logCapture) Enabled(context.Context, slog.Level) bool { return true }
+func (c *logCapture) WithAttrs([]slog.Attr) slog.Handler       { return c }
+func (c *logCapture) WithGroup(string) slog.Handler            { return c }
+
+func (c *logCapture) Handle(_ context.Context, r slog.Record) error {
+	c.mu.Lock()
+	c.recs = append(c.recs, capturedRecord{level: r.Level, msg: r.Message})
+	c.mu.Unlock()
+	return nil
+}
+
+// at returns the messages logged at exactly the given level.
+func (c *logCapture) at(level slog.Level) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []string
+	for _, r := range c.recs {
+		if r.level == level {
+			out = append(out, r.msg)
+		}
+	}
+	return out
+}
+
+// has reports whether any message at the given level contains substr.
+func (c *logCapture) has(level slog.Level, substr string) bool {
+	for _, m := range c.at(level) {
+		if strings.Contains(m, substr) {
+			return true
+		}
+	}
+	return false
+}
+
 // newTestServer builds a Server over the given seams and returns it with a live
 // httptest server in front of its Handler.
 func newTestServer(t *testing.T, cfg Config) (*Server, *httptest.Server) {
+	t.Helper()
+	s, ts, _ := newTestServerLogged(t, cfg, slog.DiscardHandler)
+	return s, ts
+}
+
+// newTestServerLogged is newTestServer with the logger injected, for the tests that
+// assert on log level.
+func newTestServerLogged(t *testing.T, cfg Config, h slog.Handler) (*Server, *httptest.Server, *logCapture) {
 	t.Helper()
 	if cfg.Clock == nil {
 		cfg.Clock = newFixedClock()
@@ -223,7 +280,8 @@ func newTestServer(t *testing.T, cfg Config) (*Server, *httptest.Server) {
 	if cfg.Origins == nil {
 		cfg.Origins = testOrigins(t)
 	}
-	s, err := New(slog.New(slog.DiscardHandler), cfg)
+	cap, _ := h.(*logCapture)
+	s, err := New(slog.New(h), cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -232,7 +290,7 @@ func newTestServer(t *testing.T, cfg Config) (*Server, *httptest.Server) {
 		s.Close()
 		ts.Close()
 	})
-	return s, ts
+	return s, ts, cap
 }
 
 // doJSON issues one request and decodes the body into a generic map, returning the

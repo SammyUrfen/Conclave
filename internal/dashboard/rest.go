@@ -69,6 +69,14 @@ func (s *Server) listBodyCached(ctx context.Context) (listBody, error) {
 		body, err := s.readList(ctx)
 
 		s.mu.Lock()
+		if clientGone(err) {
+			// Same rule as snapshotBody: one caller's cancellation must not become
+			// every caller's error for the next snapshotMinInterval.
+			s.listLoading = nil
+			s.mu.Unlock()
+			close(done)
+			return listBody{}, err
+		}
 		s.list, s.listErr, s.listAt, s.listValid = body, err, s.clk.Now(), true
 		s.listLoading = nil
 		s.mu.Unlock()

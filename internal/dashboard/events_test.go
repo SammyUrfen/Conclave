@@ -3,7 +3,9 @@ package dashboard
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
@@ -941,4 +943,147 @@ func waitFor(t *testing.T, cond func() bool, what string) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+// TestDisconnectDuringSnapshotIsNotAnError pins BOTH directions of the expected-versus-
+// genuine split, because a one-sided test of this passes just as well against a blanket
+// downgrade — which would hide every real snapshot fault instead of the noise.
+//
+// The context a snapshot read runs under is the CONNECTION's, so a client that closes
+// mid-read makes it return context.Canceled. That is the ordinary end of a connection,
+// not a fault: logging it at Error and synthesising an internal-error close code makes
+// routine traffic read as a fault list, which is exactly the confusion that made a dozen
+// harmless errors look like a dozen defects earlier in this build.
+func TestDisconnectDuringSnapshotIsNotAnError(t *testing.T) {
+	t.Run("client vanishes mid-read: expected", func(t *testing.T) {
+		sub := &fakeSubnet{block: make(chan struct{})}
+		sub.set(sampleSnapshot())
+		cap := &logCapture{}
+		_, ts, _ := newTestServerLogged(t, Config{
+			Meets:  &fakeMeets{live: []arbiter.Meet{sampleMeet()}},
+			Subnet: sub,
+		}, cap)
+
+		conn := dialEvents(t, ts.URL, "standup", "")
+		// Park the writer inside Snapshot, then cut the client off underneath it.
+		waitFor(t, func() bool {
+			sub.mu.Lock()
+			defer sub.mu.Unlock()
+			return sub.calls > 0
+		}, "the writer to reach Snapshot")
+		conn.CloseNow()
+
+		waitFor(t, func() bool {
+			return cap.has(slog.LevelDebug, "client disconnected")
+		}, "the disconnect to be logged at Debug")
+		if msgs := cap.at(slog.LevelError); len(msgs) != 0 {
+			t.Errorf("a routine disconnect logged at Error: %v", msgs)
+		}
+		close(sub.block)
+	})
+
+	t.Run("the seam genuinely fails: still an error and still 1011", func(t *testing.T) {
+		sub := &fakeSubnet{err: errors.New("the coordinator exploded")}
+		cap := &logCapture{}
+		_, ts, _ := newTestServerLogged(t, Config{
+			Meets:  &fakeMeets{live: []arbiter.Meet{sampleMeet()}},
+			Subnet: sub,
+		}, cap)
+
+		conn := dialEvents(t, ts.URL, "standup", "")
+		if got := readUntilClose(t, conn); got != websocket.StatusInternalError {
+			t.Errorf("close status = %d, want 1011 for a real fault", got)
+		}
+		if !cap.has(slog.LevelError, "snapshot") {
+			t.Errorf("a genuine snapshot failure was not logged at Error: %v", cap.at(slog.LevelError))
+		}
+		if cap.has(slog.LevelDebug, "client disconnected") {
+			t.Errorf("a real fault was misreported as a client disconnect — the split has " +
+				"drifted into a blanket downgrade")
+		}
+	})
+}
+
+// TestCancelledReadIsNotCached is the other half of the same defect. snapshotBody caches
+// its result for snapshotMinInterval to bound control-plane load, and it cached ERRORS
+// too so that a flood for a missing meet stays bounded. A context cancellation is not
+// that kind of error: it belongs to ONE caller, and caching it would serve a spurious
+// failure to every other client of that meet — including the REST endpoint — for the
+// next quarter second, because one unrelated browser tab closed.
+func TestCancelledReadIsNotCached(t *testing.T) {
+	sub := &fakeSubnet{block: make(chan struct{})}
+	sub.set(sampleSnapshot())
+	_, ts := newTestServer(t, Config{
+		Meets:  &fakeMeets{live: []arbiter.Meet{sampleMeet()}},
+		Subnet: sub,
+	})
+
+	// Caller A enters the read and is cancelled inside it.
+	ctx, cancel := context.WithCancel(context.Background())
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/api/meets/standup", nil)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if res, err := http.DefaultClient.Do(req); err == nil {
+			res.Body.Close()
+		}
+	}()
+	waitFor(t, func() bool {
+		sub.mu.Lock()
+		defer sub.mu.Unlock()
+		return sub.calls > 0
+	}, "caller A to reach Snapshot")
+	cancel()
+	<-done
+
+	// Caller B, immediately after and well inside snapshotMinInterval, must get a real
+	// answer rather than A's cancellation.
+	sub.mu.Lock()
+	sub.block = nil
+	sub.mu.Unlock()
+	res, body := doJSON(t, ts, http.MethodGet, "/api/meets/standup", "", nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 — a second caller inherited the first caller's "+
+			"cancellation from the cache (body %v)", res.StatusCode, body)
+	}
+	if body["id"] != "standup" {
+		t.Errorf("body = %v", body)
+	}
+}
+
+// TestRESTDisconnectIsNotAnError pins the same split on the REST surface, which reaches
+// the identical seam with the identical cancellable context: a client that aborts a
+// request mid-read must not produce a server Error line.
+func TestRESTDisconnectIsNotAnError(t *testing.T) {
+	sub := &fakeSubnet{block: make(chan struct{})}
+	sub.set(sampleSnapshot())
+	cap := &logCapture{}
+	_, ts, _ := newTestServerLogged(t, Config{
+		Meets:  &fakeMeets{live: []arbiter.Meet{sampleMeet()}},
+		Subnet: sub,
+	}, cap)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/api/meets/standup", nil)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if res, err := http.DefaultClient.Do(req); err == nil {
+			res.Body.Close()
+		}
+	}()
+	waitFor(t, func() bool {
+		sub.mu.Lock()
+		defer sub.mu.Unlock()
+		return sub.calls > 0
+	}, "the handler to reach Snapshot")
+	cancel()
+	<-done
+
+	waitFor(t, func() bool { return cap.has(slog.LevelDebug, "client disconnected") },
+		"the aborted request to be logged at Debug")
+	if msgs := cap.at(slog.LevelError); len(msgs) != 0 {
+		t.Errorf("an aborted request logged at Error: %v", msgs)
+	}
+	close(sub.block)
 }
