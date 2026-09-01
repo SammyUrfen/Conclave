@@ -23,9 +23,12 @@ import (
 // the mechanism, this owns the choices.
 type RouterConfig struct {
 	ICEServers []webrtc.ICEServer
-	SendMedia  bool   // add an outbound video track toward each peer
-	MediaPath  string // IVF file to send; empty ⇒ synthetic frames
-	RecordPath string // write the first received track here; empty ⇒ just count
+	// MediaPortRange confines every session's ICE gathering to these UDP ports.
+	// Zero ⇒ ephemeral. See SessionConfig.MediaPortRange for why it exists.
+	MediaPortRange [2]uint16
+	SendMedia      bool   // add an outbound video track toward each peer
+	MediaPath      string // IVF file to send; empty ⇒ synthetic frames
+	RecordPath     string // write the first received track here; empty ⇒ just count
 
 	// Topology, when non-nil, switches the Router from full mesh to tree mode: a
 	// peer opens a session only to its topology neighbours (not to every other
@@ -788,14 +791,15 @@ func (r *Router) startPeerOpt(ctx context.Context, peerID string, opts peerOpts)
 	}
 
 	session, err := NewSession(SessionConfig{
-		Log:        r.log,
-		SelfID:     selfID,
-		PeerID:     peerID,
-		Transport:  tr,
-		ICEServers: r.cfg.ICEServers,
-		Offerer:    offererOverride,
-		Clock:      r.clk,
-		Spawn:      r.spawnTracked,
+		Log:            r.log,
+		SelfID:         selfID,
+		PeerID:         peerID,
+		Transport:      tr,
+		ICEServers:     r.cfg.ICEServers,
+		MediaPortRange: r.cfg.MediaPortRange,
+		Offerer:        offererOverride,
+		Clock:          r.clk,
+		Spawn:          r.spawnTracked,
 		OnNegotiationFailed: func() {
 			r.postEvent(routerEvent{kind: evNegotiationFailed, peerName: name})
 		},
