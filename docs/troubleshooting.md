@@ -57,17 +57,17 @@ Three habits answer most questions faster than this document:
   ```
   This loses the race detector. Treat it as a stopgap, not the default — re-enable `-race` (i.e. go back to `make test`) before trusting any concurrency change.
 
-### `go test ./...` fails in `internal/media` but `make test` is green
+### `go test ./...` and `make test` disagree about a media test
 
-- **Symptom:** plain `go test ./...` reports
-  ```
-  --- FAIL: TestPionRemoveTrackDoesNotRenegotiate (0.21s)
-      pionbehavior_test.go:85: pion NOT to fire negotiation-needed for a removal stopped holding
-  ```
-  while `make test` (`go test -race ./...`) passes every package.
-- **Cause:** that test pins a *pion* behaviour inside a real-time window — pion must **not** fire negotiation-needed within 500 ms of a `RemoveTrack`. Race instrumentation slows the binary enough to change which side of that window pion's ops goroutine lands on. It is reproducible in both directions on this machine: 5/5 failures without `-race`, 3/3 passes with it. It is **not** version drift — `pion/webrtc/v4` is `v4.2.16`, exactly the version the finding was measured against.
-- **Fix:** use `make test` / `make check`. **The gate the project defines is `-race`**, and CI runs the same thing. Do not "fix" the test by loosening its window — if this pin ever fails *under `-race`*, the correct response is to delete `pendingLocalChange` (pion started renegotiating removals on its own), not to relax the assertion.
-- **Why it lives outside the determinism gate:** `internal/media` is deliberately excluded from `make check-determinism` because it runs real pion, real ICE and real DTLS. This is exactly the class of wall-clock-dependent test the control-plane rules exist to keep out of the control plane.
+- **Symptom:** a test in `internal/media` passes under one invocation and fails under the other.
+- **This is not currently reproducible** — both invocations are green today, 13/13 packages each way — but it happened once and the diagnosis is worth keeping, because the shape recurs.
+- **Cause: `-race` is a ~5× time dilation on this package** (`internal/media` runs real pion, ICE and DTLS: ~16 s plain, ~82 s instrumented). Any test whose subject is a race between our goroutine and pion's dispatch goroutine is therefore *measuring a different system* under `-race`. In the case that occurred, the instrumented run was so slow that DTLS never completed inside the test's window, so `-race` was silently acting as a proxy for "the `PeerConnection` is not connected yet" — the real determining variable, and the inverse of production.
+- **Fix — the order of operations matters:**
+  1. **Do not widen the window and do not mark the package race-only.** Both make the symptom go away while preserving whatever false belief produced it.
+  2. Ask *what the test is actually measuring*, and vary the state you suspect — not the invocation.
+  3. Anchor the test on an observable **state** (wait for `connected`) rather than on a duration that stands in for it. That is what makes a pin invocation-independent.
+- **The rule to remember:** *a test that disagrees across invocations is not flaky — it is reporting that the invocation is an input.* `DESIGN.md` §7.2 tells the full story; `docs/testing.md` §5 carries the testing lesson.
+- **Related:** `internal/media` is deliberately outside `make check-determinism` precisely because it must run on real time. A *control-plane* package with a timing window would fail this way with none of the visibility — which is what the gate exists to prevent.
 
 ### `make check-determinism` fails
 
