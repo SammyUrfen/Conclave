@@ -650,8 +650,8 @@ func (r *Router) addLegLive(l leg) bool {
 	}
 	track, sender, err := session.AddForwardTrack(forwardTrackPrefix+l.src, "conclave")
 	if err != nil {
-		r.log.Error("add forward track mid-call",
-			slog.String("source", l.src), slog.String("child", l.child), slog.Any("error", err))
+		logPionError(r.log, "add forward track mid-call", err,
+			slog.String("source", l.src), slog.String("child", l.child))
 		return false
 	}
 	r.fwd.addOutLive(l.src, l.child, track, sender)
@@ -880,8 +880,8 @@ func (r *Router) setupRelayEdge(session *Session, topo *overlay.Topology, peerNa
 	for _, l := range legsToward(topo, r.selfName, peerName) {
 		fwdTrack, sender, err := session.AddForwardTrack(forwardTrackPrefix+l.src, "conclave")
 		if err != nil {
-			r.log.Error("add forward track",
-				slog.String("source", l.src), slog.String("child", peerName), slog.Any("error", err))
+			logPionError(r.log, "add forward track", err,
+				slog.String("source", l.src), slog.String("child", peerName))
 			continue
 		}
 		r.fwd.addOut(l.src, peerName, fwdTrack, sender)

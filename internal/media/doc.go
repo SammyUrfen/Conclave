@@ -68,6 +68,13 @@
 // carries the membership, metrics, heartbeat and reparent frames it needs to do it.
 // Both run on the Run goroutine, so a host queues and returns.
 //
+// Ratifying a re-parent needs evidence that the new edge carries media, but a peer
+// that subscribes to nothing has no such evidence to offer and never will — for it,
+// connecting IS the whole observable outcome. And a move that cannot be VERIFIED is
+// not a move that failed: the leg stays up and the report says "unverified", because
+// destroying a live path on an unobservable condition guarantees the outage it was
+// trying to avoid.
+//
 // The Router also reports its REALIZED overlay position (Realized) — the parent it
 // is actually attached to and the children it is actually serving, in topology
 // names — which is the ground truth a newly promoted coordinator rebuilds the

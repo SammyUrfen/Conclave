@@ -183,6 +183,28 @@ func (r *Router) onPeerState(ctx context.Context, name string, st webrtc.PeerCon
 			r.fwd.keyframeForChild(name)
 		}
 		if r.rp != nil && r.rp.phase == rpOpening && r.rp.newParent == name {
+			// §5.6 step 4 wants an ARRIVING track before ratifying, and for a peer
+			// that subscribes to nothing that is not an unmet condition but an
+			// UNDEFINED one: no track will ever arrive over this edge however healthy
+			// it is. Waiting can then only ever time out, and the timeout used to
+			// tear down the very leg the peer was successfully sending on.
+			//
+			// Only the peer can know this — the coordinator has no field that says
+			// "I receive nothing" — and it reads it off the tree: the set of origins
+			// that reach us through this neighbour. Empty means there is nothing to
+			// wait for, and the evidence that the move worked is that our own
+			// outbound sender is live on the new leg.
+			//
+			// This does NOT weaken the rule for anyone who does expect media. A relay
+			// orphaned by a correlated failure has healthy PeerConnections and nothing
+			// to forward, which is exactly the case step 4 exists to reject — it
+			// expects media, so it still waits for it.
+			if !r.expectsMediaFrom(name) {
+				r.log.Info("re-parent needs no media evidence; this peer receives nothing over the edge",
+					slog.String("new_parent", name))
+				r.commitReparent(true, "no media expected over this edge")
+				return
+			}
 			r.rp.phase = rpAwaitingMedia
 			r.hookReparent("connected", r.rp.oldParent)
 			r.armDeadline(r.rpCtx, ReparentMediaTimeout,
@@ -216,7 +238,7 @@ func (r *Router) onPeerTrack(name string) {
 	if r.rp == nil || r.rp.phase != rpAwaitingMedia || r.rp.newParent != name {
 		return
 	}
-	r.commitReparent()
+	r.commitReparent(true, "media arrived over the new edge")
 }
 
 // isParentEdge reports whether name is the peer we currently take media from. All
@@ -326,7 +348,7 @@ func (r *Router) startReparent(ctx context.Context, oldParent, newParent string,
 // they always were; only the upstream feeding them changes, and rtpRewriter keeps
 // each one's RTP series continuous across the splice. That is what keeps a
 // re-parent local to one hop instead of cascading down the whole subtree.
-func (r *Router) commitReparent() {
+func (r *Router) commitReparent(verified bool, reason string) {
 	rp := r.rp
 	r.hookReparent("committing", rp.oldParent)
 
@@ -347,9 +369,28 @@ func (r *Router) commitReparent() {
 	r.log.Info("re-parent complete",
 		slog.String("old_parent", rp.oldParent), slog.String("new_parent", rp.newParent))
 	r.hookReparent("committed", rp.oldParent)
-	if rp.viaBackup {
-		r.reportReparent(rp.oldParent, rp.newParent, true, "backup parent promoted")
+	switch {
+	case !verified:
+		// Attached but unverified. The report says so — the coordinator corroborates
+		// from the parent's heartbeat rather than abandoning us — while the leg
+		// itself stays up, because "I cannot confirm this works" is not "this does
+		// not work".
+		r.reportReparent(rp.oldParent, rp.newParent, false, reason)
+	case rp.viaBackup:
+		r.reportReparent(rp.oldParent, rp.newParent, true, reason)
 	}
+}
+
+// expectsMediaFrom reports whether anything is supposed to reach us THROUGH this
+// neighbour under the tree in force. It is the peer-local answer to "do I subscribe
+// to anything here", and it is empty for a pure source: every other node on that
+// side of the cut is a relay, and a relay publishes no media of its own.
+func (r *Router) expectsMediaFrom(name string) bool {
+	topo := r.currentTopo()
+	if topo == nil {
+		return true // unknown tree: fall back to demanding evidence
+	}
+	return len(sourcesFrom(topo, r.selfName, name)) > 0
 }
 
 // reparentFailed is the abandon path. It tries the precomputed backup ONCE, and
@@ -360,10 +401,28 @@ func (r *Router) reparentFailed(ctx context.Context, reason string) {
 	rp := r.rp
 	r.log.Warn("re-parent failed",
 		slog.String("new_parent", rp.newParent), slog.String("reason", reason))
-	r.hookReparent("abandoning", rp.oldParent)
 
-	// The half-open session to the failed target must go, or it lingers as a peer
-	// that is in nobody's topology.
+	// The two timeouts are NOT the same failure, and treating them alike is what
+	// turned an unverifiable move into a real outage.
+	//
+	// Reaching awaiting-media means the new parent CONNECTED and only the evidence
+	// is missing. That leg is a live transport path — very possibly the one carrying
+	// this peer's own outbound media — and destroying it converts "I cannot confirm
+	// this works" into "this definitely does not work", guaranteeing the gap it was
+	// trying to avoid. So the move is committed and reported honestly as unverified;
+	// the coordinator corroborates it from the parent's heartbeat, and repairs it if
+	// nobody can.
+	//
+	// Still in `opening` means it never connected. There is no working leg to
+	// protect, and leaving the half-open session behind would strand a peer that is
+	// in nobody's topology — so that one is torn down as before.
+	if rp.phase == rpAwaitingMedia {
+		r.hookReparent("unverified", rp.oldParent)
+		r.commitReparent(false, reason)
+		return
+	}
+
+	r.hookReparent("abandoning", rp.oldParent)
 	r.stopPeerByName(rp.newParent)
 
 	backup := r.backupParent()

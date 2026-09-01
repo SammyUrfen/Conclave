@@ -17,6 +17,26 @@ import (
 	"github.com/SammyUrfen/conclave/internal/signaling"
 )
 
+// logPionError records a pion failure at the level its OUTCOME deserves.
+//
+// Tearing a session down while a topology apply is in flight makes pion return
+// ErrConnectionClosed from whatever was mid-flight — an AddTrack on a pc that has
+// just closed, a SetRemoteDescription for an offer that arrived a moment too late.
+// That is the expected result of a race the design deliberately allows, not a fault,
+// and logging it at ERROR made one ordinary migration read as dozens of them. A log
+// level that cries wolf costs real debugging time later.
+//
+// Everything else stays at ERROR. This is a level fix for one known-benign outcome,
+// not a blanket downgrade.
+func logPionError(log *slog.Logger, msg string, err error, attrs ...any) {
+	attrs = append(attrs, slog.Any("error", err))
+	if errors.Is(err, webrtc.ErrConnectionClosed) {
+		log.Debug(msg+" (session already closed)", attrs...)
+		return
+	}
+	log.Error(msg, attrs...)
+}
+
 // NegotiationRetryDelay is how long a Session waits before re-attempting a
 // negotiation that failed. 250ms is long enough for a transient pion state to
 // settle and short enough that a human does not perceive the extra wait on top of
@@ -657,7 +677,7 @@ func (s *Session) onRemoteDescription(msg signaling.Message) {
 		s.mu.Unlock()
 
 		if err := s.pc.SetRemoteDescription(desc); err != nil {
-			s.log.Error("set remote description (answer)", slog.Any("error", err))
+			logPionError(s.log, "set remote description (answer)", err)
 			return
 		}
 		s.flushPending()
@@ -695,7 +715,7 @@ func (s *Session) onRemoteDescription(msg signaling.Message) {
 // in both directions.
 func (s *Session) answerOffer(desc webrtc.SessionDescription) {
 	if err := s.pc.SetRemoteDescription(desc); err != nil {
-		s.log.Error("set remote description (offer)", slog.Any("error", err))
+		logPionError(s.log, "set remote description (offer)", err)
 		return
 	}
 	s.flushPending()
