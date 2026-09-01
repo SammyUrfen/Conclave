@@ -1,6 +1,6 @@
 # PLAN.md — the Phase 5–6 architecture contract
 
-> **Status: v2, FROZEN**, 2026-09-01. v1 was frozen the same day, reviewed adversarially by
+> **Status: v2.1, FROZEN**, 2026-09-01. v1 was frozen the same day, reviewed adversarially by
 > two independent reviewers (12 critical + ~15 major findings), and amended in place. **§15 is
 > the amendment log — read it first if you built against v1**, because several frozen names
 > changed. v2 also reconciles the document with what WI-0 actually shipped; where the shipped
@@ -497,12 +497,23 @@ func BuildTree(nodes []Node, prev *Topology, c Constraints) (*Topology, error)
 sorted every node by upload-desc, so a strong joiner claimed capacity ahead of incumbents
 and could re-parent the world. The new order is:
 
-1. **Incumbents first**, in `prev.Edges` order (which §3.1 guarantees is topological, so
+0. **The FORMER ROOT first, if it is being demoted** (SHIPPED, WI-1). A node that is
+   `prev.Root` appears in `prev.Edges` only as a *Parent*, never as a Child — so a plain
+   replay of `prev.Edges` never visits it. If the new root differs and the old root is still
+   present, it needs a parent like anyone else, and placing it with the newcomers is
+   actively harmful: its former children ARE in `prev.Edges` and get processed while their
+   incumbent parent is not yet attached, so rank 1 finds `P` unattached, incumbency fails,
+   and **the whole former-root subtree scatters** — the opposite of local repair, triggered
+   by the single most disruptive event there is. Process it first, at the position
+   `prev.Edges` implicitly gives it. (If the old root is also the new root it is seeded at
+   depth 0 and this step is a no-op.)
+1. **Then incumbents**, in `prev.Edges` order (which §3.1 guarantees is topological, so
    parents are placed before their children — this is why that invariant is load-bearing
    and not decoration). Skip any incumbent not present in `nodes`.
 2. **Then newcomers** — nodes in `nodes` with no entry in `prev` — sorted upload
    descending, then name ascending.
-3. With `prev == nil`, step 1 is empty and this degenerates exactly to Phase 4's order.
+3. With `prev == nil`, steps 0 and 1 are empty and this degenerates exactly to Phase 4's
+   order.
 
 Consequence: a strong newcomer can no longer displace an incumbent's claim on a parent's
 capacity, because the capacity was already spent when the incumbent was placed. It can
@@ -576,7 +587,7 @@ strengthened the brief; it is flagged in §12.**
 |---:|---|---|
 | 0 | Hard: `B != u`, `B != P`, `B ∉ Subtree(P)`, `!B.Impaired`, `capacityOf(B, c) > 0`. | must be a legal, healthy parent that survives P's loss |
 | 0b | **Hard depth bound on the WHOLE moving subtree:** `Depth(B) + 1 + Height(u) ≤ c.MaxDepth`. | promoting `u` moves `u` *and everything under it*. `Depth(B) < MaxDepth` only bounds `u`; a relay with children promoted one level deeper pushes its own children past the bound. This was a preference (old rank 2) and had to become a hard filter. |
-| 0c | **Hard fan-in bound:** `children[B] + backupLoad[B] < capacityOf(B, c) + BackupOvershoot`, where `backupLoad[B]` counts backups already assigned to `B` in this pass. | see below |
+| 0c | **Hard fan-in bound:** `children[B] + backupLoad[B] < capacityOf(B, c) + BackupOvershootAllowance`, where `backupLoad[B]` counts backups already assigned to `B` in this pass. | see below |
 | 1 | `children[B] < capacityOf(B, c)` — **has spare capacity** — preferred over one that does not. | a failover into spare capacity is non-disruptive |
 | 2 | `Depth(B) ≤ Depth(P)` — **no deeper than the parent it replaces** — preferred. | quality: keeps the tree shallow even when 0b would permit deeper |
 | 3 | Minimum `rtt(u, B)`. | the failover target should also be a good parent |
@@ -595,7 +606,7 @@ child" — it is the size of the failed subtree, exactly when the surviving rela
 able to absorb it. Rank 0c fixes it by spending a budget across backup assignment:
 
 ```go
-// BackupOvershoot is how many backup assignments a node may hold BEYOND its computed child
+// BackupOvershootAllowance is how many backup assignments a node may hold BEYOND its computed child
 // capacity. 1, so a correlated failure can push any single relay at most one child past its
 // budget — which is what makes the "transient one-child overshoot" claim in §13 TRUE rather
 // than aspirational.
@@ -605,11 +616,11 @@ able to absorb it. Rank 0c fixes it by spending a budget across backup assignmen
 // The cost is that in a tight fleet some nodes get no backup at all, which is correct and
 // visible — a backup that would oversubscribe its target by four is not insurance, it is a
 // second outage with extra steps.
-const BackupOvershoot = 1
+const BackupOvershootAllowance = 1
 ```
 
 The consequence is now honest and genuinely bounded: **at the instant of a failover a relay
-may serve at most `BackupOvershoot` children more than its computed capacity**, until the
+may serve at most `BackupOvershootAllowance` children more than its computed capacity**, until the
 coordinator's recompute lands. That overshoot exists only in a peer's *realized* state — it
 is never encoded in a `Topology`, so `Validate` still holds for everything this package
 produces. Nodes for which rank 0c admits no candidate get **no backup**, and the dashboard
@@ -640,7 +651,7 @@ and gains:
 5. **The backup invariant**: `Backup.Parent ∉ Subtree(ParentOf(Backup.Node))`.
 6. **Backup legality**: `capacityOf(Backup.Parent, c) > 0`, `!Backup.Parent.Impaired`, and
    the hard depth bound `Depth(Backup.Parent) + 1 + Height(Backup.Node) <= c.MaxDepth`.
-7. **Backup fan-in**: for every node `B`, `children[B] + backupLoad[B] <= capacityOf(B, c) + BackupOvershoot`.
+7. **Backup fan-in**: for every node `B`, `children[B] + backupLoad[B] <= capacityOf(B, c) + BackupOvershootAllowance`.
 8. **Epoch/Rev advance**: when `Validate` is given a `prev` (via `ValidateLocalRepair`, which
    calls into the same helper), `next` must not go backwards in `(Epoch, Rev)`.
 
@@ -650,29 +661,88 @@ repair" testable rather than merely asserted:
 ```go
 // ValidateLocalRepair asserts that next differs from prev only where it had to.
 //
-// gone is the set of node names that departed or were declared gone. joined is the set
-// that arrived. promoted is the set that RE-PARENTED THEMSELVES to their backup (§5.6) —
-// without it this oracle contradicts the ratification rule, because a peer whose parent
-// was healthy but whose EDGE to that parent failed will show a changed parent that none of
-// gone/joined can justify, and the oracle would flag a correct repair as a defect.
+// Churn describes what happened between prev and next. It is a struct rather than four
+// []string parameters because C8 already added a fourth justification class (impairment)
+// and a fifth is plausible; widening a struct is a non-event, widening a signature churns
+// every call site.
+type Churn struct {
+	// Gone departed or were declared gone.
+	Gone []string
+	// Joined arrived.
+	Joined []string
+	// Promoted RE-PARENTED THEMSELVES to their backup (§5.6). Without this the oracle
+	// contradicts the ratification rule: a peer whose parent was healthy but whose EDGE
+	// to it failed shows a changed parent that neither Gone nor Joined can justify, and a
+	// correct repair is flagged as a defect.
+	Promoted []string
+	// Impaired had their dwell timer fire this round (§5.4). Their children lose
+	// incumbency protection by design (§3.4 rank 1), so those moves are justified.
+	Impaired []string
+}
+
+// ValidateLocalRepair asserts that next differs from prev only where it had to.
 //
-// prev MUST BE THE PATCHED TREE — the one the coordinator built after applying §5.6's
-// ratification, in which each promoted node's parent is already the backup it chose. Given
-// that, a promoted node's parent should be UNCHANGED between prev and next (stickiness
-// protects the ratified edge), and promoted exists so the oracle can assert exactly that
-// rather than merely tolerate a difference. Passing the unpatched tree is a caller bug and
-// the oracle cannot detect it; hence this paragraph.
+// ***prev MUST BE THE LAST PUBLISHED TREE*** — the tree peers were actually running — NOT
+// the coordinator's patched working copy. v2 said the opposite; WI-1 shipped this and is
+// right. See §5.6a for the three distinct trees this contract now names, and §15.7 for the
+// ruling.
 //
-// The property: every node present in BOTH prev and next whose parent CHANGED must be
-// justified — it is in gone's prev-subtree (orphaned), or its prev parent is absent from
-// next's node set, or its prev parent became ineligible in next (over capacity, past depth,
-// or newly Impaired).
+// Two reasons, the second decisive:
+//
+//  1. An oracle fed the patched copy is asserting against the very belief it exists to
+//     check. The promotion has already been baked in, so the promoted node shows NO parent
+//     change, and the oracle can confirm only that the coordinator believes what it
+//     believes.
+//  2. THE PUBLISHED TREE IS THE ONLY ARTIFACT THAT STILL CARRIES THE BACKUP ASSIGNMENT the
+//     promotion must be checked against. Given the published prev, the oracle can assert
+//     that a promoted node moved to *the backup it was actually assigned* —
+//     next.ParentOf(u) == prev.BackupOf(u) — which is a real check on the promotion's
+//     legitimacy. The patched copy has already overwritten that evidence, so this check is
+//     not merely weaker there, it is IMPOSSIBLE.
+//
+// There is no double-counting with Churn.Promoted: prev supplies the BEFORE state and the
+// backup assignment; Promoted supplies the JUSTIFICATION CLASS for a change that gone and
+// joined cannot explain. Different roles, both needed.
+//
+// It takes nodes and Constraints (RULING D) for the same reason Validate does. Minimality is
+// defined relative to §3.4's PREFERENCE ORDERING, and rank 2 of that ordering is RTT-aware.
+// An oracle that cannot see RTT cannot evaluate rank 2, so it cannot answer its own
+// question — it flags a legitimate move onto a materially closer parent as gratuitous. That
+// is not a weaker oracle; it is an oracle answering a narrower question than the one it
+// claims to. Both oracles now take the same inputs and differ only in whether they see prev.
+//
+// A node u present in BOTH prev and next whose parent changed P -> Q is JUSTIFIED iff any of:
+//
+//	1. P is in Churn.Gone, or P is absent from next's node set;
+//	2. u is in Churn.Promoted. And when the assigned backup B = prev.BackupOf(u) is still
+//	   present and eligible in next, the oracle asserts the STRICT form: Q must EQUAL B —
+//	   a promoted node must land on the backup it was given, not on an arbitrary node.
+//	   When B is absent or ineligible in next (a correlated failure took the backup too),
+//	   the strict form cannot hold and u falls through to the general rules below, so the
+//	   oracle stays sound rather than firing falsely on a correct repair;
+//	3. P became ineligible in next: over capacity, past MaxDepth, TURN-bound, or Impaired;
+//	4. the move is what rank 1 permits: rtt(u,Q) + c.StickinessMs < rtt(u,P). This is the
+//	   clause the narrow signature could not express.
+//
+// LIMIT, stated so nobody over-trusts it: this checks a NECESSARY condition, not a
+// sufficient one. It asserts every move was PERMITTED by the ordering; it does not assert
+// the result was optimal, and it deliberately does NOT assert the converse (that a node
+// which could have improved did move). Greedy makes no such promise — an eligible closer
+// parent may have been filled by an earlier node — so asserting it would fail on correct
+// output.
 //
 // This is deliberately a separate function from Validate: Validate answers "is this tree
 // legal?", a property of one tree; this answers "was this change minimal?", a property of a
 // TRANSITION. Conflating them would make Validate need a prev it does not otherwise want.
-func ValidateLocalRepair(prev, next *Topology, gone, joined, promoted []string) error
+func ValidateLocalRepair(prev, next *Topology, nodes []Node, c Constraints, ch Churn) error
 ```
+
+> **Consequence for the churn suite.** WI-1's interim workaround — splitting the suite so
+> RTT-free fleets assert both oracles while RTT-rich fleets assert only `Validate` plus replay
+> determinism — was the right call against the narrow signature, but it left the *strongest*
+> fleets checked by the *weaker* oracle, which is exactly backwards: the RTT-rich fleets are
+> where rank 2 actually fires and where a churn bug would hide. **Collapse the split once the
+> signature widens**: every fleet asserts both oracles.
 
 ### 3.7 `Node.Provisional` — telling a default apart from a measurement
 
@@ -748,20 +818,44 @@ exists to provide. So root selection gets its own stability rule, stronger than 
 per-node one.
 
 ```go
-// PickRoot chooses the tree's root. Three rules, in order:
+// PickRoot chooses the tree's root.
 //
-//  1. NEVER a provisional node, and never a node that cannot parent (TURN-bound, or too
-//     little upload). Rooting on an assumed default is how the root flaps on telemetry
-//     ARRIVAL ORDER rather than on telemetry CONTENT — nondeterminism the deterministic
-//     simulation contract exists to eliminate.
-//  2. KEEP THE INCUMBENT. If prev is non-nil and prev.Root is present, non-provisional,
-//     and still able to parent, it is retained unless some eligible challenger advertises
-//     at least RootChangeMarginKbps MORE upload than it.
+// ELIGIBILITY (RULING E — streamKbps is why this parameter exists). A node is eligible iff
+// ALL of: not Provisional, not Impaired, not NATRelayed, and it can serve AT LEAST ONE
+// child — effectiveUploadKbps(n) / streamKbps >= 1.
+//
+// v2's first draft approximated "can parent" as UploadKbps > 0, which closes only HALF the
+// live root-flap defect. Provisional closes the "rooted a guess" half in every arrival
+// order — that part works. But a node reporting a REAL 1200 kbit/s against a 2000 kbit/s
+// stream cost genuinely cannot parent anyone, and without streamKbps PickRoot cannot see
+// that: it returns the unfit node and BuildTree then fails with "root cannot serve any
+// children". That surfaces as an honest `unbuildable` over real telemetry rather than an
+// arrival-order artifact, and §5.9's settle suppresses it in practice — but suppressed is
+// not closed, and a defect that only shows up under load is the kind this contract exists
+// to prevent. One scalar closes it.
+//
+// Three rules, in order:
+//
+//  1. Only ELIGIBLE nodes are considered, per above.
+//  2. KEEP THE INCUMBENT. If prev is non-nil and prev.Root is present AND STILL ELIGIBLE
+//     (the same test — an incumbent that has become unfit is not defended), it is retained
+//     unless some eligible challenger advertises at least RootChangeMarginKbps MORE upload.
 //  3. Otherwise: highest-upload eligible node, ties broken by name.
 //
-// Returns "" when no eligible node exists. A lone node is returned as-is (a one-node tree
-// is trivially valid) EVEN IF provisional — there is nothing to be wrong about.
-func PickRoot(nodes []Node, prev *Topology) string
+// Returns "" when no eligible node exists — a genuinely unrootable fleet, which the
+// coordinator reports as `unbuildable` (§5.9) and which the prev=nil retry (§5.9a) cannot
+// rescue, because dropping the stability preference does not create upload capacity.
+//
+// MaxDepth is deliberately NOT a parameter: the root sits at depth 0 and the depth bound
+// constrains its descendants, not its own eligibility. Passing the whole Constraints was
+// rejected for a sharper reason — Constraints.Root is the very thing PickRoot computes, so
+// a Constraints parameter is self-referential and invites a caller to pass a stale root and
+// quietly get it back. A scalar cannot be misused that way.
+//
+// A lone node is returned as-is (a one-node tree is trivially valid) even if ineligible;
+// MinBuildableMembers (§5.9) means the coordinator never reaches that path, and it exists
+// for simnet and unit tests.
+func PickRoot(nodes []Node, prev *Topology, streamKbps int) string
 
 // RootChangeMarginKbps is how much more upload a challenger must advertise before it is
 // worth re-rooting the entire subnet.
@@ -777,7 +871,7 @@ const RootChangeMarginKbps = 2000
 ```
 
 Call sites to update: `coordinator.recompute` and `simnet.Network.Build`. Both pass their
-current topology; both pass `nil` on the first build.
+current topology and their `StreamKbps`; both pass `nil` for `prev` on the first build.
 
 > **This closes an observed live defect.** In a 3-peer managed run, `PickRoot(nodes)` was
 > called on every threshold event over a projection in which unreported peers sit at
@@ -1610,9 +1704,12 @@ The coordinator ratifies **only `OK: true`** — which now means media actually 
 
 The coordinator's response is the rule that keeps this from thrashing:
 
-> **RATIFICATION RULE (frozen).** On a successful `Reparented`, the coordinator patches
-> `prev` so that `u`'s parent is the backup `u` actually chose, **and then** rebuilds from
-> that patched `prev`. It does not rebuild from the pre-failure tree.
+> **RATIFICATION RULE (frozen).** On a successful `Reparented`, the coordinator patches its
+> **working copy** so that `u`'s parent is the backup `u` actually chose, **and then** calls
+> `BuildTree` with that patched working copy. It does not build from the pre-failure tree.
+>
+> This is about **`BuildTree`'s input only.** It is NOT about the oracle's input — see
+> §5.6a, which exists because v2 conflated the two.
 
 Why this matters: if the coordinator rebuilt from the old tree, stickiness would see `u`'s
 incumbent parent as the *dead* one, find it ineligible, and re-choose freely — quite
@@ -1620,6 +1717,32 @@ possibly moving `u` a second time, to a parent that is no better than the backup
 connected to. That is two interruptions where one was needed. By patching first, `u`'s new
 parent *becomes* the incumbent, and stickiness protects it. The coordinator ratifies the
 peer's local decision rather than fighting it.
+
+#### 5.6a The three trees the coordinator holds — keep them distinct
+
+v2 said "`prev` is the patched tree" in one place about `BuildTree` and in another about
+`ValidateLocalRepair`, and they are **different trees**. WI-3 must keep three references per
+meet, and confusing any two produces a silent correctness bug rather than a compile error:
+
+| Name | What it is | Who consumes it |
+|---|---|---|
+| **`published`** | The last tree actually sent to peers. Carries the `Epoch`/`Rev` peers are fencing against and — load-bearing — the `Backups` assignment they promoted under. | `ValidateLocalRepair`'s `prev`; the dashboard snapshot; `Fence` reasoning |
+| **`working`** | `published`, patched with every ratified promotion since (§5.6). Rebuilt from `published` each round; never sent anywhere. | `BuildTree`'s `prev` |
+| **`next`** | `BuildTree`'s output for this round. | published on success, and then **becomes `published`** |
+
+So one recompute round is:
+
+```
+working := patch(published, ratifiedPromotions)
+next    := BuildTree(nodes, working, cons)          // sticky attempt, §5.9a
+_       =  Validate(next, nodes, cons)              // gate
+_       =  ValidateLocalRepair(published, next, nodes, cons, churn)   // NOT working
+publish(next); published = next; ratifiedPromotions = nil
+```
+
+The asymmetry is the point and is worth stating in one line: **the builder should be told
+what the peers have already done, so stickiness protects it; the oracle should be told what
+the peers were last *instructed* to do, so it can check that what they did was allowed.**
 
 The unsuccessful case (`OK: false`) is a threshold event handled as an urgent recompute
 that bypasses `RecomputeCooldown` — a stranded peer is receiving nothing, so the anti-thrash
@@ -1911,13 +2034,75 @@ const (
 	// Warn — a warning that fires on every healthy startup teaches operators to ignore
 	// warnings.
 	OutcomeSettling BuildOutcome = "settling"
-	// OutcomeUnbuildable: the fleet is over-constrained — BuildTree rejected it, or
-	// PickRoot found no eligible root, over a fleet that HAS settled. This is a real,
-	// operator-visible condition (not enough aggregate upload for this many peers, or a
-	// depth bound too shallow) and the previous tree is retained. Log: Warn.
+	// OutcomeRelaxed: the sticky build FAILED but a from-scratch build (prev = nil)
+	// succeeded, so a tree WAS published — at the cost of dropping the stability
+	// preference for this round. Expect a large re-parent. Log: Warn (it is rare,
+	// expensive, and worth seeing), but it is a SUCCESS, not a fault. See §5.9a.
+	OutcomeRelaxed BuildOutcome = "relaxed"
+	// OutcomeUnbuildable: no tree exists for this fleet EVEN WITHOUT the stability
+	// preference — PickRoot found no eligible root, or both build attempts failed. This
+	// is a real, operator-actionable condition (not enough aggregate upload for this many
+	// peers, or a depth bound too shallow) and the previous tree is retained. Log: Warn.
+	//
+	// Note how much stronger this signal is than v1's: because §5.9a requires the relaxed
+	// retry first, `unbuildable` now means "genuinely over-constrained", never "stickiness
+	// painted us into a corner".
 	OutcomeUnbuildable BuildOutcome = "unbuildable"
 )
 ```
+
+### 5.9a The mandatory relaxed retry (RULING F)
+
+**Stickiness can make a satisfiable fleet unbuildable.** A sticky rebuild pins incumbents
+before newcomers (§3.4 order), so it can fail where a from-scratch build would succeed: the
+incumbents' claims on capacity are honoured first, and a newcomer that a fresh build would
+have placed near the root finds nothing left. This is **inherent to the stability preference,
+not a bug** — it is the price of §3.4 rank 1, paid in a case the ordering cannot foresee.
+
+But a meet must never be declared `unbuildable` while a perfectly good tree exists. So:
+
+> **FROZEN: `recompute` performs a TWO-ATTEMPT build.**
+>
+> 1. `next, err := BuildTree(nodes, prev, cons)` — the sticky attempt.
+> 2. If it succeeds → publish. `Outcome = OutcomeBuilt`. Done.
+> 3. If it fails → **retry once with `prev = nil`**: `next, err2 := BuildTree(nodes, nil, cons)`.
+>    - Succeeds → **publish it**. `Outcome = OutcomeRelaxed`. `Event.Reason` carries the
+>      *first* attempt's error text, because that error is the only explanation of why every
+>      peer is about to be re-parented and discarding it would make the event unreadable.
+>      The relaxed tree becomes the new `prev`.
+>    - Fails → `Outcome = OutcomeUnbuildable`. **Keep the previous tree**, publish
+>      `EventUnbuildable` with the second attempt's error.
+>
+> `overlay.Validate` gates publication in both branches, unchanged: a tree that fails its own
+> oracle is never published, whichever attempt produced it.
+
+**Rules on the retry, each freezing a way it could be misused:**
+
+- **It does NOT bypass `RecomputeCooldown`.** A relaxed build re-parents nearly everyone; it
+  is the single most expensive thing the control plane does. The only cooldown bypasses
+  remain the two in §5.6/§5.9: a stranded peer (`OK:false`) and an unplaced joiner.
+- **It is a retry, not a fallback mode.** Exactly one extra attempt, same tick, same inputs.
+  There is no "relaxed mode" the coordinator can get stuck in — the next recompute starts
+  sticky again from the newly published `prev`.
+- **It is loud.** Log at Warn with both error texts. A meet that goes relaxed repeatedly is
+  telling you the fleet is chronically near its capacity bound, which is exactly the
+  operational signal §13.1's honest-limits discipline wants surfaced rather than smoothed
+  over.
+- **`PickRoot` returning `""` short-circuits both attempts.** Dropping the stability
+  preference does not create upload capacity, so an unrootable fleet is `unbuildable`
+  immediately, with no pointless second call.
+
+**Why a fourth outcome rather than a boolean on `OutcomeBuilt`.** The manager is right that a
+stickiness-only failure is neither `settling` nor `unbuildable`, and the three audiences are
+genuinely different: `settling` is normal startup (Debug, muted UI), `relaxed` is a rare
+expensive success the operator should *see but not act on* (Warn, distinct UI treatment),
+`unbuildable` is a fault requiring a human to change something (Warn, persistent `--crit`
+banner). Three states, three renderings; a boolean would have to be plumbed into the UI as a
+de facto fourth state anyway, with none of the enum's exhaustiveness.
+
+`EventTopology` carries `Outcome` (the field already exists), so **no new `EventKind` is
+needed** — a relaxed publish is still a topology event, because a tree really was published.
+The dashboard branches on `data.outcome`.
 
 Two new `EventKind` values carry these through the `Publisher` seam:
 
@@ -3005,7 +3190,7 @@ Every frame on `/api/meets/{id}/events` has exactly this shape:
 | `member_joined` | `{"id","name"}` | `coordinator.EventMember` (Present) |
 | `member_left` | `{"id","name"}` | `coordinator.EventMember` (!Present) |
 | `health_changed` | `{"name","health","prev_health"}` | `coordinator.EventHealth` |
-| `topology` | `{"root","edges":[…],"backups":[…],"depth","relays":[…]}` | `coordinator.EventTopology` |
+| `topology` | `{"root","edges":[…],"backups":[…],"depth","relays":[…],"outcome","reason"}` — `outcome` is `built` or `relaxed`; on `relaxed`, `reason` carries the sticky attempt's error (§5.9a) | `coordinator.EventTopology` |
 | `reparent` | `{"name","from","to","self_promoted":true,"reason"}` | `coordinator.EventReparent` |
 | `failover` | `{"name","orphans":[…],"reroot":false,"reason"}` | `coordinator.EventFailover` |
 | `election` | `{"epoch","coordinator","prev","reason"}` | `arbiter.Publisher` |
@@ -3068,7 +3253,7 @@ neutral style, never by crashing):
 | `nat` | `direct`, `turn` |
 | `kind` | `snapshot`, `member_joined`, `member_left`, `health_changed`, `topology`, `reparent`, `failover`, `election`, `stale_rejected`, `settling`, `unbuildable`, `demo`, `pong` |
 | `reason` (election) | `bootstrap`, `failover`, `promotion`, `demotion`, `manual` |
-| `outcome` | `built`, `settling`, `unbuildable` |
+| `outcome` | `built`, `relaxed`, `settling`, `unbuildable` |
 
 **WebSocket protocol, complete.** The client sends **exactly two** operations — `{"op":"ping"}`
 and `{"op":"resync"}`. There is **no** `subscribe`/`unsubscribe`: the socket is
@@ -3142,7 +3327,7 @@ identity and the UI must not present it as one.
 | **Subnet** | The live tree. Coordinator badge = `--accent-primary` (#bd93f9), relay badge = `--accent-secondary` (#ff79c6), leaf = `--surface`. Edges `--edge` (#8be9fd); a degraded node's edge `--warn`; a failover flash `--crit`. **Two independent badges per node**, never one merged role. Backup parents drawn as a dashed edge. |
 | **Node detail** | Per-node telemetry with `font-variant-numeric: tabular-nums` so live numbers do not jitter the layout. |
 | **Event log** | The envelope stream, newest first, colour-coded by `kind`. |
-| **Build state** | `settling` renders as a transient, non-alarming "waiting for telemetry from X, Y" line in `--fg-muted` — it is normal startup and must never look like a fault. `unbuildable` renders as a **persistent banner** in `--crit` with the reason text, because it means someone is receiving nothing and a human has to change a flag or drop a peer. Getting these two visually confused is the specific failure this distinction exists to prevent. |
+| **Build state** | Three distinct renderings, and confusing any two is the specific failure the enum exists to prevent. `settling` → transient "waiting for telemetry from X, Y" in `--fg-muted`; normal startup, must never look like a fault. `relaxed` → a one-shot `--warn` flash on the subnet panel reading "rebuilt from scratch — stability preference dropped", with the reason on hover; a rare, expensive *success* the operator should notice but need not act on. `unbuildable` → a **persistent `--crit` banner** with the reason; someone is receiving nothing and a human must change a flag or drop a peer. |
 | **Epoch** | Current epoch + rev, prominently. `stale_rejected` count next to it — this is the visible proof of the fence. |
 
 Theming follows `docs/design-system.md` §2.1–2.4: Dracula tokens as CSS custom properties on
@@ -3412,9 +3597,9 @@ safe.
 
 | Layer | Package | Style | Must cover |
 |---|---|---|---|
-| **Pure graph** | `overlay` | Table-driven + the independent `Validate` oracle. Never re-derive the expected tree. | Epoch/rev stamping; stickiness at rank 1 (an incumbent survives a lower-load and a marginally-closer challenger, loses to one beating `StickinessMs`); processing order (a strong joiner does not re-parent incumbents); backup invariant `B ∉ Subtree(P)`; root children have no backup; `ValidateLocalRepair` catches a gratuitous re-parent; `Validate` catches each new violation class; `LoadTopology` still accepts a Phase-3 file and stamps `StaticEpoch`; determinism over ≥50 repeats. **`PickRoot` never returns a provisional node; an incumbent root survives a challenger inside `RootChangeMarginKbps` and loses to one beyond it.** |
-| **Deterministic sim** | `simnet` | Seeded scenarios + property tests over many seeds. | Replay identity (same seed ⇒ identical trace); virtual-clock ordering (same-instant timers fire in creation order); each injection primitive; ≥200-step churn keeping `Validate` green; the dwell suppressing a noisy-but-stable metric stream; the dwell firing on a sustained one. **REPORT-ORDER INVARIANCE (below).** |
-| **Control loop** | `coordinator` | `-race`, fake `Sender`, fake `Publisher`, `VirtualClock`, `Sync` barrier. | The eight threshold events and **only** those recompute; `RecomputeCooldown` coalescing a burst; the `OK:false` cooldown bypass; health FSM transitions in virtual time; local repair moves only orphans (asserted via `ValidateLocalRepair`); the ratification rule (a self-promoted parent survives the next rebuild); re-root on root loss; `Snapshot` never tears. **The settle rule: a 1-member meet never builds and never consumes the settle; every join RE-ARMS it; a join burst coalesces into one build; a join bypasses `RecomputeCooldown` but not the settle; `unbuildable` is emitted only post-settle.** |
+| **Pure graph** | `overlay` | Table-driven + the independent `Validate` oracle. Never re-derive the expected tree. | Epoch/rev stamping; stickiness at rank 1 (an incumbent survives a lower-load and a marginally-closer challenger, loses to one beating `StickinessMs`); processing order (a strong joiner does not re-parent incumbents); backup invariant `B ∉ Subtree(P)`; root children have no backup; `ValidateLocalRepair` catches a gratuitous re-parent; `Validate` catches each new violation class; `LoadTopology` still accepts a Phase-3 file and stamps `StaticEpoch`; determinism over ≥50 repeats. **`PickRoot` never returns a provisional, impaired, or under-capacity node (a real 1200 kbit/s report against a 2000 kbit/s stream cost is NOT rootable — ruling E); an incumbent root survives a challenger inside `RootChangeMarginKbps` and loses to one beyond it; a demoted former root is processed first and its former children stay put (§3.4 step 0); `ValidateLocalRepair` accepts an RTT-justified move past `StickinessMs` and still rejects an unjustified one (ruling D).** |
+| **Deterministic sim** | `simnet` | Seeded scenarios + property tests over many seeds. | Replay identity (same seed ⇒ identical trace); virtual-clock ordering (same-instant timers fire in creation order); each injection primitive; ≥200-step churn keeping **both** oracles green (the interim RTT-free / RTT-rich split collapses once ruling D lands); the dwell suppressing a noisy-but-stable metric stream; the dwell firing on a sustained one. **The three §12.3 properties**, including the 120-permutation enumeration asserting validity + bounded delta on each — and pinning `9 distinct trees, 1 root` as a regression check on the trade itself. |
+| **Control loop** | `coordinator` | `-race`, fake `Sender`, fake `Publisher`, `VirtualClock`, `Sync` barrier. | The eight threshold events and **only** those recompute; `RecomputeCooldown` coalescing a burst; the `OK:false` cooldown bypass; health FSM transitions in virtual time; local repair moves only orphans (asserted via `ValidateLocalRepair`); the ratification rule (a self-promoted parent survives the next rebuild); re-root on root loss; `Snapshot` never tears. **The settle rule: a 1-member meet never builds and never consumes the settle; every join RE-ARMS it; a join burst coalesces into one build; a join bypasses `RecomputeCooldown` but not the settle; `unbuildable` is emitted only post-settle.** **The §5.9a relaxed retry: a fleet that is sticky-unbuildable but fresh-buildable publishes with `OutcomeRelaxed` and NEVER reports `unbuildable`; a genuinely over-constrained fleet reports `unbuildable` and keeps its previous tree; the retry does not bypass the cooldown; `PickRoot == ""` short-circuits without a second attempt.** | |
 | **Election** | `arbiter` | Table-driven `Score`; scenario-driven election. | `Score` returns 0 for TURN-bound and non-healthy; upload is absent from the formula (assert a large `UploadKbps` changes nothing); every trigger in §6.2; `MinTermDuration` blocks a voluntary handover and does **not** block a failure one; epochs strictly increase and never repeat. |
 | **Fencing** | `simnet` + `coordinator` | Scenario. | Two coordinators mid-handover: the stale one's push is rejected and counted; a topology carrying a higher epoch is rejected; a rejoining peer resets `curEpoch`; the arbiter-restart hole (§6.7) is closed. |
 | **Media, deterministic** | `media` | Unit, no network. | The negotiation serializer: a second `AddTrack` while `negotiating` sets `renegotiate` and produces **exactly one** follow-up offer; the retry path bounded by `NegotiationRetries`; `RemoveTrack` on a closed pc returns nil; the diff computation in `applyTopology` (pure function over two topologies — extract it so it is testable without pion). |
@@ -3434,6 +3619,19 @@ first — and therefore which incumbency `prev` records before the next rebuild 
 converges to trees with the same root and different `Edges` (e.g. `D` under `C` in one
 history and under `A` in another). Both are valid. Both are minimal with respect to their own
 history. Neither is wrong.
+
+**MEASURED (WI-1, confirmed):** enumerating all **120** first-report permutations of that
+fleet yields **9 distinct valid trees**, and **the converged root is identical across all
+120.** That is the precise, honest statement of the trade, and it is a better result than
+either extreme would have been:
+
+> **The root converges; the shape does not.**
+
+The root converging is `PickRoot`'s stickiness plus the `Provisional` rule doing exactly
+their job — the one decision whose instability would re-parent the entire meet is
+arrival-order independent. The shape not converging is rank 1 doing exactly *its* job. Nine
+trees, all valid, all minimal with respect to their own history, none of them "the right
+one".
 
 **This is not a bug to patch. It is what stickiness IS.**
 
@@ -3471,11 +3669,15 @@ with the concrete numeric consequences pinned as separate table cases:
 | one leaf departs | **0** |
 | one relay `X` departs, no re-root | **≤ `len(childrenOf_prev(X))`** |
 | one self-promotion (§5.6) | **0** — the ratified edge is already in `prevPatched` |
-| one node becomes `Impaired` | **≤ `len(childrenOf_prev(node))`** |
+| one node becomes `Impaired` | **≤ `len(childrenOf_prev(node))`** (rank 1 is voided for exactly those children, §3.4) |
+| an RTT improvement past `StickinessMs` | **≤ 1 per improving node**, and each must satisfy `ValidateLocalRepair`'s justification 4 — this row is only assertable because RULING D widened the oracle to see RTT |
+| a sticky build failed and the relaxed retry ran (§5.9a) | **unbounded** — assert `Outcome == OutcomeRelaxed` was published, the same way the re-root row asserts `Reroot == true` |
 | root departs | unbounded (re-root; assert `Reroot == true` was published) |
 
-The re-root row is the honest one: it is the single case where "local repair" does not apply,
-and the test asserts that the coordinator *said so* rather than that it avoided it.
+The last two rows are the honest ones: re-root and relaxed-retry are the two cases where
+"local repair" does not apply at all, and the test asserts that the coordinator **said so** —
+`Reroot == true`, `Outcome == OutcomeRelaxed` — rather than that it avoided them. A design
+that cannot always be local must at minimum always be *legible* about when it was not.
 
 **(c) Determinism given the same event SEQUENCE — not the same event SET.**
 Same `ScenarioConfig.Seed` and the same *ordered* script ⇒ byte-identical trace, over ≥50
@@ -3517,7 +3719,7 @@ Stated plainly, because a contract that oversells is worse than one that admits 
    property is *stronger* live than in simulation, and the min-latency property is *only*
    exercised in simulation. Say exactly that.
 3. **Backup capacity is not reserved (§3.5).** A failover can transiently oversubscribe a
-   relay by up to `BackupOvershoot` (= 1) children until the next recompute. This claim is
+   relay by up to `BackupOvershootAllowance` (= 1) children until the next recompute. This claim is
    TRUE only because rank 0c bounds backup fan-in; without that cap the overshoot would be
    the size of the failed subtree, which is what v1 shipped and what §15/M1 corrects.
 4. **Root children have no backup (§3.5).** Losing the root is a full rebuild, not a warm
@@ -3648,7 +3850,7 @@ everything that changed, and why.
 
 **New frozen names:** `overlay.Fence` (+ `AdoptAnnouncement`, `Reset`, `Accept`, `Applied`),
 `overlay.Height`, `overlay.Node.Impaired`, `overlay.Node.LossPct`, `overlay.MaxLossDeratePct`,
-`overlay.BackupOvershoot`, `coordinator.MinBuildableMembers`, `coordinator.Member`,
+`overlay.BackupOvershootAllowance`, `coordinator.MinBuildableMembers`, `coordinator.Member`,
 `coordinator.SetRoster`, `media.ReparentMediaTimeout`, `media.TimestampGapTicks`,
 `metrics.Report.Coordinatable`, `internal/policy` (`MeetIDPattern`, `ValidMeetID`, `Origins`,
 `ParseOrigins`, `Patterns`, `Match`), `simnet.VirtualClock.SetBarrier`, `arbiter.Meet`,
@@ -3676,8 +3878,8 @@ everything that changed, and why.
 
 | Finding | Resolution | § |
 |---|---|---|
-| Backup fan-in unbounded; overshoot was `|Subtree(P)|−1`, not 1 | `BackupOvershoot = 1` spent across assignment (rank 0c) | 3.5 |
-| `ValidateLocalRepair` contradicted the ratification rule | `promoted` argument; `prev` is the **patched** tree, stated | 3.6 |
+| Backup fan-in unbounded; overshoot was `|Subtree(P)|−1`, not 1 | `BackupOvershootAllowance = 1` spent across assignment (rank 0c) | 3.5 |
+| `ValidateLocalRepair` contradicted the ratification rule | `Churn.Promoted`; `prev` is the **last published** tree — **this row said "patched" in v2 and was WRONG, see §15.7** | 3.6, 5.6a |
 | Promotion could violate `MaxDepth` for the promoted subtree | Hard rank 0b: `Depth(B) + 1 + Height(u) ≤ MaxDepth`, needing new `Topology.Height` | 3.5 |
 | `Fitness.Health` had no source; coordinator-death detection was circular | The arbiter keeps its **own** liveness view; `Fitness.Live` | 6.1 |
 | One lost heartbeat ⇒ `prev = nil` ⇒ global re-parent | Validate the reconstruction over the **reduced heard-from** set | 6.6 |
@@ -3717,7 +3919,64 @@ See §9.4a.
 (Chrome's honoured ceiling); `RecomputeCooldown = 5s` (bounded below by the cost of the
 interruption it suppresses, above by joiner patience — which joins escape entirely).
 
-### 15.7 Where I think a reviewer is wrong
+### 15.7 RULING: `ValidateLocalRepair`'s `prev` is the LAST PUBLISHED tree (v2 was wrong)
+
+**WI-1 is right and has already shipped the correct behaviour.** v2's §3.6 and its §15.3 log
+row both said `prev` is the coordinator's *patched* tree. That is wrong for the oracle, and
+the correction is now in §3.6 with the mechanics in §5.6a.
+
+WI-1's stated argument is correct: an oracle fed the patched copy asserts against the very
+belief it exists to check — the promotion is already baked in, so the promoted node shows no
+parent change and the oracle can only confirm that the coordinator believes what it believes.
+
+**And there is a stronger reason it did not state.** The published tree is the only artifact
+that still carries the **`Backups` assignment the promotion must be checked against.** Given
+the published `prev`, the oracle can assert `next.ParentOf(u) == prev.BackupOf(u)` — that a
+promoted node landed on *the backup it was actually assigned*, not on some arbitrary node
+it decided it liked. That is a genuine check on the promotion's legitimacy, and against the
+patched copy it is not merely weaker, it is **impossible**: the patch has overwritten the
+evidence. So the shipped choice buys an assertion the rejected one cannot express, and §3.6's
+justification 2 is strengthened to make it (with a guard for the correlated-failure case
+where the assigned backup is itself gone, so the oracle stays sound instead of firing falsely
+on a correct repair).
+
+**No double-counting**, which was the manager's concern: `prev` (published) supplies the
+BEFORE state and the backup assignment; `Churn.Promoted` supplies the JUSTIFICATION CLASS for
+a change that `Gone`/`Joined` cannot explain. Two different roles; both required.
+
+**The manager's hypothesis (c) is exactly how v2 went wrong.** §6.6 and §5.6 legitimately
+patch a working copy — that is about **`BuildTree`'s input**, it is correct, and it is
+unchanged. v2's amendment log conflated that with the **oracle's input**. Both statements were
+about `prev`; they were about different functions and different trees. §5.6a now names all
+three (`published` / `working` / `next`), gives the round in five lines, and states the
+asymmetry in one:
+
+> The builder should be told what the peers have already **done**, so stickiness protects it;
+> the oracle should be told what the peers were last **instructed** to do, so it can check
+> that what they did was allowed.
+
+WI-3 keeps all three references per meet. Nothing needs reworking in WI-1.
+
+### 15.8 Later rulings (D, E, F) and shipped-accuracy items
+
+| Ruling | Resolution | § |
+|---|---|---|
+| **D** — the oracle could not see RTT and flagged a legitimate rank-2 move (seed 42, `n4` `n1`→`n3`, a 48 ms win) as gratuitous | **Widened.** `ValidateLocalRepair(prev, next, nodes []Node, c Constraints, ch Churn)`; the four `[]string` churn args collapse into `overlay.Churn{Gone, Joined, Promoted, Impaired}`. Justification 4 (an RTT win past `StickinessMs`) becomes expressible. WI-1's interim RTT-free/RTT-rich suite split **collapses** — it left the strongest fleets checked by the weaker oracle, which is backwards. | 3.6, 12.2 |
+| **E** — `PickRoot` approximated "can parent" as `UploadKbps > 0`, so a real 1200 kbit/s report against a 2000 kbit/s stream cost still got rooted | **Widened.** `PickRoot(nodes, prev, streamKbps int)`; eligibility is `effectiveUploadKbps(n)/streamKbps >= 1`, plus not-Provisional, not-Impaired, not-TURN. Rejected passing the whole `Constraints`: `Constraints.Root` is the thing `PickRoot` computes, so it is a self-referential parameter that invites a caller to pass a stale root and get it back. `MaxDepth` is deliberately not needed — the root is at depth 0. | 3.8 |
+| **F** — stickiness can make a satisfiable fleet unbuildable | **Mandatory two-attempt build (§5.9a):** sticky, then one retry with `prev = nil`. New fourth outcome `OutcomeRelaxed` (built, stability preference dropped, expect a large re-parent) carried on the existing `EventTopology.Outcome`, so no new `EventKind`. The retry does NOT bypass `RecomputeCooldown`, is one attempt not a mode, and is logged at Warn. `unbuildable` now means **genuinely over-constrained**, never "stickiness painted us into a corner" — a much stronger, actionable signal. | 5.9a |
+
+**Shipped-accuracy items reflected:** a demoted former root is processed **first** (§3.4 step
+0) — placing it with the newcomers scatters its former children, because their incumbent
+parent is not yet attached when they are processed, turning the most disruptive event there
+is into a whole-subtree scatter; and `BackupOvershoot` → **`BackupOvershootAllowance`**,
+spent across backup assignment, which makes §13.3's one-child overshoot claim literally true.
+
+**Measured and pinned (§12.3, §13.13):** 120 first-report permutations of the C3
+counterexample fleet produce **9 distinct valid trees with an identical converged root** —
+*the root converges, the shape does not*. That is the precise statement of the
+stability/determinism trade and it is now a regression check on the trade itself.
+
+### 15.9 Where I think a reviewer is wrong
 
 - **"`Supersedes` should be deleted."** Not taken. It is genuinely needed for *ordering* —
   the coordinator sequencing its own trees, the dashboard detecting a stale snapshot. The
@@ -3730,5 +3989,5 @@ interruption it suppresses, above by joiner patience — which joins escape enti
 
 ---
 
-*This document is FROZEN at v2. Amendments go through the owner, in this file, recorded in
+*This document is FROZEN at v2.1. Amendments go through the owner, in this file, recorded in
 §15. Implementers: build what is written, and report what is wrong.*
