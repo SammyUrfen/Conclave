@@ -15,7 +15,12 @@ import (
 )
 
 func measured(v float64) func() (float64, bool) { return func() (float64, bool) { return v, true } }
-func unmeasured() func() (float64, bool)        { return func() (float64, bool) { return 0, false } }
+
+// unmeasured returns a NON-ZERO value alongside ok=false, and the non-zero is the
+// whole point. A sensor that reports (0, false) makes "the field was left alone" and
+// "the field was overwritten with the sensor's zero" indistinguishable, so a test
+// built on it passes against the exact mutation it exists to catch.
+func unmeasured() func() (float64, bool) { return func() (float64, bool) { return 999, false } }
 func links(r []metrics.PeerRTT, loss float64) func() ([]metrics.PeerRTT, float64) {
 	return func() ([]metrics.PeerRTT, float64) { return r, loss }
 }
