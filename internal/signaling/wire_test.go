@@ -3,6 +3,7 @@ package signaling
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -15,6 +16,8 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+
+	"github.com/SammyUrfen/conclave/internal/policy"
 )
 
 // TestFrameVocabulary pins the wire values. They are the one thing a peer built
@@ -302,6 +305,23 @@ func TestSendToStamping(t *testing.T) {
 // and the ?room= value /ws accepts. A meet that only one of the two admits is a meet
 // the dashboard can create but never render, or vice versa.
 func TestRoomIDValidation(t *testing.T) {
+	// RULING A (docs/PLAN.md §2.4): RoomIDPattern/ValidRoomID now DELEGATE to
+	// internal/policy rather than owning the rule, so the dashboard's future
+	// meet-creation endpoint can share it without importing this package. Pin the
+	// delegation itself — not just matching behaviour on a few sample ids — so a
+	// future edit that reintroduces a second copy of the pattern fails here even if
+	// nobody thinks to update the table below.
+	t.Run("RoomIDPattern and ValidRoomID are policy aliases, not a second copy", func(t *testing.T) {
+		if RoomIDPattern != policy.MeetIDPattern {
+			t.Errorf("RoomIDPattern = %q, want the literal policy.MeetIDPattern %q", RoomIDPattern, policy.MeetIDPattern)
+		}
+		for _, id := range []string{"demo", "", "Demo", "a_b-c9", "café"} {
+			if got, want := ValidRoomID(id), policy.ValidMeetID(id); got != want {
+				t.Errorf("ValidRoomID(%q) = %v, policy.ValidMeetID(%q) = %v; they diverged", id, got, id, want)
+			}
+		}
+	})
+
 	t.Run("ValidRoomID", func(t *testing.T) {
 		tests := []struct {
 			id   string
@@ -401,6 +421,58 @@ func TestHubOriginPolicy(t *testing.T) {
 	}
 }
 
+// TestOriginsMatchAgreesWithWebsocketAccept is the one assertion that is the
+// entire justification for internal/policy existing (docs/PLAN.md §2.4, §12.2):
+// Origins.Match — used by the future dashboard CORS surface — MUST accept exactly
+// the set that Origins.Patterns() makes the REAL websocket.Accept accept. This
+// package may import both signaling and policy, so the check runs against the
+// genuine library rather than a second copy of the matching algorithm.
+//
+// Empty origin is deliberately excluded: websocket.Accept always allows an absent
+// Origin header (it means a non-browser client, like our Go peer, sent no CORS
+// preflight at all), whereas Origins.Match(("")) correctly refuses to match
+// anything — there is no dashboard use case for CORS-approving a request with no
+// Origin. That is an intentional difference in what the two are FOR, not a case
+// the "same set" property covers; TestHubOriginPolicy's "no origin" case already
+// exercises the websocket.Accept side of it.
+func TestOriginsMatchAgreesWithWebsocketAccept(t *testing.T) {
+	origins, err := policy.ParseOrigins("https://sammyurfen.github.io,http://localhost:*")
+	if err != nil {
+		t.Fatalf("ParseOrigins: %v", err)
+	}
+	srv, wsURL, _ := newWireServer(t, HubConfig{AllowedOrigins: origins}, nil)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	candidates := []string{
+		"https://sammyurfen.github.io",
+		"http://localhost:5173",
+		"http://localhost",
+		"https://evil.example",
+		"http://sammyurfen.github.io",
+		"HTTPS://SAMMYURFEN.GITHUB.IO",
+		"https://sammyurfen.github.io.evil.example",
+	}
+	for _, origin := range candidates {
+		t.Run(origin, func(t *testing.T) {
+			_, wantAllowed := origins.Match(origin)
+
+			opts := &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{origin}}}
+			conn, _, err := websocket.Dial(ctx, wsURL, opts)
+			gotAllowed := err == nil
+			if conn != nil {
+				conn.CloseNow()
+			}
+			if gotAllowed != wantAllowed {
+				t.Errorf("origin %q: policy.Origins.Match says allowed=%v, but websocket.Accept (via Patterns()) says allowed=%v",
+					origin, wantAllowed, gotAllowed)
+			}
+		})
+	}
+}
+
 // TestHubPingReapsDeadSocket is the whole point of the WS keepalive: a TCP socket
 // that is dead but never FIN'd leaves wsjson.Read blocked forever, so without a
 // protocol ping the Hub would carry a ghost member in the roster indefinitely and
@@ -473,7 +545,10 @@ func TestHubConfigDefaults(t *testing.T) {
 	})
 
 	t.Run("zero config gets defaults", func(t *testing.T) {
-		h := NewHubWithConfig(HubConfig{Log: log})
+		h, err := NewHubWithConfig(HubConfig{Log: log})
+		if err != nil {
+			t.Fatalf("NewHubWithConfig(zero config): %v", err)
+		}
 		if h.clk == nil || h.pingInterval != WSPingInterval || h.pingTimeout != WSPingTimeout {
 			t.Errorf("zero config gave clk=%v interval=%v timeout=%v, want the defaults", h.clk, h.pingInterval, h.pingTimeout)
 		}
@@ -488,13 +563,38 @@ func TestHubConfigDefaults(t *testing.T) {
 		}
 	})
 
-	t.Run("an inconsistent ping config panics", func(t *testing.T) {
+	// RULING B (docs/PLAN.md §2.4/§4.2, §15.4): PingInterval/PingTimeout are
+	// operator input (they arrive from flags, same family as -allowed-origins), not
+	// a programmer error, so a self-contradictory pair must be reported as an error
+	// value — the project's fail-loud-at-startup rule translated by run() error into
+	// one sentence on stderr — rather than a panic whose stack trace names no flag.
+	t.Run("an inconsistent ping config is a reported error, not a panic", func(t *testing.T) {
+		h, err := NewHubWithConfig(HubConfig{Log: log, PingInterval: time.Second, PingTimeout: 2 * time.Second})
+		if err == nil {
+			t.Fatal("a pong timeout longer than the ping interval was accepted")
+		}
+		if h != nil {
+			t.Errorf("got a non-nil Hub alongside the error: %+v", h)
+		}
+		if !errors.Is(err, ErrInvalidPingConfig) {
+			t.Errorf("error %v does not wrap ErrInvalidPingConfig", err)
+		}
+		// Actionable: names the two config values and their values, not just "bad
+		// config" — the whole point of moving off panic.
+		for _, want := range []string{"PingInterval", "PingTimeout", "1s", "2s"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not mention %q", err.Error(), want)
+			}
+		}
+	})
+
+	t.Run("an inconsistent config never panics", func(t *testing.T) {
 		defer func() {
-			if recover() == nil {
-				t.Error("a pong timeout longer than the ping interval was accepted")
+			if r := recover(); r != nil {
+				t.Fatalf("NewHubWithConfig panicked: %v", r)
 			}
 		}()
-		NewHubWithConfig(HubConfig{Log: log, PingInterval: time.Second, PingTimeout: 2 * time.Second})
+		_, _ = NewHubWithConfig(HubConfig{Log: log, PingInterval: time.Second, PingTimeout: time.Second})
 	})
 }
 
@@ -591,7 +691,10 @@ func (o *recordingObserver) leaves() int {
 func newWireServer(t *testing.T, cfg HubConfig, obs Observer) (*httptest.Server, string, *Hub) {
 	t.Helper()
 	cfg.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
-	hub := NewHubWithConfig(cfg)
+	hub, err := NewHubWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewHubWithConfig: %v", err)
+	}
 	if obs != nil {
 		hub.SetObserver(obs)
 	}
