@@ -47,11 +47,25 @@ function summarize(kind, data) {
     case 'member_joined': return `${str(data.name, '?')} joined`;
     case 'member_left': return `${str(data.name, '?')} left`;
     case 'health_changed': {
-      // prev_health is "" for the first transition after a server restart — the dashboard
-      // only remembers a node's last-published value in-process, so there is honestly
-      // nothing prior to show, not a malformed field.
+      const name = str(data.name, '?');
+      const health = str(data.health, '?');
+      // prev_health === health is a VALID, expected shape (internal/coordinator's dwell
+      // logic, wired through healthData in internal/dashboard/wire.go): a fired
+      // sustained-degradation dwell, or its recovery counterpart clearing, rides this
+      // same event with both fields equal, because the node's LIVENESS did not change —
+      // only its quality verdict did. Rendering that as "degraded → degraded" reads as a
+      // no-op; render it as the verdict it is instead.
+      if (data.prev_health !== undefined && data.prev_health === data.health) {
+        return health === 'healthy'
+          ? `${name}: degradation cleared (${health})`
+          : `${name}: sustained ${health} (verdict, not a transition)`;
+      }
+      // prev_health being "" would mean a genuinely unknown prior value. The coordinator
+      // now always sends a real Event.PrevHealth (§15.14), so this path should not fire
+      // in normal operation against this server build — kept only as defensive handling
+      // against a malformed/older payload, not as an expected case.
       const prev = data.prev_health ? str(data.prev_health) : '(first observation)';
-      return `${str(data.name, '?')}: ${prev} → ${str(data.health, '?')}`;
+      return `${name}: ${prev} → ${health}`;
     }
     case 'topology': return `root=${str(data.root, '?')} outcome=${str(data.outcome, '?')}${data.reason ? ` (${data.reason})` : ''}`;
     // §9.4 v2.6: `self_promoted` removed from the wire — EventReparent is only ever emitted
@@ -66,7 +80,10 @@ function summarize(kind, data) {
       return `epoch ${fmtId(data.epoch)}: ${str(data.prev, '?')} → ${to} (${str(data.reason, '?')})`;
     }
     case 'announce_repair': return `${str(data.name, '?')}: peer at epoch ${fmtId(data.peer_epoch)} vs meet epoch ${fmtId(data.meet_epoch)} — ${data.resolved ? 'resolved' : 'repairing'}`;
-    case 'stale_rejected': return `${str(data.name, '?')} rejected (epoch ${fmtId(data.epoch)}, rev ${fmtId(data.rev)}): ${str(data.reason)}`;
+    // total is that peer's cumulative refusal count this session (coordinator.Event.Count)
+    // — the informative part of this event, and NOT the meet-wide sum shown elsewhere
+    // (see state.js applyDelta for why those two numbers are never mixed).
+    case 'stale_rejected': return `${str(data.name, '?')} rejected (epoch ${fmtId(data.epoch)}, rev ${fmtId(data.rev)}, total ${fmtId(data.total)}): ${str(data.reason)}`;
     case 'settling': return `waiting for ${Array.isArray(data.waiting) ? data.waiting.join(', ') || 'telemetry' : 'telemetry'}`;
     case 'unbuildable': return str(data.reason, 'no reason given');
     case 'demo': return `${str(data.action, '?')} → ${str(data.target, '?')} (by ${str(data.by_remote_addr, 'unknown')})`;

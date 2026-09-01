@@ -89,9 +89,13 @@ function connectingLabel(status) {
 }
 
 function renderEpochBar(meet, wsStatus) {
-  // §6.8/§9.4: stale_rejected legitimately reads 0 (Phase 6 wiring for this counter is
-  // incomplete server-side) — that is honest data, not a fault, so 0 stays in the neutral
-  // colour rather than a warning colour.
+  // §6.8/§9.4/§15.14: stale_rejected legitimately reads 0 — either nothing has ever been
+  // refused, or (§15.14) a peer whose fence just reset on rejoin — so 0 stays in the
+  // neutral colour rather than a warning colour; it is honest data, not a missing-wiring
+  // artifact. This field is snapshot-only: it is the coordinator's meet-wide sum and only
+  // ever arrives on a `snapshot` frame, never synthesized from the per-peer `total` on a
+  // `stale_rejected` delta (see state.js applyDelta) — so between snapshots it can lag the
+  // true total by however many refusals have not yet triggered a resync.
   const staleRejected = typeof meet.stale_rejected === 'number' ? meet.stale_rejected : 0;
   // Coordinator is "" for BOTH "vacant" and "the arbiter itself is coordinating" — the
   // two are distinguished by arbiter_is_coordinator, never by testing the name for "".
