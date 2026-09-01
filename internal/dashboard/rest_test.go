@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/SammyUrfen/conclave/internal/arbiter"
+	"github.com/SammyUrfen/conclave/internal/policy"
 )
 
 // TestListMeets pins GET /api/meets against §9.3 and §9.4b: the row schema, the
@@ -276,6 +278,58 @@ func TestJoinURLDerivation(t *testing.T) {
 				t.Errorf("peer_command = %v, want %v", join["peer_command"], wantCmd)
 			}
 		})
+	}
+}
+
+// TestJoinCommandIsValidInput pins that the rendezvous this endpoint hands a human is a
+// command that WORKS when pasted unchanged.
+//
+// joinurl.go interpolates the meet id and the name placeholder into a shell command with
+// NO escaping, relying entirely on policy's patterns to make that safe — so every value
+// it emits must satisfy the pattern the receiving surface enforces. The name placeholder
+// is the one that bit: the hub validates -name against policy.ValidPeerName, which is
+// lowercase-only, so an uppercase YOUR_NAME is rejected the moment it is used as
+// intended. A copy button that hands out a failing command is worse than no button.
+func TestJoinCommandIsValidInput(t *testing.T) {
+	meets := &fakeMeets{created: arbiter.Meet{ID: "standup", CreatedAt: testAt}}
+	_, ts := newTestServer(t, Config{Meets: meets})
+	_, body := doJSON(t, ts, http.MethodPost, "/api/meets", `{"id":"standup"}`, nil)
+	join, ok := body["join"].(map[string]any)
+	if !ok {
+		t.Fatalf("no join block: %v", body)
+	}
+	cmd, _ := join["peer_command"].(string)
+	fields := strings.Fields(cmd)
+	got := map[string]string{}
+	for i := 0; i+1 < len(fields); i++ {
+		if strings.HasPrefix(fields[i], "-") {
+			got[fields[i]] = fields[i+1]
+		}
+	}
+
+	name := got["-name"]
+	if name == "" {
+		t.Fatalf("peer_command has no -name value: %q", cmd)
+	}
+	if !policy.ValidPeerName(name) {
+		t.Errorf("peer_command -name %q fails policy.ValidPeerName (%s) — pasting this "+
+			"command verbatim is rejected by the hub", name, policy.PeerNamePattern)
+	}
+	if room := got["-room"]; !policy.ValidMeetID(room) {
+		t.Errorf("peer_command -room %q fails policy.ValidMeetID", room)
+	}
+	// Still obviously a placeholder: a valid-but-plausible real name would be worse,
+	// because a user would paste it without noticing they had joined as someone else.
+	if !strings.Contains(name, "-") && !strings.Contains(name, "_") {
+		t.Errorf("-name %q does not read as a placeholder", name)
+	}
+	// Every interpolated value must be shell-safe on its own terms, since nothing here
+	// quotes them.
+	for flag, v := range got {
+		if strings.ContainsAny(v, " \t\"'$`;&|<>()") {
+			t.Errorf("peer_command %s value %q contains shell metacharacters and is "+
+				"interpolated unescaped", flag, v)
+		}
 	}
 }
 
