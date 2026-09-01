@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"sync"
 	"testing"
@@ -632,4 +634,139 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+// TestPeerBeatsAndDeclaresOnTheWire is the end-to-end proof for the two features
+// that fail SILENTLY when they are merely unwired.
+//
+// It runs the real runCall against a real signaling.Hub over a real WebSocket and
+// reads what the server's Observer actually receives. Nothing here is mocked at the
+// wire, which is the point: a unit test on sampleReport proves the struct marshals,
+// not that the frame is ever sent — and "the frame is never sent" is exactly the
+// shape of both bugs. No PeerConnection is created, because this peer is alone in
+// the meet, so the test costs a socket and no media.
+func TestPeerBeatsAndDeclaresOnTheWire(t *testing.T) {
+	tests := []struct {
+		name              string
+		coordinatable     string
+		wantCoordinatable bool
+	}{
+		{name: "willing by default", coordinatable: "-coordinatable=true", wantCoordinatable: true},
+		{name: "declining", coordinatable: "-coordinatable=false", wantCoordinatable: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obs := &captureObserver{}
+			hub := signaling.NewHub(testLogger())
+			hub.SetObserver(obs)
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET /ws", hub.ServeWS)
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			// A 20 ms cadence keeps the test quick. It is legal configuration — the
+			// coordinator sizes every threshold from the cadence a peer DECLARES, and
+			// floors it at the socket-detection budget, so a fast beater is safe.
+			opts, err := parseArgs([]string{
+				"-call", "-managed", "-name", "relay", "-server", srv.URL,
+				"-room", "wire-test", "-heartbeat", "20ms", "-upload-kbps", "1500",
+				tt.coordinatable,
+			})
+			if err != nil {
+				t.Fatalf("parseArgs: %v", err)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- runCall(ctx, testLogger(), opts.cfg) }()
+
+			waitFor(t, "a telemetry report and two heartbeats on the wire", func() bool {
+				return obs.count(signaling.TypeMetrics) >= 1 && obs.count(signaling.TypeHeartbeat) >= 2
+			})
+
+			var rep metrics.Report
+			if err := json.Unmarshal(obs.last(signaling.TypeMetrics), &rep); err != nil {
+				t.Fatalf("decode report: %v", err)
+			}
+			if rep.Coordinatable != tt.wantCoordinatable {
+				t.Errorf("report.Coordinatable on the wire = %v, want %v", rep.Coordinatable, tt.wantCoordinatable)
+			}
+			if rep.Name != "relay" || rep.UploadKbps != 1500 {
+				t.Errorf("report = %+v, want name=relay upload_kbps=1500", rep)
+			}
+
+			var hb metrics.Heartbeat
+			if err := json.Unmarshal(obs.last(signaling.TypeHeartbeat), &hb); err != nil {
+				t.Fatalf("decode heartbeat: %v", err)
+			}
+			if hb.Name != "relay" {
+				t.Errorf("heartbeat name = %q, want relay", hb.Name)
+			}
+			if hb.Seq < 2 {
+				t.Errorf("heartbeat seq = %d, want the counter to be advancing", hb.Seq)
+			}
+			// The cadence must be the one -heartbeat asked for: the coordinator reads
+			// it back to size this peer's degraded/gone thresholds, and a wrong value
+			// here declares a perfectly healthy peer gone.
+			if got := hb.Interval(); got != 20*time.Millisecond {
+				t.Errorf("declared cadence = %v, want 20ms (-heartbeat must reach interval_ms)", got)
+			}
+
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("runCall returned %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("runCall did not return after its context was cancelled")
+			}
+		})
+	}
+}
+
+// captureObserver records the control-plane frames the Hub terminates, so the test
+// can assert on what the SERVER received rather than on what the peer intended.
+type captureObserver struct {
+	mu   sync.Mutex
+	seen map[signaling.Type][][]byte
+}
+
+func (o *captureObserver) record(t signaling.Type, payload []byte) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.seen == nil {
+		o.seen = make(map[signaling.Type][][]byte)
+	}
+	o.seen[t] = append(o.seen[t], append([]byte(nil), payload...))
+}
+
+func (o *captureObserver) count(t signaling.Type) int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return len(o.seen[t])
+}
+
+func (o *captureObserver) last(t signaling.Type) []byte {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	frames := o.seen[t]
+	if len(frames) == 0 {
+		return nil
+	}
+	return frames[len(frames)-1]
+}
+
+func (o *captureObserver) PeerJoined(string, string, string) {}
+func (o *captureObserver) PeerLeft(string, string)           {}
+func (o *captureObserver) Metrics(_, _ string, payload []byte) {
+	o.record(signaling.TypeMetrics, payload)
+}
+func (o *captureObserver) Heartbeat(_, _ string, payload []byte) {
+	o.record(signaling.TypeHeartbeat, payload)
+}
+func (o *captureObserver) Reparented(_, _ string, payload []byte) {
+	o.record(signaling.TypeReparented, payload)
 }
