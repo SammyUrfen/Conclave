@@ -551,6 +551,11 @@ type peerPlane struct {
 	// a plain bool guarded by the single-owner rule.
 	hosts atomic.Bool
 
+	// selfID reports this peer's server-assigned id, or "" before the joined frame
+	// lands. It is how the host's own locally-injected frames get the attribution the
+	// server would otherwise have stamped on them.
+	selfID func() string
+
 	// newCoordinator is the constructor, injected so a test can substitute a fake
 	// and count how many are built. Nil is filled in by newPeerPlane.
 	newCoordinator func(coordinator.Config) planeCoordinator
@@ -572,6 +577,7 @@ func newPeerPlane(log *slog.Logger, room, selfName string, clk clock.Clock,
 		selfName: selfName,
 		clk:      clk,
 		send:     send,
+		selfID:   func() string { return "" },
 		events:   make(chan planeEvent, planeQueueDepth),
 	}
 	p.newCoordinator = func(cfg coordinator.Config) planeCoordinator {
@@ -616,6 +622,48 @@ func (p *peerPlane) announce(ann arbiter.Announcement, adopted, self bool) {
 		p.log.Error("dropped a coordinator announcement: plane queue full",
 			slog.Uint64("epoch", ann.Epoch), slog.Bool("self", self))
 	}
+}
+
+// selfReport and selfBeat inject the HOST's own telemetry into the coordinator this
+// peer is hosting.
+//
+// They exist because of an asymmetry that is correct on both sides and leaves a hole
+// in the middle. The server refuses to forward a peer's frames back to that same peer
+// (§8 rule 2 skips coordID == peerID) — echoing them would double the traffic on the
+// one socket least able to afford it. So an elected coordinator hears from every node
+// in the meet EXCEPT the one it is running on, and nothing on the wire can ever fix
+// that: the frame is correctly never sent. The host is a member like any other; it is
+// just the one member its own coordinator cannot learn about remotely.
+//
+// Left unfed, the health FSM sees a member that never beats and declares it gone —
+// the coordinator evicting its own host from the tree while that host is alive and
+// publishing. Measured worst case: an elected peer that was the meet's only
+// relay-capable node excluded itself, leaving no eligible root and no tree at all.
+//
+// They take the SAME value that goes on the wire and route it through the SAME path a
+// remote peer's frame takes, marshalled and attributed exactly as the server would
+// have stamped it. The round trip through JSON is deliberate: it costs nothing at 1 Hz
+// and it means the host cannot drift into being a specially-shaped member that the
+// health FSM treats differently from everyone else.
+func (p *peerPlane) selfReport(rep metrics.Report) { p.postSelf(signaling.TypeMetrics, rep) }
+
+func (p *peerPlane) selfBeat(hb metrics.Heartbeat) { p.postSelf(signaling.TypeHeartbeat, hb) }
+
+// postSelf queues one locally-originated frame as if the server had delivered it.
+func (p *peerPlane) postSelf(kind signaling.Type, body any) {
+	id := p.selfID()
+	if id == "" {
+		// Before the joined frame lands there is no id to attribute this to, and a
+		// member record keyed on "" would be a phantom node the meet never had.
+		return
+	}
+	msg, err := controlFrame(kind, body)
+	if err != nil {
+		p.log.Warn("could not encode a self-report", slog.String("type", string(kind)), slog.Any("error", err))
+		return
+	}
+	msg.From = id
+	p.post(msg)
 }
 
 // Dropped counts events shed by post/announce. Nonzero means the control link
@@ -765,6 +813,17 @@ func (p *peerPlane) onElection(ctx context.Context, ann arbiter.Announcement, se
 	// coordinator.
 	p.coord.SetEpoch(p.room, ann.Epoch)
 	p.hosts.Store(true)
+
+	// Admit the host NOW, not on its first self-report. The join settle can expire in
+	// the gap, and a tree built in that window would exclude the very node computing
+	// it. PeerJoined is the same call the wire would have made for any other member,
+	// and the coordinator's roster handling is idempotent, so a later TypeMembership
+	// naming this peer costs nothing.
+	if id := p.selfID(); id != "" {
+		p.coord.PeerJoined(p.room, id, p.selfName)
+	} else {
+		p.log.Warn("elected before this peer knows its own id; the host will be admitted by its first self-report")
+	}
 }
 
 // stop tears the hosted coordinator down and joins its goroutine.
@@ -1063,6 +1122,7 @@ func runCall(ctx context.Context, logger *slog.Logger, cfg callConfig) error {
 		// Every control frame this peer's coordinator would need, queued and returned
 		// immediately — media calls this on its Run goroutine.
 		rcfg.OnControlFrame = plane.post
+		plane.selfID = func() string { return router.SelfID() }
 	}
 	router = media.NewRouter(logger, client, rcfg)
 	logger.Info("running call",
@@ -1089,6 +1149,13 @@ func runCall(ctx context.Context, logger *slog.Logger, cfg callConfig) error {
 		reporter := metrics.NewReporter(logger, metrics.DefaultInterval, clk,
 			func() metrics.Report { return sampleReport(cfg) },
 			func(rep metrics.Report) error {
+				// Tee to the local coordinator first. The server will not forward this
+				// peer's own frames back to it, so if this process is hosting the
+				// coordinator, THIS is the only path by which it learns about its own
+				// host. Same value, same cadence as every other member's.
+				if plane != nil {
+					plane.selfReport(rep)
+				}
 				msg, err := controlFrame(signaling.TypeMetrics, rep)
 				if err != nil {
 					return err
@@ -1107,6 +1174,11 @@ func runCall(ctx context.Context, logger *slog.Logger, cfg callConfig) error {
 			// tree from, rather than inheriting its predecessor's beliefs (§6.6).
 			func() metrics.Heartbeat { return realizedBeat(router) },
 			func(h metrics.Heartbeat) error {
+				// Tee, for the same reason as the report above: a host that never
+				// appears to beat is declared gone by its own coordinator.
+				if plane != nil {
+					plane.selfBeat(h)
+				}
 				msg, err := controlFrame(signaling.TypeHeartbeat, h)
 				if err != nil {
 					return err
