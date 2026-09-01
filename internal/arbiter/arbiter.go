@@ -408,8 +408,9 @@ func (a *Arbiter) ListMeets(ctx context.Context) ([]Meet, error) {
 	return out, nil
 }
 
-// ListEndedMeets returns the tombstone ring, newest first, so an operator reviewing
-// the failover they just watched sees it at the top.
+// ListEndedMeets returns the tombstone ring in the contract's order: EndedAt
+// descending, then id ascending — newest first, so an operator reviewing the failover
+// they just watched sees it at the top.
 //
 // It is a separate method rather than a second return value from ListMeets because the
 // dashboard serves both in one body but a handler test wants to narrow each seam on its
@@ -418,10 +419,17 @@ func (a *Arbiter) ListEndedMeets(ctx context.Context) ([]EndedMeet, error) {
 	var out []EndedMeet
 	err := a.query(ctx, func() {
 		a.reap(a.clk.Now())
-		out = make([]EndedMeet, 0, len(a.ended))
-		for i := len(a.ended) - 1; i >= 0; i-- {
-			out = append(out, a.ended[i])
-		}
+		out = append(make([]EndedMeet, 0, len(a.ended)), a.ended...)
+		// Sorted, not merely reversed. Insertion order is REAP order, and a reap
+		// sweeps by id — so a batch that ended at different times would come back in
+		// the wrong order, and a batch that ended at the same time in the reverse of
+		// the one the contract asks for.
+		sort.Slice(out, func(i, j int) bool {
+			if !out[i].EndedAt.Equal(out[j].EndedAt) {
+				return out[i].EndedAt.After(out[j].EndedAt)
+			}
+			return out[i].ID < out[j].ID
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -451,7 +459,7 @@ func (a *Arbiter) reap(now time.Time) {
 	for _, id := range due {
 		ms := a.meets[id]
 		delete(a.meets, id)
-		a.ended = append(a.ended, ms.tombstone(now))
+		a.ended = append(a.ended, ms.tombstone())
 		if len(a.ended) > MaxEndedMeets {
 			a.ended = a.ended[len(a.ended)-MaxEndedMeets:]
 		}

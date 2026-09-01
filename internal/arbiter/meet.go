@@ -27,10 +27,10 @@ import (
 type Meet struct {
 	ID        string
 	CreatedAt time.Time
-	// EndedAt is zero while the meet is live, and set when it is reaped. A reaped
-	// meet leaves the registry, so a live listing never carries a non-zero EndedAt;
-	// the field exists so one type can describe a meet at either point in its life.
-	EndedAt time.Time
+	// There is deliberately no EndedAt here. A reaped meet leaves the registry, so
+	// the field could never hold a value, and a field that is structurally always
+	// zero states something false about the type. The end time lives on the
+	// tombstone, EndedMeet.EndedAt, which is the only place it can be observed.
 	Members int
 	// Epoch is the current term. 0 means no coordinator has ever been named here.
 	Epoch uint64
@@ -53,8 +53,22 @@ type Meet struct {
 // telemetry, because an unbounded history is the same denial of service in a
 // different map.
 type EndedMeet struct {
-	ID          string
-	CreatedAt   time.Time
+	ID        string
+	CreatedAt time.Time
+	// EndedAt is when the meet WENT EMPTY — the moment its last participant left —
+	// not when it was reaped.
+	//
+	// The distinction is not pedantic. Reaping is LAZY: it happens on a registry
+	// mutation or a listing, so on a quiet server nothing triggers a sweep and a
+	// reap-time stamp could be late by hours rather than by MeetTTL. "Ended 14:20"
+	// for a call that finished at 11:59 is the kind of wrong nobody notices and
+	// nobody can debug, whereas a tombstone that merely APPEARS late is visibly late.
+	//
+	// The value is the FINAL emptiness: a meet that empties, is rejoined, and empties
+	// again carries the last one. That falls out of emptyAt being cleared on rejoin
+	// rather than needing its own rule. Reap time is an implementation artifact and
+	// is deliberately not recorded at all — no consumer needs it, and a second
+	// timestamp would only invite the same confusion back.
 	EndedAt     time.Time
 	PeakMembers int
 	FinalEpoch  uint64
@@ -188,11 +202,15 @@ func (ms *meetState) snapshot(arbiterID string) Meet {
 }
 
 // tombstone renders this meet as the record left behind when it is reaped.
-func (ms *meetState) tombstone(now time.Time) EndedMeet {
+//
+// It takes no instant: the end time is ms.emptyAt, already recorded when the last
+// member left. Passing the reap time in would make the caller's clock the source of a
+// value that is not about the caller's moment at all.
+func (ms *meetState) tombstone() EndedMeet {
 	return EndedMeet{
 		ID:          ms.id,
 		CreatedAt:   ms.createdAt,
-		EndedAt:     now,
+		EndedAt:     ms.emptyAt,
 		PeakMembers: ms.peakMembers,
 		FinalEpoch:  ms.epoch,
 		Elections:   ms.elections,
