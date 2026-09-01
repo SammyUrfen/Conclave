@@ -17,7 +17,9 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
+	"github.com/SammyUrfen/conclave/internal/metrics"
 	"github.com/SammyUrfen/conclave/internal/overlay"
 )
 
@@ -140,16 +142,27 @@ func TestMemorylessRequestProducesAMemorylessTree(t *testing.T) {
 // quietly absorb one.
 func TestMeaningfulZerosAreHonoured(t *testing.T) {
 	t.Run("SocketDetection 0 disables the floor", func(t *testing.T) {
-		c := &Coordinator{cfg: normalize(Config{SocketDetection: 0, GoneAfter: hourAway})}
-		if got := c.goneThreshold(&nodeState{}); got != hourAway {
-			t.Fatalf("a zero socket window must not be replaced by a default; threshold %v", got)
+		// The threshold has to be SHORTER than any plausible default the mutation
+		// could inject, or the floor is unreachable and the assertion is vacuous —
+		// which is exactly what the first version of this sub-test was.
+		const short = time.Second
+		c := &Coordinator{cfg: normalize(Config{SocketDetection: 0, GoneAfter: short})}
+		if got := c.goneThreshold(&nodeState{}); got != short {
+			t.Fatalf("a zero socket window must not be replaced by a default: it would "+
+				"FLOOR every threshold at it; got %v want %v", got, short)
 		}
 	})
 	t.Run("DegradedAfter and GoneAfter 0 derive from the peer's cadence", func(t *testing.T) {
+		// Asserted through the thresholds themselves, not through the stored zeros: a
+		// normalize that filled in a constant would still leave the fields readable,
+		// but a peer declaring a 5s cadence would be judged against the default.
 		c := &Coordinator{cfg: normalize(Config{})}
-		if c.cfg.DegradedAfter != 0 || c.cfg.GoneAfter != 0 {
-			t.Fatalf("these zeros mean 'derive per node' and must survive normalize; got %v/%v",
-				c.cfg.DegradedAfter, c.cfg.GoneAfter)
+		ns := &nodeState{interval: 5 * time.Second}
+		if got, want := c.degradedThreshold(ns), metrics.DegradedAfter(5*time.Second); got != want {
+			t.Fatalf("degraded threshold = %v, want %v derived from the declared cadence", got, want)
+		}
+		if got, want := c.goneThreshold(ns), metrics.GoneAfter(5*time.Second); got != want {
+			t.Fatalf("gone threshold = %v, want %v derived from the declared cadence", got, want)
 		}
 	})
 	t.Run("DefaultUploadKbps 0 keeps an unproven peer a leaf", func(t *testing.T) {
