@@ -2157,11 +2157,15 @@ one.
 with the sitting coordinator impaired on all three axes at once (nftables dropping 40%
 of its media UDP, a 125 ms-each-way control-link proxy, and a namespaced `/proc/stat`
 standing in for a saturated machine): `epoch 2, reason demotion`,
-reproduced across two runs. Note *which* peers were eligible to replace it: one
-advertises 500 kbit/s and the other 9000, they score alike, and the two runs picked
-different winners — because `UploadKbps` does not appear in `arbiter.Score` at all.
-That is §2.1's control/data-plane split visible in a live log line rather than only in
-the reflection test that enforces it.
+reproduced across two runs. The victim held the role until t+60 s, lost it in the
+following interval, and the successor then held it for four more minutes without
+flapping.
+
+Note *which* peer replaced it, both times: the one advertising **500 kbit/s**, over a
+candidate advertising 9000. That is not a defect — `UploadKbps` does not appear in
+`arbiter.Fitness` at all, so the two score alike on the control-plane axes and the name
+tiebreak decides. §2.1's control/data-plane split, visible in a live log line rather
+than only in the reflection test that enforces it.
 
 **The backup-parent path, and the A/B that finally exercised it.** Cutting a relay's
 media with `nft` while leaving its WebSocket alive is what the backup path was designed
