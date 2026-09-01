@@ -1,6 +1,6 @@
 # PLAN.md — the Phase 5–6 architecture contract
 
-> **Status: v2.3, FROZEN**, 2026-09-01. v1 was frozen the same day, reviewed adversarially by
+> **Status: v2.4, FROZEN**, 2026-09-01. v1 was frozen the same day, reviewed adversarially by
 > two independent reviewers (12 critical + ~15 major findings), and amended in place. **§15 is
 > the amendment log — read it first if you built against v1**, because several frozen names
 > changed. v2 also reconciles the document with what WI-0 actually shipped; where the shipped
@@ -324,6 +324,15 @@ both and correctly declined to resolve either unilaterally:
   `cmd/server` asserting `arbiter.DefaultArbiterID == signaling.ServerID` is REQUIRED.**
   `DefaultArbiterID` is a test fallback, never a second source of truth: `cmd/server` MUST
   pass `Config.ArbiterID` explicitly.
+
+  **TWO tests are required, and they prove different things (§15.12).** WI-5 shipped the
+  first in an external `arbiter_test` package — a test-only import of `signaling` that links
+  into no binary and adds no production edge, which is the right way to reach across a
+  forbidden edge. It asserts **the constants agree**. WI-9 must still add the second, in
+  `cmd/server`, asserting **the wiring actually passes it** — that the constructed arbiter's
+  `Config.ArbiterID == signaling.ServerID`. Constants agreeing while `main` forgets to pass
+  them is exactly the failure a single test would miss, so the `arbiter_test` copy does not
+  discharge §2.4's requirement.
 
 The two get different answers because one has a natural home and the other does not. "Move it
 somewhere shared" is right only when a *correct* shared home exists; otherwise it manufactures
@@ -2314,10 +2323,8 @@ func (a *Arbiter) Metrics(roomID, peerID string, payload []byte)
 type Meet struct {
 	ID        string
 	CreatedAt time.Time
-	// EndedAt is zero while the meet is live; set when it is reaped (§6.9).
-	EndedAt time.Time
-	Members int
-	Epoch   uint64
+	Members   int
+	Epoch     uint64
 	Coordinator    string // peer name; "" ⇒ vacant (§6.8) or the arbiter itself
 	CoordinatorID  string // Config.ArbiterID when the arbiter coordinates
 	Relays         []string // REALIZED, ascending
@@ -2326,11 +2333,26 @@ type Meet struct {
 }
 
 // EndedMeet is the tombstone left behind when a meet is reaped (§6.9), so an operator can
-// still review the demo they just ran instead of watching it vanish the instant the last
-// peer disconnects. Deliberately small and fixed-size — it carries counts, never telemetry.
+// still review the demo they just ran instead of watching it vanish the instant the last peer
+// disconnects. Deliberately small and fixed-size — it carries counts, never telemetry.
 type EndedMeet struct {
-	ID          string
-	CreatedAt   time.Time
+	ID        string
+	CreatedAt time.Time
+	// EndedAt is when the meet WENT EMPTY — the moment its last participant left — NOT
+	// when it was reaped (CORRECTED, §15.12).
+	//
+	// v2.3 stamped this at reap time, which is wrong by up to MeetTTL and, because reaping
+	// is LAZY (§6.9), potentially wrong by much more: on a quiet server nothing triggers a
+	// sweep, so a meet that ended at 11:59 could be stamped hours later. "Ended 14:20" for a
+	// call that finished at 11:59 is the kind of wrong nobody notices and nobody can debug.
+	//
+	// The value is the final emptyAt: a meet that goes empty, is rejoined, and goes empty
+	// again carries the LAST one, which falls out naturally because emptyAt is cleared on
+	// rejoin. Reap time is an implementation artifact and is deliberately not recorded — no
+	// consumer needs it, and a second timestamp would only invite the same confusion back.
+	//
+	// The tombstone may still APPEAR late (lazy reaping). That is fine and honest: a late
+	// appearance is visibly late, a wrong timestamp is invisibly wrong.
 	EndedAt     time.Time
 	PeakMembers int
 	FinalEpoch  uint64
@@ -2426,7 +2448,25 @@ the formula is real; the inputs are not yet.** Do not claim otherwise in a demo.
 | **Promotion** | `Score(challenger) - Score(incumbent) > PromoteMarginScore`, sustained past `ElectionDwell`, and `MinTermDuration` has elapsed since the last change. | ≥ 20 s |
 | **Re-announce** | ANY membership change in a meet that already has a coordinator. Epoch is **unchanged**; the announcement is re-broadcast so a joiner (or a peer that lost its fence) adopts it. Not an election — see §8 routing rule 5 / §15/C6. | immediate |
 | **Manual** | `POST /api/demo/meets/{id}/elect` (demo surface only, §9.6). | immediate |
-| **Vacate** | The coordinator is lost or demoted and NO eligible candidate exists. Announce `ReasonVacated` at a bumped epoch (§6.8). | immediate |
+| **Vacate** | The coordinator is **lost** (`!Live`) and NO eligible candidate exists. Announce `ReasonVacated` at a bumped epoch (§6.8). | immediate |
+
+**A LIVE but ineligible incumbent with no replacement KEEPS the role (RATIFIED, §15.12).**
+v2.3's row said "lost **or demoted**"; the implementation vacates only on loss, and the
+implementation is right. Demotion is a *replacement* operation — it means "hand this to
+someone better" — so with nobody to hand it to there is nothing to do, and vacating would stop
+all re-optimization for the meet in exchange for nothing. A live incumbent below
+`DemoteBelowScore` is still *functioning*: it ingests telemetry, computes trees, and pushes
+them. It is a poor coordinator, not a dead one.
+
+This is the same principle as rank 0b's soft impairment filter (§3.4) applied one plane up:
+**a degraded parent beats no parent; a degraded coordinator beats no coordinator.** The rule
+holds regardless of *why* the incumbent became ineligible — low score, TURN-bound, or
+`!Coordinatable` — because the alternative is strictly worse for every participant. A peer
+that genuinely wants out can leave the meet, which converts this into the loss path.
+
+So there are exactly two ways the role ends: the incumbent is **lost**, or a **replacement**
+is available. There is no third "resign into a vacancy" path, and adding one would be a way
+to make a working meeting worse.
 
 **PRECEDENCE when demotion and promotion both apply: DEMOTION wins (RATIFIED, §15.10).**
 WI-5 chose this and it is right. The two produce the same *action* — replace the incumbent —
@@ -2526,10 +2566,27 @@ type Announcement struct {
 	IssuedAt time.Time `json:"issued_at"`
 }
 
-// Announcer ships an Announcement to every member of a meet. Consumer-defined here so
-// arbiter never imports signaling; cmd/server adapts it to hub.SendRoom.
+// Announcer ships an Announcement to peers. Consumer-defined here so arbiter never imports
+// signaling; cmd/server adapts each method to the matching Hub call.
+//
+// TWO methods, because there are two genuinely different deliveries (RATIFIED, §15.12). v2.3
+// froze only the broadcast form while §6.8's repair required a unicast — a contradiction the
+// WI-5 implementer resolved correctly rather than broadcasting, since broadcasting would
+// violate §6.8's own stated reason for unicasting (one wedged peer must not cost N frames per
+// second).
 type Announcer interface {
+	// AnnounceCoordinator broadcasts to every member of a meet: elections, vacancies, and
+	// the membership-change re-broadcast of §8 rule 5. cmd/server adapts it to hub.SendRoom.
 	AnnounceCoordinator(roomID string, a Announcement) error
+	// RepairCoordinator re-sends the meet's CURRENT announcement to ONE lagging peer
+	// (§6.8). cmd/server adapts it to hub.SendTo.
+	//
+	// Named for its PURPOSE rather than its shape (RepairCoordinator, not
+	// AnnounceCoordinatorTo) because §6.8 makes the repair a first-class concept with its
+	// own event kind and its own transition semantics. A reader at the call site should be
+	// able to tell it is the repair path and not an election, and a future caller should
+	// have to think before reaching for the unicast form for some other purpose.
+	RepairCoordinator(roomID, peerID string, a Announcement) error
 }
 
 // Publisher is the arbiter's dashboard seam, separate from coordinator.Publisher because
@@ -2826,6 +2883,30 @@ const MaxEndedMeets = 20
 `GET /api/meets` returns both, always: `{"meets": [...], "ended": [...]}`. No query
 parameter — `ended` is capped at 20 tiny objects, so making the frontend ask for it would be
 ceremony with no payoff.
+
+**`MaxMeets` is a HARD cap on `CreateMeet` and a SOFT cap on peer auto-create (RATIFIED,
+§15.12).** A peer dialling `/ws?room=X` for a meet that does not exist auto-creates it, and
+that path logs a warning and proceeds past the cap rather than refusing. The implementer was
+right, and the asymmetry is principled rather than sloppy:
+
+- **Refusing would strand a live participant.** The Hub has already admitted the peer by the
+  time the arbiter hears about it, so a refusal produces a peer that exists on the wire but
+  not in the control plane — invisible to the coordinator, unreachable by any tree. That is
+  strictly worse than one extra map entry.
+- **The two paths have different threat profiles, and the cap is aimed at one of them.**
+  `MaxMeets` exists to bound *unauthenticated writes that persist without a live connection*:
+  `POST /api/meets` lets a caller create a meet, walk away, and have it occupy the registry
+  for `MeetTTL`. The auto-create path cannot do that — it requires **holding a WebSocket
+  open**, and the moment that socket drops the meet goes empty and enters the reap path. So
+  auto-created meets are bounded by *concurrent connections*, which is a real bound enforced
+  by file descriptors, and the marginal cost of the map entry is negligible beside the socket
+  that must be held to keep it.
+
+Rejected: a Hub-side admission check (`HubConfig.AdmitRoom func(string) bool`) rejecting the
+upgrade before `register`, which would make the cap uniformly hard with no stranded peer. It
+buys a bound we already have by another route, at the cost of a new `signaling → arbiter`
+seam and a new failure mode for legitimate users at the door. Revisit only if auto-created
+meets are ever observed to be the binding resource, which the socket cost makes unlikely.
 
 **Honest limitation:** this bounds *state*, not *request rate*. An attacker can still churn
 create/reap indefinitely. Per-IP rate limiting is out of scope for a portfolio system with no
@@ -3332,6 +3413,7 @@ run to run. Every collection now has a stated order:
 | dashboard `nodes[]` | ascending by `name` |
 | dashboard `edges[]` | topological, mirroring `Topology.Edges` |
 | dashboard `meets[]` | `created_at_unix_ms` descending, then `id` ascending |
+| dashboard `ended[]` | `ended_at_unix_ms` descending, then `id` ascending — newest-first, mirroring `meets[]` (§15.12) |
 
 ```go
 // Hub gains:
@@ -3801,6 +3883,10 @@ package dashboard
 // tests run against a fake with no arbiter at all.
 type MeetSource interface {
 	ListMeets(ctx context.Context) ([]arbiter.Meet, error)
+	// ListEndedMeets returns the tombstone ring (§6.9), newest-first per §8.1. Added in
+	// v2.4: §9.3 mandates an `ended[]` array that this interface previously gave the
+	// dashboard no way to reach.
+	ListEndedMeets(ctx context.Context) ([]arbiter.EndedMeet, error)
 	CreateMeet(ctx context.Context, id string) (arbiter.Meet, error)
 	GetMeet(ctx context.Context, id string) (arbiter.Meet, error)
 }
@@ -4037,6 +4123,23 @@ safe.
 > deterministically: no sockets, no pion, no media, no wall clock.** Every temporal
 > behaviour is driven through `clock.Clock` and asserted in virtual time. Enforced by
 > `make check-determinism` (§4.7), not by review discipline.
+
+**The ONE deliberate exception: generated meet ids use `crypto/rand`.** It is the only
+non-replayable value any control-plane package emits, and it is that way on purpose — a
+counter or a seeded PRNG would make **every live meet enumerable on an unauthenticated
+surface**, so anyone could walk the id space and join or read meets they were never told
+about. Unpredictability is a security property here, not a stylistic choice, and it outranks
+replayability.
+
+Determinism is recovered at a **seam, not by weakening the source**:
+`arbiter.Config.NewMeetID func() string`, which tests replace with a counter. Production
+leaves it nil and gets `crypto/rand`.
+
+> **Do not "fix" this for determinism.** If `make check-determinism` or a future lint ever
+> flags `crypto/rand` in `arbiter`, the correct response is to exempt it and point at this
+> paragraph — not to swap in `math/rand`. A client-supplied id is validated by
+> `policy.ValidMeetID` and never generated, so this applies only to the server-generated
+> form (§9.4a).
 
 ### 12.2 What is tested where
 
@@ -4525,7 +4628,31 @@ reproduces the all-impaired reshuffle (**two** nodes moving, not one), and harde
 unconditional filter fails with `cannot attach … every candidate was filtered out`. Only the
 second expression of it, in rank 1, is removed.
 
-### 15.12 Where I think a reviewer is wrong
+### 15.12 v2.4 — WI-5 follow-up rulings
+
+| # | Finding | Ruling | § |
+|---|---|---|---|
+| 1 | §6.3's `Announcer` was broadcast-only, but §6.8's repair requires a unicast — a direct contradiction between two frozen sections. | **Ratified `RepairCoordinator(roomID, peerID, a)`.** Broadcasting would violate §6.8's own stated reason for unicasting. `cmd/server` adapts `AnnounceCoordinator`→`hub.SendRoom` and `RepairCoordinator`→`hub.SendTo`. Named for purpose, not shape, so a reader can tell the repair path from an election at the call site. | 6.3 |
+| 2 | `EndedMeet.EndedAt` recorded the REAP time, lagging the real end by up to `MeetTTL`. | **Corrected to the final `emptyAt`** — when the last participant left. Worse than stated: reaping is *lazy*, so on a quiet server the stamp could be hours late. Reap time is an implementation artifact and is deliberately not recorded at all; a second timestamp would only invite the confusion back. A tombstone that *appears* late is visibly late; a wrong timestamp is invisibly wrong. | 6.1 |
+| 3 | `Meet.EndedAt` is structurally always zero (a reaped meet leaves the registry). | **Deleted.** My error, introduced in v2.3. Same class of trap as the clause §15.11 just removed — a field that cannot hold a value states something false about the type. | 6.1 |
+| 4 | §6.2's Vacate row said "lost **or demoted**"; the implementation vacates only on loss. | **Ratified the implementation, fixed the row.** Demotion is a *replacement* operation, so with no replacement there is nothing to do. Same principle as rank 0b one plane up: **a degraded parent beats no parent; a degraded coordinator beats no coordinator.** It holds regardless of *why* the incumbent became ineligible; a peer that wants out leaves the meet, which is the loss path. There is no "resign into a vacancy". | 6.2 |
+| 5 | `ended[]` had no ordering rule while every other replayed collection does. | **Added:** `ended_at_unix_ms` descending, then `id` ascending — newest-first, mirroring `meets[]`. | 8.1 |
+| 6 | `MaxMeets` is hard on `CreateMeet`, soft on peer auto-create. | **Ratified, and the asymmetry is principled.** Refusing would strand a live participant the Hub has already admitted — visible on the wire, invisible to the control plane. And the cap targets *unauthenticated writes that persist without a live connection*, which is `POST /api/meets` alone: auto-created meets require **holding a socket open**, so they are bounded by concurrent connections and enter the reap path the moment it drops. Rejected a Hub-side `AdmitRoom` check: it buys a bound we already have, for a new `signaling → arbiter` seam and a new door-slam for legitimate users. | 6.9 |
+
+**Also recorded.**
+
+- **`crypto/rand` for generated meet ids is a deliberate determinism exception**, now stated in
+  §12.1 so nobody "fixes" it. A counter would make every live meet enumerable on an
+  unauthenticated surface; unpredictability is a security property that outranks replayability
+  here. Determinism is recovered at the `Config.NewMeetID` seam, not by weakening the source.
+- **`MeetSource.ListEndedMeets`** added — §9.3 mandated an `ended[]` array that §9.7's
+  interface gave the dashboard no way to reach. WI-7 consumes it.
+- **Both `ArbiterID` equality tests are required.** WI-5's external `arbiter_test` package
+  (a test-only `signaling` import that links into no binary) asserts **the constants agree**;
+  WI-9's `cmd/server` test must still assert **the wiring passes it**. Constants agreeing while
+  `main` forgets to pass them is precisely what one test alone would miss.
+
+### 15.13 Where I think a reviewer is wrong
 
 - **"`Supersedes` should be deleted."** Not taken. It is genuinely needed for *ordering* —
   the coordinator sequencing its own trees, the dashboard detecting a stale snapshot. The
@@ -4538,5 +4665,5 @@ second expression of it, in rank 1, is removed.
 
 ---
 
-*This document is FROZEN at v2.3. Amendments go through the owner, in this file, recorded in
+*This document is FROZEN at v2.4. Amendments go through the owner, in this file, recorded in
 §15. Implementers: build what is written, and report what is wrong.*
