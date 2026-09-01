@@ -219,6 +219,25 @@ type Heartbeat struct {
 	// of every new epoch depend on nothing but hash seed — silently destroying the
 	// determinism the whole test strategy rests on. Call Normalize before sending.
 	Children []ChildLink `json:"children,omitempty"`
+	// StaleRejected is how many control-plane instructions this peer's fence has
+	// REFUSED since it last joined (media.Router.StaleRejected()).
+	//
+	// It rides the heartbeat rather than Report because it is CONTROL state, not
+	// telemetry: this frame already carries the peer's fence (Epoch, Rev), and this
+	// counter is that same fence's refusal count — so the number and the fence that
+	// produced it are consistent by construction rather than by two frames happening
+	// to agree. Report's 3 s cadence would also be the wrong rhythm for something an
+	// operator watches during a handover.
+	//
+	// CUMULATIVE and MONOTONIC within a session, and RESET ON REJOIN exactly like
+	// Seq. That reset is a requirement, not a stylistic echo: the fence itself resets
+	// on TypeJoined, so a counter that survived a rejoin would be reporting refusals
+	// made under a fence that no longer exists. It matters because the coordinator
+	// emits its stale event on an INCREASE, never per heartbeat — so a carried-over
+	// total would either mask a genuine refusal (the new total never climbs past the
+	// stale high-water mark) or manufacture one out of a peer that has refused
+	// nothing. omitempty because the healthy case is 0 on every beat from every peer.
+	StaleRejected uint64 `json:"stale_rejected,omitempty"`
 }
 
 // ChildLink is one realized downstream edge: the child's stable label and the pion
