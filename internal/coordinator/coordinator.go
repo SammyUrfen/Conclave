@@ -151,6 +151,10 @@ type roomState struct {
 	rebuildUntil time.Time
 	heard        map[string]bool
 	baseline     *overlay.Topology
+	// handoverNote records WHY the baseline is missing, when it is missing for a bad
+	// reason. It rides the term's first EventTopology, because that tree — the one
+	// where everybody moves — is exactly where the explanation is needed.
+	handoverNote string
 
 	published *overlay.Topology
 	working   *overlay.Topology
@@ -1222,6 +1226,7 @@ func (c *Coordinator) abandonTerm(rs *roomState) {
 	rs.rebuilding = false
 	rs.rebuildUntil = time.Time{}
 	rs.heard = nil
+	rs.handoverNote = ""
 }
 
 // markUrgentIfUnplaced sets the room's cooldown bypass when some named, live member

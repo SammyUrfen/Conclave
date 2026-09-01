@@ -85,6 +85,30 @@ const (
 // outside. NOT part of the frozen surface — see the WI-3 report.
 const ReasonNoEligibleRoot = "no eligible root: no member can serve a child"
 
+// The two ways rebuild-from-peers (§6.6) can degrade, carried on the first
+// EventTopology of a term so the degradation is visible where its consequence is.
+//
+// Both produce the SAME visible symptom — a from-scratch tree, so nearly every peer
+// re-parents — and they have completely different causes and different fixes. Collapsing
+// them, or reporting neither, leaves an operator watching every handover reconfigure the
+// whole meet with no way to tell a broken telemetry path from ordinary churn. This is
+// the same discipline §5.9a forced one plane down, where "we have not heard from anyone
+// yet" and "this fleet is over-constrained" had to stop sharing one warning.
+//
+// They are exported so a test can assert on the distinction; the dashboard renders
+// Event.Reason as text and never parses it.
+const (
+	// ReasonNoRealizedState: the peers beat, but none of them named a parent, so there
+	// was no realized topology to reconstruct. The likely cause is a peer build that
+	// does not populate metrics.Heartbeat's Parent/Children — i.e. the input to §6.6 is
+	// missing rather than contradictory — and the fix is on the peer, not the fleet.
+	ReasonNoRealizedState = "rebuild-from-peers: no realized topology was reported; this handover degraded to a full rebuild"
+	// ReasonRealizedStateInvalid prefixes the case where the peers DID describe a
+	// topology and it is not a legal tree — the mid-flight re-parent captured
+	// half-applied that §6.6 admits as residual. The validator's complaint is appended.
+	ReasonRealizedStateInvalid = "rebuild-from-peers: the reported realized topology is not a legal tree"
+)
+
 // Config parameterises the coordinator. Every duration is honoured through Clock, so
 // a simnet scenario can drive all of them in virtual time.
 type Config struct {

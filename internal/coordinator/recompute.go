@@ -38,7 +38,7 @@ func (c *Coordinator) recompute(rs *roomState, cause string) {
 		}
 		rs.rebuilding = false
 		rs.rebuildUntil = time.Time{}
-		rs.baseline = c.reconstructBaseline(rs)
+		rs.baseline, rs.handoverNote = c.reconstructBaseline(rs)
 		rs.heard = nil
 	}
 
@@ -121,7 +121,11 @@ func (c *Coordinator) build(rs *roomState, nodes []overlay.Node, cause string) {
 		StickinessMs: c.cfg.StickinessMs,
 	}
 
-	outcome, reason := OutcomeBuilt, ""
+	// A degraded handover explains itself on the tree that shows the damage. If the
+	// build ALSO goes relaxed, both explanations are kept and the handover's comes
+	// first: it is the upstream cause, and the relaxed error is a consequence of
+	// rebuilding without a baseline.
+	outcome, reason := OutcomeBuilt, rs.handoverNote
 	next, err := overlay.BuildTree(nodes, rs.working, cons)
 	if err != nil {
 		relaxed, err2 := overlay.BuildTree(nodes, nil, cons)
@@ -132,7 +136,12 @@ func (c *Coordinator) build(rs *roomState, nodes []overlay.Node, cause string) {
 		// The FIRST attempt's error is carried as the reason, because it is the only
 		// explanation of why every peer is about to be re-parented; discarding it
 		// would make the event unreadable.
-		next, outcome, reason = relaxed, OutcomeRelaxed, err.Error()
+		next, outcome = relaxed, OutcomeRelaxed
+		if reason == "" {
+			reason = err.Error()
+		} else {
+			reason += "; " + err.Error()
+		}
 		c.log.Warn("stability-preserving build failed; published a relaxed tree",
 			slog.String("room_id", rs.id), slog.String("cause", cause),
 			slog.Any("sticky_error", err))
@@ -163,9 +172,10 @@ func (c *Coordinator) publishTree(rs *roomState, next *overlay.Topology, outcome
 	// Ratifications are consumed by the tree that folds them in; carrying them
 	// forward would re-apply a promotion the fleet has since moved past.
 	rs.promotions = make(map[string]string)
-	// Likewise the reconstructed baseline: it seeds exactly the first tree of a term,
-	// after which `published` is the real thing to be sticky about.
-	rs.baseline = nil
+	// Likewise the reconstructed baseline and its degradation note: they belong to
+	// exactly the first tree of a term, after which `published` is the real thing to be
+	// sticky about.
+	rs.baseline, rs.handoverNote = nil, ""
 
 	// A relaxed publish is a SUCCESS, but a rare and expensive one the operator
 	// should see: a meet that goes relaxed repeatedly is telling you the fleet is
@@ -391,8 +401,10 @@ func (c *Coordinator) unheard(rs *roomState) []string {
 }
 
 // reconstructBaseline rebuilds a stickiness baseline for a new term out of what the
-// peers say they have REALIZED, or returns nil if what they described is not a legal
-// tree.
+// peers say they have REALIZED. It returns nil, plus a human-readable reason, when that
+// is not possible for a BAD reason — no realized state was reported at all, or what was
+// reported is not a legal tree. The reason is empty when the fallback is unremarkable
+// (a term over a meet too small to have had a tree).
 //
 // It is built over the REDUCED node set actually heard from, never the full roster.
 // That is the M5 correction and it is the whole reason this is worth doing: validating
@@ -407,29 +419,47 @@ func (c *Coordinator) unheard(rs *roomState) []string {
 // node holds or was pushed. A new coordinator reconstructs ground truth, not its
 // predecessor's beliefs, and that is what makes a handover after a crash take the same
 // code path as a graceful one.
-func (c *Coordinator) reconstructBaseline(rs *roomState) *overlay.Topology {
+func (c *Coordinator) reconstructBaseline(rs *roomState) (*overlay.Topology, string) {
 	all, _ := c.project(rs)
+	if len(all) < MinBuildableMembers {
+		// A term over a meet with nobody (or one peer) in it has nothing to rebuild
+		// from, and nothing is wrong with that. Flagging it would fire on the very
+		// first tree of every meet, which is how a real signal becomes noise.
+		return nil, ""
+	}
+
 	heardNodes := make([]overlay.Node, 0, len(rs.heard))
 	parents := make(map[string]string, len(rs.heard))
+	named := 0
 	for _, n := range all {
 		if !rs.heard[n.Name] {
 			continue
 		}
 		heardNodes = append(heardNodes, n)
-		parents[n.Name] = c.realParentOf(rs, n.Name)
+		p := c.realParentOf(rs, n.Name)
+		parents[n.Name] = p
+		if p != "" {
+			named++
+		}
 	}
-	if len(heardNodes) < MinBuildableMembers {
-		return nil // nothing worth being sticky about
+	if len(heardNodes) < MinBuildableMembers || named == 0 {
+		// The input to rebuild-from-peers is MISSING, not contradictory. Warn rather
+		// than Info: the meet is about to re-parent everyone, and unlike ordinary churn
+		// this has a cause an operator can actually fix.
+		c.log.Warn("rebuild-from-peers has no realized topology to work from",
+			slog.String("room_id", rs.id), slog.Uint64("epoch", rs.epoch),
+			slog.Int("heard", len(heardNodes)), slog.Int("with_parent", named))
+		return nil, ReasonNoRealizedState
 	}
 
 	obs := reconstructObserved(parents, rs.epoch)
 	if obs == nil {
-		c.log.Info("realized state has no unique root; rebuilding without a stickiness baseline",
+		c.log.Warn("realized topology has no unique root; rebuilding without a stickiness baseline",
 			slog.String("room_id", rs.id), slog.Int("heard", len(heardNodes)))
-		return nil
+		return nil, ReasonRealizedStateInvalid + ": no unique root among the reported parents"
 	}
 
-	// Validate insists on a stamped tree (Epoch and Rev ≥ 1), while the baseline must
+	// Validate insists on a stamped tree (Epoch and Rev >= 1), while the baseline must
 	// carry Rev 0 so BuildTree's "the revision must advance" guard passes against the
 	// term's first tree at Rev 1. Both requirements are right and they simply disagree,
 	// so the oracle sees a stamped copy and the builder gets the real one.
@@ -443,15 +473,17 @@ func (c *Coordinator) reconstructBaseline(rs *roomState) *overlay.Topology {
 		// The residual case the contract admits: a genuinely torn tree, e.g. a
 		// mid-flight re-parent captured half-applied. Falling back to a memoryless
 		// build is expensive but correct; seeding the builder with an illegal baseline
-		// would not be.
-		c.log.Info("realized state is not a legal tree; rebuilding without a stickiness baseline",
+		// is not, and is observable — an illegal baseline that is honourable up to its
+		// last edge pins incumbents, strands the remainder, and forces the relaxed
+		// retry.
+		c.log.Warn("realized topology is not a legal tree; rebuilding without a stickiness baseline",
 			slog.String("room_id", rs.id), slog.Any("error", err))
-		return nil
+		return nil, ReasonRealizedStateInvalid + ": " + err.Error()
 	}
 	c.log.Info("reconstructed a stickiness baseline from peer heartbeats",
 		slog.String("room_id", rs.id), slog.Uint64("epoch", rs.epoch),
 		slog.Int("heard", len(heardNodes)), slog.Int("edges", len(obs.Edges)))
-	return obs
+	return obs, ""
 }
 
 // realParentOf is the upstream neighbour a member last reported having ACTUALLY
