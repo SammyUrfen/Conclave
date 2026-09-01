@@ -403,10 +403,12 @@ func TestRealizedBeat(t *testing.T) {
 				fence:  overlay.Fence{Epoch: 4, CoordinatorID: "p1", Rev: 9},
 				parent: "root", state: "connected",
 				children: []metrics.ChildLink{{Name: "leaf-a", State: "connected"}, {Name: "leaf-b", State: "connecting"}},
+				stale:    3,
 			},
 			want: metrics.Heartbeat{
 				Epoch: 4, Rev: 9, Parent: "root", ParentState: "connected",
-				Children: []metrics.ChildLink{{Name: "leaf-a", State: "connected"}, {Name: "leaf-b", State: "connecting"}},
+				Children:      []metrics.ChildLink{{Name: "leaf-a", State: "connected"}, {Name: "leaf-b", State: "connecting"}},
+				StaleRejected: 3,
 			},
 		},
 		{
@@ -429,6 +431,26 @@ func TestRealizedBeat(t *testing.T) {
 				Epoch: 5, Rev: 2, Parent: "old-relay", ParentState: "disconnected",
 				Children: []metrics.ChildLink{{Name: "leaf-c", State: "connected"}},
 			},
+		},
+		{
+			// Passed through verbatim, at whatever total the fence currently holds.
+			// The coordinator emits on an INCREASE, so clamping, smoothing or
+			// carrying a value here would either suppress a real refusal or
+			// manufacture one out of a peer that has refused nothing.
+			name: "the refusal counter rides the same frame as the fence",
+			src: fakeOverlay{
+				fence: overlay.Fence{Epoch: 7, Rev: 3}, parent: "relay", state: "connected", stale: 12,
+			},
+			want: metrics.Heartbeat{
+				Epoch: 7, Rev: 3, Parent: "relay", ParentState: "connected", StaleRejected: 12,
+			},
+		},
+		{
+			// The healthy case, and the reason the gap was invisible: 0 is what a
+			// system with a working fence looks like on every beat.
+			name: "a peer that has refused nothing reports zero",
+			src:  fakeOverlay{fence: overlay.Fence{Epoch: 1, Rev: 1}, parent: "relay", state: "connected"},
+			want: metrics.Heartbeat{Epoch: 1, Rev: 1, Parent: "relay", ParentState: "connected"},
 		},
 		{
 			name: "the root has no parent",
@@ -454,12 +476,14 @@ type fakeOverlay struct {
 	parent   string
 	state    string
 	children []metrics.ChildLink
+	stale    uint64
 }
 
 func (f *fakeOverlay) Fence() overlay.Fence { return f.fence }
 func (f *fakeOverlay) Realized() (string, string, []metrics.ChildLink) {
 	return f.parent, f.state, f.children
 }
+func (f *fakeOverlay) StaleRejected() uint64 { return f.stale }
 
 var _ overlayReporter = (*fakeOverlay)(nil)
 var _ overlayReporter = (*media.Router)(nil)
@@ -1034,6 +1058,71 @@ func TestPeerReportsRealizedTreeOnTheWire(t *testing.T) {
 			t.Errorf("%s reported children %+v; a leaf has none", leaf, hb.Children)
 		}
 	}
+
+	// --- the fence's refusal counter, end to end -----------------------------
+	//
+	// Every other link in this chain exists — media counts refusals, the
+	// coordinator emits on an increase, the dashboard renders the total — so the
+	// only way the panel can read 0 forever is if the number never leaves the peer.
+	// A healthy system also reads 0, which is why this has to be asserted against a
+	// peer that has genuinely refused something.
+	if n := mustHeartbeatFrom(t, obs, "relay").StaleRejected; n != 0 {
+		t.Fatalf("relay reported %d refusals before any bogus push; want 0", n)
+	}
+
+	// Two pushes that are perfectly well-formed and strictly NEWER (epoch 1, rev 2
+	// and 3) but come from a sender the arbiter never named. Only the authorization
+	// clause can reject them, so the count is unambiguous — an ordering-only fence
+	// would accept both and the assertion below would read 0.
+	relayID := peerIDFor(t, hub, room, "relay")
+	for _, rev := range []uint64{2, 3} {
+		bogus, err := json.Marshal(overlay.Topology{
+			Epoch: 1, Rev: rev, Root: "leaf-a",
+			Edges: []overlay.Edge{{Parent: "leaf-a", Child: "relay"}, {Parent: "leaf-a", Child: "leaf-b"}},
+		})
+		if err != nil {
+			t.Fatalf("marshal bogus topology: %v", err)
+		}
+		// An explicit From survives stampServer, so this arrives exactly as a
+		// peer-originated push would: a node claiming the coordinator's job.
+		if !hub.SendTo(room, relayID, signaling.Message{
+			Type: signaling.TypeTopology, From: "impostor", Payload: bogus,
+		}) {
+			t.Fatal("could not deliver the bogus push")
+		}
+	}
+
+	waitForSlow(t, "the relay to report both refusals on a heartbeat", func() bool {
+		hb, ok := lastHeartbeatFrom(t, obs, "relay")
+		return ok && hb.StaleRejected == 2
+	})
+	if got := mustHeartbeatFrom(t, obs, "relay").StaleRejected; got != 2 {
+		t.Errorf("relay stale_rejected = %d, want 2", got)
+	}
+	// The count is per peer and read from that peer's own fence, never fabricated:
+	// the leaves were sent nothing and must still report nothing.
+	for _, leaf := range []string{"leaf-a", "leaf-b"} {
+		if n := mustHeartbeatFrom(t, obs, leaf).StaleRejected; n != 0 {
+			t.Errorf("%s stale_rejected = %d, want 0 (it was sent no bogus push)", leaf, n)
+		}
+	}
+	// The refused pushes must not have been APPLIED: the relay is still the root
+	// serving both leaves, not a child of leaf-a.
+	if hb := mustHeartbeatFrom(t, obs, "relay"); hb.Parent != "" || len(hb.Children) != 2 {
+		t.Errorf("a refused push changed the tree: relay parent=%q children=%+v", hb.Parent, hb.Children)
+	}
+}
+
+// peerIDFor resolves a topology name to the runtime id the server assigned it.
+func peerIDFor(t *testing.T, hub *signaling.Hub, room, name string) string {
+	t.Helper()
+	for _, p := range hub.Roster(room) {
+		if p.Name == name {
+			return p.ID
+		}
+	}
+	t.Fatalf("no peer named %q in the meet", name)
+	return ""
 }
 
 // connectedState is pion's PeerConnectionState string for a live edge. Spelled once
