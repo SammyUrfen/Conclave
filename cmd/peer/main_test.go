@@ -1696,6 +1696,11 @@ func TestPeerPlaneFeedsItsHostLocally(t *testing.T) {
 
 	p.selfReport(metrics.Report{Name: "relay", UploadKbps: 6000, NAT: overlay.NATDirect, Coordinatable: true})
 	p.selfBeat(metrics.Heartbeat{Name: "relay", Seq: 1, IntervalMs: 50, Epoch: 1, Rev: 1})
+	// A coordinator peer is a peer in the tree like any other, so it can lose its own
+	// parent and promote its own backup — and §8 rule 2 skips coordID == peerID for
+	// reparented exactly as it does for the other two, so its own coordinator would
+	// never hear the promotion it is supposed to RATIFY.
+	p.selfReparented(metrics.Reparented{Name: "relay", From: "root", To: "leaf-a", OK: true, Epoch: 1, Rev: 1})
 	p.sync()
 
 	got := fake.latest().snap()
@@ -1708,12 +1713,16 @@ func TestPeerPlaneFeedsItsHostLocally(t *testing.T) {
 	if !reflect.DeepEqual(got.beats, []string{"p1"}) {
 		t.Errorf("self beat attribution = %v, want [p1]", got.beats)
 	}
+	if !reflect.DeepEqual(got.reparents, []string{"p1"}) {
+		t.Errorf("self re-parent attribution = %v, want [p1]", got.reparents)
+	}
 
 	t.Run("nothing is injected before this peer is elected", func(t *testing.T) {
 		q, qf := newTestPlane(t)
 		q.selfID = func() string { return "p1" }
 		q.selfReport(metrics.Report{Name: "relay"})
 		q.selfBeat(metrics.Heartbeat{Name: "relay", Seq: 1})
+		q.selfReparented(metrics.Reparented{Name: "relay", OK: true})
 		q.sync()
 		if qf.count() != 0 {
 			t.Fatal("a self-report constructed a coordinator on its own")
