@@ -149,6 +149,110 @@ func TestImpairmentIsASoftFilter(t *testing.T) {
 	}
 }
 
+// assertImpairedIncumbentInvariant checks the §3.4a IMPAIRED-INCUMBENT INVARIANT as a
+// BLACK-BOX property of BuildTree's output, deliberately without reference to any rank:
+//
+//	prev.ParentOf(u) == P  ∧  P.Impaired  ∧  a non-impaired candidate was eligible for u
+//	⇒  next.ParentOf(u) != P
+//
+// This is what rank 1's deleted !Impaired clause stood for. The clause could not enforce
+// it (it was unreachable); a property test can, and it stays true no matter which rank
+// happens to produce it — which is the entire reason it is stated as a property.
+//
+// THE PREMISE IS WITNESSED BY THE ROOT, and that choice is what makes the assertion
+// sound rather than merely plausible. "Eligible for u" is a fact about the moment u was
+// placed, which a black-box test cannot observe: a candidate with spare capacity in the
+// FINAL tree may have been attached only after u was processed, so using it as the
+// witness would fail spuriously. The root cannot have that problem. It is attached
+// first, before any node is placed, and capacity is only ever consumed — so if the root
+// is non-impaired and still has a free slot at the END, it certainly had one, at legal
+// depth, when u was placed. The witness is conservative: it may under-report the premise,
+// never over-report it.
+//
+// Returns the number of (u, P) pairs where the premise actually held, so a caller can
+// refuse to pass vacuously.
+func assertImpairedIncumbentInvariant(t *testing.T, prev, next *Topology, nodes []Node, c Constraints) int {
+	t.Helper()
+	byName := map[string]Node{}
+	for _, n := range nodes {
+		byName[n.Name] = n
+	}
+	rootNode, ok := byName[next.Root]
+	if !ok || rootNode.Impaired || c.MaxDepth < 1 {
+		return 0 // no sound witness available; the premise is unprovable here
+	}
+	rootFree := len(next.ChildrenOf(next.Root)) < capacityOf(rootNode, c)
+
+	held := 0
+	for _, e := range prev.Edges {
+		u, was := e.Child, e.Parent
+		if !byName[was].Impaired {
+			continue
+		}
+		if _, still := byName[u]; !still {
+			continue
+		}
+		if !rootFree || was == next.Root || u == next.Root {
+			continue // premise not witnessed
+		}
+		held++
+		if got := next.ParentOf(u); got == was {
+			t.Errorf("IMPAIRED-INCUMBENT INVARIANT violated: %q is still parented to the impaired %q, "+
+				"although the root %q was a non-impaired candidate with a free slot",
+				u, was, next.Root)
+		}
+	}
+	return held
+}
+
+// TestImpairedIncumbentInvariant sweeps the invariant over a fleet, impairing each node
+// in turn. It is the enforcement that replaced rank 1's unreachable !Impaired clause: a
+// test enforces, a clause only asserts, and an unreachable clause does not even do that.
+func TestImpairedIncumbentInvariant(t *testing.T) {
+	base := []Node{
+		{Name: "R", UploadKbps: 20000}, // cap 10: the root always has a free slot
+		{Name: "A", UploadKbps: 8000},
+		{Name: "B", UploadKbps: 8000},
+		{Name: "C", UploadKbps: 4000},
+		{Name: "d", RTT: map[string]float64{"A": 10, "B": 40}},
+		{Name: "e", RTT: map[string]float64{"B": 10, "A": 40}},
+		{Name: "f"},
+	}
+	cons := Constraints{Root: "R", MaxDepth: 3, StreamKbps: 2000, Epoch: 1, Rev: 1, StickinessMs: DefaultStickinessMs}
+	prev := mustBuild(t, base, nil, cons)
+	if err := Validate(prev, base, cons); err != nil {
+		t.Fatalf("base tree: %v", err)
+	}
+
+	total := 0
+	for _, victim := range []string{"A", "B", "C", "d", "e", "f"} {
+		t.Run("impair_"+victim, func(t *testing.T) {
+			nodes := make([]Node, len(base))
+			copy(nodes, base)
+			for i := range nodes {
+				if nodes[i].Name == victim {
+					nodes[i].Impaired = true
+				}
+			}
+			next := mustBuild(t, nodes, prev, deltaRev(cons, 2))
+			if err := Validate(next, nodes, deltaRev(cons, 2)); err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+			total += assertImpairedIncumbentInvariant(t, prev, next, nodes, deltaRev(cons, 2))
+		})
+	}
+	if total == 0 {
+		t.Fatal("the invariant premise never held across the sweep; the test proves nothing")
+	}
+	t.Logf("invariant premise held for %d (node, impaired-parent) pairs", total)
+}
+
+// deltaRev returns c with a different Rev, so a sweep can rebuild from one prev.
+func deltaRev(c Constraints, rev uint64) Constraints {
+	c.Rev = rev
+	return c
+}
+
 // TestImpairmentCouplingRule is the §3.4 coupling rule, and §12.2 requires BOTH of its
 // branches: one fleet, differing ONLY in whether a single candidate is impaired, must
 // produce two different outcomes.
