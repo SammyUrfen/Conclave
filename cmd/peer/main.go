@@ -415,6 +415,7 @@ func adoptAnnouncement(log *slog.Logger, selfID func() string, adopt coordinator
 type overlayReporter interface {
 	Fence() overlay.Fence
 	Realized() (parent string, parentState string, children []metrics.ChildLink)
+	StaleRejected() uint64
 }
 
 // realizedBeat samples the half of a heartbeat that only the media layer knows: the
@@ -430,6 +431,15 @@ type overlayReporter interface {
 // new edge. Any filtering, defaulting or repair here would re-introduce exactly the
 // divergence rebuild-from-peers (§6.6) exists to eliminate.
 //
+// The same restraint governs StaleRejected, and there it is load-bearing in a
+// second way: the counter is cumulative and monotonic within a session and RESETS ON
+// REJOIN, because the fence producing it resets on TypeJoined (§5.7 rule 6). It is
+// therefore read fresh from the Router on every beat and passed through — never
+// remembered here, never seeded, never clamped or smoothed. The coordinator emits
+// its stale event on an INCREASE, so a value carried across a rejoin would mask a
+// genuine refusal (the new total never climbs past the old high-water mark), and any
+// smoothing would manufacture one out of a peer that has refused nothing.
+//
 // Name, Seq and IntervalMs are stamped by beater.next after this returns, so a
 // provider cannot misreport the identity a coordinator keys on.
 func realizedBeat(r overlayReporter) metrics.Heartbeat {
@@ -441,6 +451,10 @@ func realizedBeat(r overlayReporter) metrics.Heartbeat {
 		Parent:      parent,
 		ParentState: parentState,
 		Children:    children,
+		// The visible proof that the fence works, on the frame that carries the
+		// fence itself — so the number and the state that produced it are consistent
+		// by construction rather than by two frames happening to agree.
+		StaleRejected: r.StaleRejected(),
 	}
 }
 
@@ -746,8 +760,9 @@ func runCall(ctx context.Context, logger *slog.Logger, cfg callConfig) error {
 	if runErr != nil && !errors.Is(runErr, context.Canceled) {
 		return runErr
 	}
-	// stale_rejected is proof the fence works, not an error condition, so it is
-	// reported on the way out rather than warned about in flight.
+	// The session totals. stale_rejected also rides every heartbeat, so the control
+	// plane and the dashboard see it live; this line is the local closing summary,
+	// and it is proof the fence works rather than an error condition.
 	logger.Info("call ended",
 		slog.Uint64("stale_rejected", router.StaleRejected()),
 		slog.Uint64("reparent_reports_dropped", reparents.Dropped()))
