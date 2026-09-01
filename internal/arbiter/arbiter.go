@@ -934,29 +934,29 @@ func (a *Arbiter) elect(ms *meetState, now time.Time) bool {
 		return false
 	}
 
-	// NOTE ON WHAT MAKES THE DWELL REACHABLE AT ALL, because it is not obvious from
+	// NOTE ON WHAT MAKES THE DWELL REACHABLE AT ALL, because it is not visible from
 	// here: the dwell restarts whenever the target changes, so a target that changes
-	// every second is a dwell that never elapses and a role that can never move. That
-	// was harmless while every eligible peer scored identically and candidates() fell
-	// through to its name tiebreak. It stopped being harmless when RTTServerMs and
-	// CPUPct became MEASURED — two comparable peers then differ by microseconds of
-	// jitter and trade places about once a second. A live three-peer meet sat on the
-	// arbiter for five minutes announcing nothing.
+	// every second is a dwell that never elapses and a role that can never move.
 	//
-	// The fix is upstream, in candidates(): the ranking compares QUANTIZED scores, so
-	// a difference smaller than the sensors can meaningfully report cannot reorder
-	// anybody. See ScoreQuantum. TestDwellSurvivesChallengerJitter reproduces the bug
-	// and pins the fix.
+	// That was harmless while every eligible peer scored identically and candidates()
+	// fell through to its name tiebreak — the ordering was then perfectly stable. It
+	// stopped being harmless when RTTServerMs and CPUPct became MEASURED: two
+	// comparable peers differ by microseconds of jitter and trade places about once a
+	// second. A live three-peer meet run with -coordinate -elect sat on the arbiter
+	// for five minutes announcing nothing but its bootstrap.
 	//
-	// RESIDUAL, stated rather than papered over: two peers whose scores straddle a
-	// bucket boundary land in different buckets and can still trade places. A
-	// pending-target stickiness rule was written and then DELETED, because absorbing
-	// that case also absorbs an exact tie — and then the pending target, which is
-	// whichever peer happened to join first, decides a tie that
-	// TestTiesBreakDeterministically requires the name order to decide. Narrowing it
-	// to strictly-worse-but-within-a-quantum did satisfy both, but no test could be
-	// built that distinguished it from bucketing alone at reasonable cost, and
-	// unpinned mechanism is worse than a documented gap.
+	// The fix is upstream in candidates(), which ranks on QUANTIZED scores so that a
+	// difference smaller than the sensors can meaningfully report cannot reorder
+	// anybody (see ScoreQuantum). After it, the same live scenario promoted a peer at
+	// epoch 2, and instrumentation counted 8 challenger flips over 370 samples where
+	// before it flipped on nearly every one.
+	//
+	// RESIDUAL, measured rather than assumed: two peers whose drifting scores straddle
+	// a bucket boundary still trade places while they cross it, which DELAYS a
+	// handover without preventing one — the stable intervals between crossings are
+	// longer than the dwell, and the drift stops once the uptime term saturates.
+	// TestDwellSurvivesABucketBoundary pins that, and records the stickiness rule that
+	// was written for this case and deleted because it also swallowed exact ties.
 	want := a.wantedMove(ms, chal.score, now)
 	if want == "" {
 		ms.clearPending()
