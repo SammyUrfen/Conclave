@@ -358,6 +358,16 @@ func (s *Session) AddRecvOnlyVideo() error {
 // ConnectionState reports the current PeerConnection state.
 func (s *Session) ConnectionState() webrtc.PeerConnectionState { return s.pc.ConnectionState() }
 
+// stats returns pion's stats report for this session's PeerConnection. It exists so
+// selectedPairRTTMs can read the nominated ICE candidate pair's round trip without
+// the rest of the package touching the pc directly.
+//
+// It is NOT cheap — pion walks every transceiver, transport and certificate to build
+// the report — so callers must not hold Router.mu across it. Router.LinkStats
+// snapshots the sessions under the lock, releases it, and calls this outside, the
+// same shape Realized already uses for ConnectionState.
+func (s *Session) stats() webrtc.StatsReport { return s.pc.GetStats() }
+
 // Close tears down the PeerConnection (unblocking any track reads/writes) and
 // retires any pending negotiation retry. It is idempotent: the Router closes a
 // session on teardown and a superseded re-parent closes its pending one, and both

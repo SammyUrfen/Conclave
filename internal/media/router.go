@@ -180,6 +180,10 @@ type Router struct {
 	// applyTopology runs on the Run goroutine while Stats/remote-track sinks read it
 	// from others.
 	topo *overlay.Topology
+	// rtt holds this peer's measured round-trips to other peers, including ones it
+	// no longer has an edge to (see RTTMemory). Under mu because LinkStats runs on
+	// the metrics reporter's goroutine while Run mutates the peer map.
+	rtt rttStore
 	// name↔id maps translate between the stable topology names and the runtime ids
 	// the server assigns. Filled from the joined roster + peer-joined/peer-left, so
 	// every tree decision is made in names and resolved to an id here.
@@ -1267,6 +1271,75 @@ func (r *Router) Realized() (parent string, parentState string, children []metri
 	}
 	sort.Slice(children, func(i, j int) bool { return children[i].Name < children[j].Name })
 	return parent, parentState, children
+}
+
+// LinkStats is the peer-side telemetry sensor: this node's measured round-trip to
+// every peer it can still speak about, and the worst packet loss any downstream child
+// currently reports about the media this node sends it.
+//
+// It is the counterpart to Realized — same shape, same locking discipline, different
+// question. Realized answers "what edges do I actually have"; this answers "how good
+// are they".
+//
+// THE RTT SET IS WIDER THAN THE CURRENT NEIGHBOURS, deliberately. Live sessions are
+// measured now; peers this node held an edge to recently are served from rttStore's
+// memory until RTTMemory expires them. That widening is what gives overlay.BuildTree
+// a challenger to compare the incumbent parent against — see RTTMemory for why a
+// live-edges-only sensor would leave the whole min-latency rank inert.
+//
+// Loss is a SCALAR because overlay.Node.LossPct and arbiter.Fitness.LossPct are both
+// scalars. Note the two consumers want subtly different things — overlay wants this
+// node's media uplink loss, arbiter's field is documented as control-link loss — and
+// one wire field serves both. That mismatch predates this sensor and is recorded in
+// docs/DESIGN.md §8.1 rather than papered over here.
+//
+// Meaningful in tree mode only; a full-mesh Router has no overlay position to report.
+func (r *Router) LinkStats() (peerRTT []metrics.PeerRTT, lossPct float64) {
+	// Snapshot names and sessions together under the one lock, exactly as Realized
+	// does: reading the peer map and the id↔name map separately could observe a peer
+	// mid-teardown and file a measurement under an empty name.
+	type edge struct {
+		name    string
+		session *Session
+	}
+	r.mu.Lock()
+	edges := make([]edge, 0, len(r.peers))
+	for id, link := range r.peers {
+		name := r.nameByID[id]
+		if name == "" || link.session == nil {
+			continue
+		}
+		edges = append(edges, edge{name: name, session: link.session})
+	}
+	r.mu.Unlock()
+
+	// Session.stats walks every transceiver and transport, so it runs OUTSIDE the
+	// lock. Holding mu across it would stall applyTopology and every pion callback
+	// that posts to Run behind a stats collection, on the reporter's cadence.
+	type measured struct {
+		name string
+		ms   float64
+	}
+	fresh := make([]measured, 0, len(edges))
+	for _, e := range edges {
+		if ms, ok := selectedPairRTTMs(e.session.stats()); ok {
+			fresh = append(fresh, measured{name: e.name, ms: ms})
+		}
+	}
+
+	now := r.clk.Now()
+	r.mu.Lock()
+	for _, m := range fresh {
+		r.rtt.record(m.name, m.ms, now)
+	}
+	peerRTT = r.rtt.snapshot(now)
+	r.mu.Unlock()
+
+	lossPct = 0
+	if r.fwd != nil {
+		lossPct = r.fwd.loss.worstPct()
+	}
+	return peerRTT, lossPct
 }
 
 // Fence returns a snapshot of this peer's authority state, for the host to report to
