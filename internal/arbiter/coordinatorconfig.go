@@ -30,20 +30,33 @@ import (
 //
 // EVERY VALUE IS RESOLVED, AND ABSENCE IS NOT REPRESENTABLE PER FIELD. This is the
 // deliberate difference from coordinator.Config, which uses 0 to mean "use the package
-// default" for StickinessMs, Dwell, RecomputeCooldown and JoinSettle. That convention
+// default" — still, today, for Dwell, RecomputeCooldown and JoinSettle. That convention
 // cannot be put on a wire, because 0 is ALSO a meaningful value for every one of them —
-// memoryless re-parenting, no hysteresis, no anti-thrash floor, build immediately — so a
-// bare number would mean "the operator chose zero" or "nobody filled this in" and no
-// reader could tell which. (That collision is live on the server today: -stickiness-ms 0
-// is documented and validated as memoryless and silently yields 25. It is the same shape
-// as an inverted boolean polarity — a value that carries meaning colliding with a
-// convention that treats it as absent.)
+// no hysteresis, no anti-thrash floor, build immediately — so a bare number would mean
+// "the operator chose zero" or "nobody filled this in" and no reader could tell which.
+// It is the same shape as an inverted boolean polarity: a value that carries meaning
+// colliding with a convention that treats it as absent.
+//
+// That collision was not hypothetical when this type was designed. StickinessMs had it
+// live on the server: -stickiness-ms 0 was documented and validated as memoryless and
+// silently yielded 25, the flag accepted and ignored. It has since been fixed AT THE
+// SOURCE — coordinator.Config.StickinessMs is now a *float64 built by
+// coordinator.Stickiness, so nil resolves to the safe default and a pointer to 0 is an
+// unambiguous request for zero — and cmd/server sends the resolved effective value, so
+// -stickiness-ms 0 travels as "stickiness_ms": 0. The history is kept because it is the
+// justification for this shape, not a defect report: it is the concrete evidence that
+// the overloaded zero bites in practice rather than in principle.
+//
+// The wire deliberately does NOT inherit the pointer. A pointer is right in
+// coordinator.Config, where nil must mean "I never thought about this, give me the safe
+// default"; it is wrong here, where every value has already been decided and nil would
+// reintroduce the absence this type exists to eliminate. It would also leave == compiling
+// while silently comparing addresses — and == is what Resolved and every "did the config
+// change" check rest on.
 //
 // So a field here always means exactly itself, and the "did anyone fill this in"
 // question is answered ONCE, by Resolved, instead of per field by a pointer or a
-// sentinel. One flag rather than four keeps the struct comparable with ==, which matters:
-// a pointer field would make == compile and silently compare addresses, which is the
-// same class of quiet wrongness this type exists to remove.
+// sentinel — one flag doing what four per-field markers would have done worse.
 //
 // Durations are carried as milliseconds rather than as time.Duration, matching
 // metrics.Heartbeat.IntervalMs — the codebase's established convention for a duration on
