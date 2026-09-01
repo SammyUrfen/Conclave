@@ -346,9 +346,13 @@ func TestListBodyIsStableJSON(t *testing.T) {
 		},
 		ended: []arbiter.EndedMeet{{ID: "gone", EndedAt: testAt}},
 	}
-	_, ts := newTestServer(t, Config{Meets: meets})
+	clk := newFixedClock()
+	_, ts := newTestServer(t, Config{Meets: meets, Clock: clk})
 	var first string
 	for i := 0; i < 20; i++ {
+		// Past the read bound each time, so these are 20 real assemblies of the body
+		// rather than 19 reads of one cached string.
+		clk.Advance(snapshotMinInterval)
 		_, body := doJSON(t, ts, http.MethodGet, "/api/meets", "", nil)
 		raw, err := json.Marshal(body)
 		if err != nil {

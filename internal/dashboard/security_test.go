@@ -78,7 +78,6 @@ func rawUpgrade(t *testing.T, serverURL, host, origin, path string) int {
 // InsecureSkipVerify plus one explicit gate through the single matcher.
 func TestUpgradeRejectsDNSRebinding(t *testing.T) {
 	_, url := standupServer(t, Config{})
-	host := strings.TrimPrefix(url, "http://")
 
 	tests := []struct {
 		name   string
@@ -88,9 +87,11 @@ func TestUpgradeRejectsDNSRebinding(t *testing.T) {
 		{name: "attacker name as both Host and Origin", host: "evil.com", origin: "http://evil.com"},
 		{name: "with a port", host: "evil.com:9000", origin: "http://evil.com:9000"},
 		{name: "case-folded, as EqualFold accepts", host: "EVIL.com", origin: "http://evil.COM"},
-		// The library compares only hosts, so a plaintext origin claiming the real
-		// server's host also slipped through even though the allow-list is scheme-exact.
-		{name: "scheme downgrade on the real host", host: host, origin: "http://" + host},
+		// The library compares HOSTS ONLY, so a plaintext origin claiming a host the
+		// allow-list permits only over https slipped through too. (The loopback host
+		// cannot show this: the shipped list allows http://127.0.0.1:* outright.)
+		{name: "scheme downgrade on an https-only host",
+			host: "sammyurfen.github.io", origin: "http://sammyurfen.github.io"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

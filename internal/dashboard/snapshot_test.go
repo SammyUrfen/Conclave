@@ -320,14 +320,19 @@ func TestNodeValueSanitising(t *testing.T) {
 // identical requests must produce byte-identical JSON. A map anywhere in the wire
 // types would fail this because Go randomises map iteration.
 func TestSnapshotBodyIsStableJSON(t *testing.T) {
+	clk := newFixedClock()
 	subnet := &fakeSubnet{}
 	subnet.set(sampleSnapshot())
 	_, ts := newTestServer(t, Config{
 		Meets:  &fakeMeets{live: []arbiter.Meet{sampleMeet()}},
 		Subnet: subnet,
+		Clock:  clk,
 	})
 	var first string
 	for i := 0; i < 20; i++ {
+		// Step past the read bound every iteration: otherwise 19 of these 20 come from
+		// the cached copy and the test asserts only that a string equals itself.
+		clk.Advance(snapshotMinInterval)
 		_, body := doJSON(t, ts, http.MethodGet, "/api/meets/standup", "", nil)
 		raw, err := json.Marshal(body)
 		if err != nil {

@@ -26,9 +26,64 @@ const (
 	provenanceIntended = "intended"
 )
 
-// snapshotBody assembles the §9.3 detail body, which is also the WS `snapshot` frame's
-// data. It calls two seams and holds no lock while doing so.
+// snapshotBody returns the §9.3 detail body, which is also the WS `snapshot` frame's
+// data, subject to the snapshotMinInterval read bound.
+//
+// The bound is the whole point: assembling this body round-trips coordinator.Snapshot
+// through the SINGLE Run goroutine that also drives heartbeats, dwell timers and
+// rebuilds, and this function is reachable unauthenticated with no socket at all. Left
+// unbounded, request rate IS control-plane load — which would undo the care the
+// coordinator took to move its outbound sends off that goroutine, and would let one
+// caller stall every meet in the process.
+//
+// A result younger than snapshotMinInterval is reused; otherwise exactly ONE caller
+// performs the read while the rest wait on it. Both halves are needed: the interval
+// bounds a sequential flood, the single-flight latch bounds a concurrent one.
+//
+// The returned body is shared, not copied. Nothing mutates a body after it is built —
+// it is marshalled and discarded — so a copy would allocate on every request to defend
+// against a write that does not exist. Do not introduce one.
+//
+// It holds no lock across either seam call, which is not an optimisation but a deadlock
+// rule: Snapshot round-trips the coordinator's Run goroutine, and Publish runs ON that
+// goroutine and takes this same lock.
 func (s *Server) snapshotBody(ctx context.Context, meetID string) (meetBody, error) {
+	for {
+		s.mu.Lock()
+		ms := s.streamLocked(meetID)
+		if !ms.snapAt.IsZero() && s.clk.Now().Sub(ms.snapAt) < snapshotMinInterval {
+			body, err := ms.snap, ms.snapErr
+			s.mu.Unlock()
+			return body, err
+		}
+		if ch := ms.snapLoading; ch != nil {
+			s.mu.Unlock()
+			select {
+			case <-ch:
+				continue // the loader has published its result; re-read the cache
+			case <-ctx.Done():
+				return meetBody{}, ctx.Err()
+			}
+		}
+		done := make(chan struct{})
+		ms.snapLoading = done
+		s.mu.Unlock()
+
+		body, err := s.readSnapshot(ctx, meetID)
+
+		s.mu.Lock()
+		ms.snap, ms.snapErr, ms.snapAt = body, err, s.clk.Now()
+		ms.snapLoading = nil
+		s.mu.Unlock()
+		close(done)
+		return body, err
+	}
+}
+
+// readSnapshot performs the actual round-trips. An error is cached alongside a success
+// so that a flood of requests for a NON-EXISTENT meet is bounded too — otherwise the
+// cheapest way to hammer the arbiter would be to ask for ids that are not there.
+func (s *Server) readSnapshot(ctx context.Context, meetID string) (meetBody, error) {
 	meet, err := s.cfg.Meets.GetMeet(ctx, meetID)
 	if err != nil {
 		return meetBody{}, err

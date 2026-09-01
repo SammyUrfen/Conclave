@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -28,15 +29,70 @@ func (s *Server) handleMeets(w http.ResponseWriter, r *http.Request) {
 
 // listMeets serves GET /api/meets: the REALIZED view plus the tombstone ring.
 func (s *Server) listMeets(w http.ResponseWriter, r *http.Request) {
-	live, err := s.cfg.Meets.ListMeets(r.Context())
+	body, err := s.listBodyCached(r.Context())
 	if err != nil {
 		s.writeInternal(w, "list meets", err)
 		return
 	}
-	ended, err := s.cfg.Meets.ListEndedMeets(r.Context())
+	s.writeJSON(w, http.StatusOK, body)
+}
+
+// listBodyCached applies the snapshotMinInterval bound to GET /api/meets, which
+// round-trips the ARBITER's single Run goroutine TWICE per request (live registry, then
+// tombstones) and is the first call every client makes — so it is the easiest amplifier
+// in the service to point a loop at. Same shape as snapshotBody: an interval to bound a
+// sequential flood, a single-flight latch to bound a concurrent one.
+//
+// listValid, separate from the interval, is what a mutation clears: creating a meet must
+// never be followed by a list that predates your own write (see createMeet).
+func (s *Server) listBodyCached(ctx context.Context) (listBody, error) {
+	for {
+		s.mu.Lock()
+		if s.listValid && s.clk.Now().Sub(s.listAt) < snapshotMinInterval {
+			body, err := s.list, s.listErr
+			s.mu.Unlock()
+			return body, err
+		}
+		if ch := s.listLoading; ch != nil {
+			s.mu.Unlock()
+			select {
+			case <-ch:
+				continue
+			case <-ctx.Done():
+				return listBody{}, ctx.Err()
+			}
+		}
+		done := make(chan struct{})
+		s.listLoading = done
+		s.mu.Unlock()
+
+		body, err := s.readList(ctx)
+
+		s.mu.Lock()
+		s.list, s.listErr, s.listAt, s.listValid = body, err, s.clk.Now(), true
+		s.listLoading = nil
+		s.mu.Unlock()
+		close(done)
+		return body, err
+	}
+}
+
+// invalidateList drops the cached listing so the next read is fresh.
+func (s *Server) invalidateList() {
+	s.mu.Lock()
+	s.listValid = false
+	s.mu.Unlock()
+}
+
+// readList performs the two arbiter round-trips and assembles the body.
+func (s *Server) readList(ctx context.Context) (listBody, error) {
+	live, err := s.cfg.Meets.ListMeets(ctx)
 	if err != nil {
-		s.writeInternal(w, "list ended meets", err)
-		return
+		return listBody{}, err
+	}
+	ended, err := s.cfg.Meets.ListEndedMeets(ctx)
+	if err != nil {
+		return listBody{}, err
 	}
 
 	body := listBody{
@@ -88,7 +144,7 @@ func (s *Server) listMeets(w http.ResponseWriter, r *http.Request) {
 		}
 		return body.Ended[i].ID < body.Ended[j].ID
 	})
-	s.writeJSON(w, http.StatusOK, body)
+	return body, nil
 }
 
 // createMeetRequest is POST /api/meets. `id` is optional: absent or empty means the
@@ -124,6 +180,9 @@ func (s *Server) createMeet(w http.ResponseWriter, r *http.Request) {
 		s.writeSourceError(w, "create meet", err, map[string]any{"id": req.ID})
 		return
 	}
+	// The caller's own write must be visible to their next read: a cached listing that
+	// predates it would read as a failed create, and the retry would 409.
+	s.invalidateList()
 	// Location alongside the body (§9.4a), so a client that follows headers and one
 	// that reads the body land in the same place.
 	w.Header().Set("Location", "/api/meets/"+meet.ID)

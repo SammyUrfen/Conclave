@@ -236,9 +236,10 @@ func TestEventStreamSeqGapOnDrop(t *testing.T) {
 // hole: {"op":"resync"} answers with a FRESH snapshot, numbered with the next seq so
 // the client's own counter stays consistent.
 func TestEventStreamResync(t *testing.T) {
+	clk := newFixedClock()
 	sub := &fakeSubnet{}
 	sub.set(sampleSnapshot())
-	s, url := standupServer(t, Config{Subnet: sub})
+	s, url := standupServer(t, Config{Subnet: sub, Clock: clk})
 	conn := dialEvents(t, url, "standup", "")
 	if f := readFrame(t, conn); f.Seq != 1 {
 		t.Fatalf("first seq = %d", f.Seq)
@@ -254,6 +255,9 @@ func TestEventStreamResync(t *testing.T) {
 	snap.Rev = 99
 	snap.Topo.Rev = 99
 	sub.set(snap)
+	// Past the read bound, so this exercises a real round-trip rather than the cached
+	// copy snapshotMinInterval is entitled to serve.
+	clk.Advance(snapshotMinInterval)
 
 	writeOp(t, conn, "resync")
 	f := readFrame(t, conn)
@@ -720,11 +724,12 @@ func TestEventsAreMeetScoped(t *testing.T) {
 // replaced rather than reconciled — it would pin the display at a high-water mark
 // belonging to a fence that no longer exists.
 func TestStaleRejectedCount(t *testing.T) {
+	clk := newFixedClock()
 	sub := &fakeSubnet{}
 	snap := sampleSnapshot()
 	snap.StaleRejected = 2
 	sub.set(snap)
-	s, url := standupServer(t, Config{Subnet: sub})
+	s, url := standupServer(t, Config{Subnet: sub, Clock: clk})
 
 	conn := dialEvents(t, url, "standup", "")
 	f := readFrame(t, conn)
@@ -747,6 +752,7 @@ func TestStaleRejectedCount(t *testing.T) {
 			t.Fatalf("frame %d kind = %q", i, got.Kind)
 		}
 	}
+	clk.Advance(resyncMinInterval)
 	writeOp(t, conn, "resync")
 	f = readFrame(t, conn)
 	if err := json.Unmarshal(f.Data, &body); err != nil {
@@ -763,6 +769,7 @@ func TestStaleRejectedCount(t *testing.T) {
 	snap = sampleSnapshot()
 	snap.StaleRejected = 0
 	sub.set(snap)
+	clk.Advance(resyncMinInterval)
 	writeOp(t, conn, "resync")
 	f = readFrame(t, conn)
 	if err := json.Unmarshal(f.Data, &body); err != nil {

@@ -183,6 +183,14 @@ type Server struct {
 	mu     sync.Mutex
 	meets  map[string]*meetStream
 	closed bool
+
+	// The same bound for GET /api/meets, which round-trips the ARBITER's single Run
+	// goroutine twice per request and is the first call every client makes.
+	list        listBody
+	listErr     error
+	listAt      time.Time
+	listLoading chan struct{}
+	listValid   bool
 }
 
 // meetStream is the per-meet fan-out state. It holds NO copy of control state: every
@@ -200,6 +208,17 @@ type meetStream struct {
 	epoch, rev uint64
 	// touched drives the maxTrackedMeets eviction.
 	touched time.Time
+
+	// snap/snapErr/snapAt/snapLoading are the read bound from snapshotMinInterval, and
+	// they are cache state ONLY — never a substitute for the coordinator's answer, just
+	// a limit on how often it is asked. snapLoading is the single-flight latch: without
+	// it a burst of concurrent requests would each miss the not-yet-populated cache and
+	// each round-trip the control plane, which is the very flood the bound exists to
+	// stop.
+	snap        meetBody
+	snapErr     error
+	snapAt      time.Time
+	snapLoading chan struct{}
 }
 
 // New constructs a Server. It fails loud on a missing MeetSource or an unusable

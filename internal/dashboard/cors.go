@@ -35,6 +35,11 @@ const (
 // one origin's answer to another.
 func (s *Server) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// nosniff on EVERY response, including errors. Error bodies reflect the
+		// requested path, and without this a browser may content-sniff a response into
+		// a type it was never sent as — which turns a reflected path into script
+		// execution on this origin. It costs one header and closes the whole class.
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		origin := r.Header.Get("Origin")
 		if origin != "" {
 			w.Header().Set("Vary", "Origin")

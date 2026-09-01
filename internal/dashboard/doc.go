@@ -34,7 +34,22 @@
 // publisher block behind a goroutine that is itself waiting on the Run loop, which is
 // a deadlock that only appears under load.
 //
-// SECOND: every collection on the wire has a defined order. Go randomises map
+// SECOND: the origin allow-list is enforced HERE, not by the WebSocket library.
+// coder/websocket's own check allows any request whose Host equals its Origin's host,
+// before consulting the configured patterns and ignoring the scheme — which a DNS
+// rebinding attacker satisfies by construction, reaching a loopback or LAN server they
+// could not otherwise dial. Both the REST CORS surface and the upgrade therefore run the
+// single policy.Origins matcher, and the library's check is disabled outright. See
+// allowUpgradeOrigin.
+//
+// THIRD: no unauthenticated request may drive a control-plane goroutine at request rate.
+// Assembling a snapshot round-trips the coordinator's single Run goroutine and listing
+// meets round-trips the arbiter's, both reachable with no socket and no credentials, so
+// both are bounded by snapshotMinInterval with a single-flight latch. Subscribers per
+// meet are capped because fan-out is per-event work on the control plane, and resync is
+// rate limited per connection.
+//
+// FOURTH: every collection on the wire has a defined order. Go randomises map
 // iteration and the frontend replays these bodies, so an unordered collection makes two
 // renderings of the same history differ. The orders are frozen in §8.1 and asserted
 // here rather than assumed of the sources.
