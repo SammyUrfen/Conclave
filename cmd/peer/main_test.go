@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -894,6 +895,12 @@ type captureObserver struct {
 	// frame the last hop to an elected coordinator peer. Without it an elected peer
 	// hears nothing from anyone, which is the pre-wiring state under test.
 	forward func(peerID string, kind signaling.Type, payload []byte)
+	// onJoin mirrors §8 rule 5 / C6: a real arbiter re-broadcasts the CURRENT
+	// announcement on every membership change, so a newcomer adopts the epoch before
+	// it can be sent a tree. It hangs off PeerJoined because that is where the real
+	// arbiter hooks it, and the Hub fires it outside its own lock and strictly after
+	// the newcomer's joined frame is queued.
+	onJoin func(peerID string)
 }
 
 func (o *captureObserver) setCoordinator(id string) {
@@ -948,8 +955,15 @@ func (o *captureObserver) last(t signaling.Type) []byte {
 	return frames[len(frames)-1]
 }
 
-func (o *captureObserver) PeerJoined(string, string, string) {}
-func (o *captureObserver) PeerLeft(string, string)           {}
+func (o *captureObserver) PeerJoined(_, peerID, _ string) {
+	o.mu.Lock()
+	hook := o.onJoin
+	o.mu.Unlock()
+	if hook != nil {
+		hook(peerID)
+	}
+}
+func (o *captureObserver) PeerLeft(string, string) {}
 func (o *captureObserver) Metrics(_, peerID string, payload []byte) {
 	o.record(signaling.TypeMetrics, payload)
 	o.fanOut(peerID, signaling.TypeMetrics, payload)
@@ -1660,4 +1674,219 @@ func announcementWithRoom(room string, epoch uint64, name, id string, cc arbiter
 	a := announcementFor(epoch, name, id, cc)
 	a.RoomID = room
 	return a
+}
+
+// TestPeerPlaneFeedsItsHostLocally covers the defect live verification found: the
+// server correctly refuses to echo a peer's own frames back to it, so an elected
+// coordinator never hears from the node it is running on. Nothing else can supply
+// that — the host must inject it locally.
+func TestPeerPlaneFeedsItsHostLocally(t *testing.T) {
+	p, fake := newTestPlane(t)
+	p.selfID = func() string { return "p1" }
+
+	p.announce(announcementFor(1, "relay", "p1", resolvedConfig()), true, true)
+	p.sync()
+
+	// Membership must exist from the moment this peer starts coordinating, not from
+	// its first self-report: the join settle can expire in between, and a tree built
+	// in that window would exclude the coordinator's own host.
+	if got := fake.latest().snap().joined; !reflect.DeepEqual(got, [][2]string{{"p1", "relay"}}) {
+		t.Fatalf("host membership at election = %v, want [[p1 relay]]", got)
+	}
+
+	p.selfReport(metrics.Report{Name: "relay", UploadKbps: 6000, NAT: overlay.NATDirect, Coordinatable: true})
+	p.selfBeat(metrics.Heartbeat{Name: "relay", Seq: 1, IntervalMs: 50, Epoch: 1, Rev: 1})
+	// A coordinator peer is a peer in the tree like any other, so it can lose its own
+	// parent and promote its own backup — and §8 rule 2 skips coordID == peerID for
+	// reparented exactly as it does for the other two, so its own coordinator would
+	// never hear the promotion it is supposed to RATIFY.
+	p.selfReparented(metrics.Reparented{Name: "relay", From: "root", To: "leaf-a", OK: true, Epoch: 1, Rev: 1})
+	p.sync()
+
+	got := fake.latest().snap()
+	// Attributed to the host's own server-assigned id, exactly as the server would
+	// have stamped it — the coordinator keys member records on that id, so anything
+	// else files the host's telemetry under a node that does not exist.
+	if !reflect.DeepEqual(got.metrics, []string{"p1"}) {
+		t.Errorf("self report attribution = %v, want [p1]", got.metrics)
+	}
+	if !reflect.DeepEqual(got.beats, []string{"p1"}) {
+		t.Errorf("self beat attribution = %v, want [p1]", got.beats)
+	}
+	if !reflect.DeepEqual(got.reparents, []string{"p1"}) {
+		t.Errorf("self re-parent attribution = %v, want [p1]", got.reparents)
+	}
+
+	// The TEE itself, not just the plane method it calls: the three self-injections
+	// live in the send closures of the reporter, the beater and the re-parent sender,
+	// and a missing one there is invisible to any test that calls the plane directly.
+	t.Run("the re-parent tee reaches the plane and still ships to the wire", func(t *testing.T) {
+		r, rf := newTestPlane(t)
+		r.selfID = func() string { return "p1" }
+		r.announce(announcementFor(1, "relay", "p1", resolvedConfig()), true, true)
+		r.sync()
+
+		var wire []signaling.Message
+		send := reparentSend(r, func(msg signaling.Message) error {
+			wire = append(wire, msg)
+			return nil
+		})
+		if err := send(metrics.Reparented{Name: "relay", From: "root", To: "leaf-a", OK: true}); err != nil {
+			t.Fatalf("reparent send: %v", err)
+		}
+		r.sync()
+
+		if got := rf.latest().snap().reparents; !reflect.DeepEqual(got, []string{"p1"}) {
+			t.Errorf("the host's own re-parent did not reach its local coordinator: %v", got)
+		}
+		if len(wire) != 1 || wire[0].Type != signaling.TypeReparented {
+			t.Errorf("the frame must still go on the wire too: %+v", wire)
+		}
+	})
+
+	t.Run("nothing is injected before this peer is elected", func(t *testing.T) {
+		q, qf := newTestPlane(t)
+		q.selfID = func() string { return "p1" }
+		q.selfReport(metrics.Report{Name: "relay"})
+		q.selfBeat(metrics.Heartbeat{Name: "relay", Seq: 1})
+		q.selfReparented(metrics.Reparented{Name: "relay", OK: true})
+		q.sync()
+		if qf.count() != 0 {
+			t.Fatal("a self-report constructed a coordinator on its own")
+		}
+	})
+
+	t.Run("an unjoined host cannot be attributed and is skipped", func(t *testing.T) {
+		q, qf := newTestPlane(t)
+		q.selfID = func() string { return "" } // before the joined frame lands
+		q.announce(announcementFor(1, "relay", "", resolvedConfig()), true, true)
+		q.sync()
+		if got := qf.latest().snap().joined; len(got) != 0 {
+			t.Errorf("injected membership without an id: %v", got)
+		}
+	})
+}
+
+// TestElectedCoordinatorIncludesItsOwnHost is the end-to-end proof, in the shape the
+// failure actually took: the elected peer is the meet's ONLY relay-capable node, so a
+// coordinator that cannot see its own host has nothing to root a tree on and publishes
+// nothing at all (ReasonNoEligibleRoot). Against the unfixed code this times out.
+//
+// It then keeps running past the gone threshold and adds a third peer, because the two
+// symptoms are distinct: publishing a first tree proves the host was ADMITTED, and
+// publishing another one after the gone window proves it was never DECLARED GONE by
+// its own coordinator while alive.
+func TestElectedCoordinatorIncludesItsOwnHost(t *testing.T) {
+	const room = "self-host"
+
+	obs := &captureObserver{}
+	hub := signaling.NewHub(testLogger())
+	hub.SetObserver(obs)
+	obs.forward = func(peerID string, kind signaling.Type, payload []byte) {
+		coordID := obs.coordinator()
+		if coordID == "" || coordID == peerID {
+			return // the server must not echo a peer's own frames back to it
+		}
+		hub.SendTo(room, coordID, signaling.Message{Type: kind, From: peerID, To: coordID, Payload: payload})
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /ws", hub.ServeWS)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
+
+	// join starts one managed peer with a declared upload budget.
+	join := func(name string, uploadKbps int) {
+		t.Helper()
+		opts, err := parseArgs([]string{
+			"-call", "-managed", "-name", name, "-server", srv.URL, "-room", room,
+			"-heartbeat", "50ms", "-upload-kbps", strconv.Itoa(uploadKbps),
+		})
+		if err != nil {
+			t.Fatalf("parseArgs(%s): %v", name, err)
+		}
+		wg.Add(1)
+		go func() { defer wg.Done(); _ = runCall(ctx, testLogger(), opts.cfg) }()
+	}
+
+	// relay is the ONLY node that can serve a child. leaf-a declares nothing, and the
+	// meet's DefaultUploadKbps is 0, so an unreported peer is not assumed capable
+	// either — the coordinator's own host is the only thing that can root a tree.
+	join("relay", 6000)
+	join("leaf-a", 0)
+	waitForSlow(t, "both peers to join", func() bool { return len(hub.Roster(room)) == 2 })
+
+	relayID := peerIDFor(t, hub, room, "relay")
+	obs.setCoordinator(relayID)
+
+	cc := resolvedConfig()
+	cc.DefaultUploadKbps = 0
+	cc.SocketDetectionMs = 200 // a fast deployment, so the floor never raises the threshold
+	// The meet overrides the health thresholds explicitly and sets them BELOW the 3s
+	// telemetry cadence. That is what makes the second assertion discriminate: any
+	// frame refreshes liveness, so with a threshold above the metrics interval a host
+	// stays healthy on its reports alone and a missing heartbeat is invisible. Below
+	// it, only the beat can keep the host alive — which is the property under test.
+	cc.DegradedAfterMs = 250
+	cc.GoneAfterMs = 500
+	ann, err := json.Marshal(announcementWithRoom(room, 1, "relay", relayID, cc))
+	if err != nil {
+		t.Fatalf("marshal announcement: %v", err)
+	}
+	if n := hub.SendRoom(room, signaling.Message{Type: signaling.TypeCoordinator, Payload: ann}); n != 2 {
+		t.Fatalf("announcement reached %d peers, want 2", n)
+	}
+	hub.SendRoom(room, signaling.Message{Type: signaling.TypeMembership, Peers: hub.Roster(room)})
+	// From here on the meet has a coordinator, so every later join must re-adopt the
+	// term the way a real arbiter would arrange.
+	obs.mu.Lock()
+	obs.onJoin = func(string) {
+		hub.SendRoom(room, signaling.Message{Type: signaling.TypeCoordinator, Payload: ann})
+		hub.SendRoom(room, signaling.Message{Type: signaling.TypeMembership, Peers: hub.Roster(room)})
+	}
+	obs.mu.Unlock()
+
+	// FIRST SYMPTOM: with the host invisible there is no eligible root and nothing is
+	// ever published, so leaf-a stays treeless.
+	waitForSlow(t, "a tree rooted on the coordinator's own host", func() bool {
+		hb, ok := lastHeartbeatFrom(t, obs, "leaf-a")
+		return ok && hb.Rev >= 1 && hb.Parent == "relay"
+	})
+	firstRev := mustHeartbeatFrom(t, obs, "leaf-a").Rev
+
+	// SECOND SYMPTOM: run well past the meet's 500ms gone threshold, measured in the
+	// host's OWN beats rather than by sleeping, so the wait tracks the cadence under
+	// test. 30 beats at 50ms is 1.5s — three gone windows.
+	startSeq := mustHeartbeatFrom(t, obs, "relay").Seq
+	waitForSlow(t, "the host to outlive its own gone threshold", func() bool {
+		hb, ok := lastHeartbeatFrom(t, obs, "relay")
+		return ok && hb.Seq > startSeq+30
+	})
+
+	// A join is a threshold event, so it forces a recompute. If the host had been
+	// declared gone in the meantime, that recompute finds no eligible root and
+	// publishes nothing — rev never advances and leaf-b never gets a parent.
+	join("leaf-b", 0)
+	waitForSlow(t, "a later tree that still roots on the host", func() bool {
+		b, okB := lastHeartbeatFrom(t, obs, "leaf-b")
+		a, okA := lastHeartbeatFrom(t, obs, "leaf-a")
+		return okA && okB && b.Parent == "relay" && b.Rev >= 1 && a.Parent == "relay" && a.Rev > firstRev
+	})
+
+	for _, leaf := range []string{"leaf-a", "leaf-b"} {
+		hb := mustHeartbeatFrom(t, obs, leaf)
+		if hb.Parent != "relay" {
+			t.Errorf("%s parent = %q, want relay — the coordinator dropped its own host", leaf, hb.Parent)
+		}
+	}
+	if hb := mustHeartbeatFrom(t, obs, "relay"); hb.Parent != "" || len(hb.Children) != 2 {
+		t.Errorf("the host is not serving both leaves: parent=%q children=%+v", hb.Parent, hb.Children)
+	}
 }
