@@ -407,29 +407,32 @@ func TestEventKindMapping(t *testing.T) {
 		{
 			name: "member_joined",
 			emit: func(s *Server) {
-				s.Publish(coordinator.Event{Kind: coordinator.EventMember, RoomID: "standup", Node: "frank", Present: true})
+				s.Publish(coordinator.Event{Kind: coordinator.EventMember, RoomID: "standup",
+					Node: "frank", NodeID: "p7", Present: true})
 			},
-			// id is "" until coordinator.Event gains NodeID (ruled in §15.14, NOT YET
-			// SHIPPED in internal/coordinator). This assertion is deliberately exact so
-			// that landing NodeID FAILS here and forces the dashboard to consume it,
-			// rather than leaving a silently empty field behind.
-			kind: "member_joined", want: map[string]any{"name": "frank", "id": ""},
+			// id is the SERVER-STAMPED peer id from Event.NodeID, not the peer-supplied
+			// name. That is the whole point of the field: a membership delta must be
+			// joinable against nodes[] on the same authoritative key the snapshot uses,
+			// and `name` is the one field a peer controls.
+			kind: "member_joined", want: map[string]any{"name": "frank", "id": "p7"},
 		},
 		{
 			name: "member_left",
 			emit: func(s *Server) {
-				s.Publish(coordinator.Event{Kind: coordinator.EventMember, RoomID: "standup", Node: "frank", Present: false})
+				s.Publish(coordinator.Event{Kind: coordinator.EventMember, RoomID: "standup",
+					Node: "frank", NodeID: "p7", Present: false})
 			},
-			kind: "member_left", want: map[string]any{"name": "frank", "id": ""},
+			kind: "member_left", want: map[string]any{"name": "frank", "id": "p7"},
 		},
 		{
 			name: "health_changed",
 			emit: func(s *Server) {
 				s.Publish(coordinator.Event{Kind: coordinator.EventHealth, RoomID: "standup",
-					Node: "bob", Health: coordinator.HealthDegraded, Reason: "3 missed beats"})
+					Node: "bob", NodeID: "p3", Health: coordinator.HealthDegraded,
+					PrevHealth: coordinator.HealthHealthy, Reason: "3 missed beats"})
 			},
 			kind: "health_changed",
-			want: map[string]any{"name": "bob", "health": "degraded", "prev_health": ""},
+			want: map[string]any{"name": "bob", "health": "degraded", "prev_health": "healthy"},
 		},
 		{
 			name: "topology",
@@ -478,11 +481,15 @@ func TestEventKindMapping(t *testing.T) {
 			name: "stale_rejected",
 			emit: func(s *Server) {
 				s.Publish(coordinator.Event{Kind: coordinator.EventStale, RoomID: "standup",
-					Node: "frank", Epoch: 3, Rev: 15, Reason: "epoch behind current"})
+					Node: "frank", NodeID: "p7", Epoch: 3, Rev: 15, Count: 7,
+					Reason: "epoch behind current"})
 			},
 			kind: "stale_rejected",
+			// epoch/rev here are the PEER's fence, not the meet's — they are the numbers
+			// that explain the refusal. total is Event.Count: that peer's cumulative
+			// refusals THIS SESSION, emitted on an increase and never per heartbeat.
 			want: map[string]any{"name": "frank", "epoch": float64(3), "rev": float64(15),
-				"reason": "epoch behind current"},
+				"total": float64(7), "reason": "epoch behind current"},
 		},
 		{
 			name: "settling",
@@ -564,34 +571,116 @@ func TestEventKindMapping(t *testing.T) {
 	}
 }
 
-// TestHealthPrevTracking pins the one field §9.4 asks for that coordinator.Event does
-// not carry: prev_health. The dashboard is the only place that sees the whole health
-// series, so it remembers the last value per node and fills the field itself.
-func TestHealthPrevTracking(t *testing.T) {
-	s, url := standupServer(t, Config{})
-	conn := dialEvents(t, url, "standup", "")
-	readFrame(t, conn)
-	for _, step := range []struct {
-		h        coordinator.Health
-		wantPrev string
+// TestHealthPrevHealthIsFromTheEvent pins that prev_health is passed straight through
+// from coordinator.Event.PrevHealth and is NOT remembered in-process.
+//
+// The discriminating case is the first subtest: a fresh subscriber's very first health
+// frame must already carry a real previous value. An in-process memory cannot produce
+// that — it has never seen this node before, so it can only emit "" — which is exactly
+// why §15.14 moved the field to the coordinator, the only party that performs the
+// transition.
+//
+// The last case is the shape the coordinator warns about: SUSTAINED DEGRADATION and its
+// recovery ride EventHealth with PrevHealth EQUAL to Health, because the node's
+// LIVENESS did not change — a fired dwell is a quality verdict. A consumer separates
+// the two with that comparison rather than by parsing Reason, which the coordinator
+// promises never to make parseable. The dashboard must pass it through unaltered rather
+// than "correcting" it into a transition that did not happen.
+func TestHealthPrevHealthIsFromTheEvent(t *testing.T) {
+	tests := []struct {
+		name           string
+		prev, cur      coordinator.Health
+		wantPrev, want string
 	}{
-		{coordinator.HealthDegraded, ""},
-		{coordinator.HealthGone, "degraded"},
-		{coordinator.HealthHealthy, "gone"},
-	} {
-		s.Publish(coordinator.Event{Kind: coordinator.EventHealth, RoomID: "standup",
-			Node: "bob", Health: step.h})
-		f := readFrame(t, conn)
-		var d map[string]any
-		if err := json.Unmarshal(f.Data, &d); err != nil {
-			t.Fatal(err)
-		}
-		if d["prev_health"] != step.wantPrev {
-			t.Errorf("health→%s: prev_health = %#v, want %q", step.h, d["prev_health"], step.wantPrev)
-		}
-		if d["health"] != string(step.h) {
-			t.Errorf("health = %#v, want %q", d["health"], step.h)
-		}
+		{name: "first frame on a fresh socket already knows the previous value",
+			prev: coordinator.HealthHealthy, cur: coordinator.HealthDegraded,
+			wantPrev: "healthy", want: "degraded"},
+		{name: "recovery", prev: coordinator.HealthGone, cur: coordinator.HealthHealthy,
+			wantPrev: "gone", want: "healthy"},
+		{name: "sustained degradation: prev == cur, and must survive intact",
+			prev: coordinator.HealthDegraded, cur: coordinator.HealthDegraded,
+			wantPrev: "degraded", want: "degraded"},
+		{name: "dwell recovery: prev == cur at healthy",
+			prev: coordinator.HealthHealthy, cur: coordinator.HealthHealthy,
+			wantPrev: "healthy", want: "healthy"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, url := standupServer(t, Config{})
+			conn := dialEvents(t, url, "standup", "")
+			readFrame(t, conn) // snapshot
+			s.Publish(coordinator.Event{Kind: coordinator.EventHealth, RoomID: "standup",
+				Node: "bob", NodeID: "p3", Health: tt.cur, PrevHealth: tt.prev})
+			f := readFrame(t, conn)
+			var d map[string]any
+			if err := json.Unmarshal(f.Data, &d); err != nil {
+				t.Fatal(err)
+			}
+			if d["prev_health"] != tt.wantPrev {
+				t.Errorf("prev_health = %#v, want %q", d["prev_health"], tt.wantPrev)
+			}
+			if d["health"] != tt.want {
+				t.Errorf("health = %#v, want %q", d["health"], tt.want)
+			}
+		})
+	}
+}
+
+// TestStaleEventDoesNotDisturbTheMeetVersion is the guard for the one trap in
+// EventStale's shape: its Epoch and Rev are the PEER's fence, deliberately not
+// defaulted to the meet's by coordinator.publish, because a peer that adopted nothing
+// is genuinely at epoch 0 and that is the most diagnostic case there is.
+//
+// Those numbers therefore belong in `data` and MUST NOT reach the envelope, nor the
+// dashboard's memory of the meet's current version. web/js/state.js copies
+// frame.epoch onto its snapshot for EVERY delta, so leaking a stale peer's epoch into
+// the envelope would visibly roll the operator's epoch display BACKWARDS mid-handover
+// — at precisely the moment they are watching it.
+func TestStaleEventDoesNotDisturbTheMeetVersion(t *testing.T) {
+	demo := &fakeDemo{}
+	s, url := standupServer(t, Config{Demo: demo})
+	conn := dialEvents(t, url, "standup", "")
+	snap := readFrame(t, conn)
+	if snap.Epoch != 3 || snap.Rev != 11 {
+		t.Fatalf("snapshot epoch/rev = %d/%d, want 3/11", snap.Epoch, snap.Rev)
+	}
+
+	// A peer stuck two terms back, refusing under its own fence.
+	s.Publish(coordinator.Event{Kind: coordinator.EventStale, RoomID: "standup",
+		Node: "frank", NodeID: "p7", Epoch: 1, Rev: 2, Count: 4, Reason: "fenced out"})
+	f := readFrame(t, conn)
+	if f.Kind != "stale_rejected" {
+		t.Fatalf("kind = %q", f.Kind)
+	}
+	if f.Epoch != 3 || f.Rev != 11 {
+		t.Errorf("envelope epoch/rev = %d/%d, want the MEET's 3/11 — the peer's fence "+
+			"belongs in data, and leaking it here rolls the epoch display backwards",
+			f.Epoch, f.Rev)
+	}
+	var d map[string]any
+	if err := json.Unmarshal(f.Data, &d); err != nil {
+		t.Fatal(err)
+	}
+	if d["epoch"] != float64(1) || d["rev"] != float64(2) {
+		t.Errorf("data epoch/rev = %v/%v, want the PEER's 1/2", d["epoch"], d["rev"])
+	}
+
+	// And the poison must not persist: a later frame with no version of its own is
+	// stamped from the dashboard's memory of the meet, which the stale event must not
+	// have corrupted.
+	res, err := http.Post(url+"/api/demo/meets/standup/evict", "application/json",
+		strings.NewReader(`{"name":"bob"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	g := readFrame(t, conn)
+	if g.Kind != "demo" {
+		t.Fatalf("kind = %q, want demo", g.Kind)
+	}
+	if g.Epoch != 3 || g.Rev != 11 {
+		t.Errorf("demo frame epoch/rev = %d/%d, want 3/11 — the stale event corrupted "+
+			"the meet's tracked version", g.Epoch, g.Rev)
 	}
 }
 
@@ -620,41 +709,59 @@ func TestEventsAreMeetScoped(t *testing.T) {
 	}
 }
 
-// TestStaleRejectedCount pins the counter §9.3 puts in the snapshot. coordinator's
-// RoomSnapshot has no such field, so the dashboard owns it — and the count captured
-// for a snapshot must be consistent with the deltas that follow: exactly once each,
-// never double-counted and never lost.
+// TestStaleRejectedCount pins that the snapshot's stale_rejected comes from
+// coordinator.RoomSnapshot.StaleRejected — the meet-wide total the coordinator sums
+// across members — and NOT from any counter the dashboard keeps itself.
+//
+// The decrease case is the discriminating one and it is not a curiosity: the peer's
+// fence resets on TypeJoined, so metrics.Heartbeat.StaleRejected resets on rejoin
+// exactly like Seq, and the meet total legitimately goes DOWN. A monotonic in-process
+// accumulator cannot represent that, which is why the interim counter had to be
+// replaced rather than reconciled — it would pin the display at a high-water mark
+// belonging to a fence that no longer exists.
 func TestStaleRejectedCount(t *testing.T) {
 	sub := &fakeSubnet{}
-	sub.set(sampleSnapshot())
+	snap := sampleSnapshot()
+	snap.StaleRejected = 2
+	sub.set(snap)
 	s, url := standupServer(t, Config{Subnet: sub})
 
-	// Two rejections before anyone is watching.
-	for i := 0; i < 2; i++ {
-		s.Publish(coordinator.Event{Kind: coordinator.EventStale, RoomID: "standup", Node: "frank"})
-	}
-	conn := dialEvents(t, url, "standup", "")
-	f := readFrame(t, conn)
-	var snap map[string]any
-	if err := json.Unmarshal(f.Data, &snap); err != nil {
-		t.Fatal(err)
-	}
-	if snap["stale_rejected"] != float64(2) {
-		t.Errorf("snapshot stale_rejected = %v, want 2", snap["stale_rejected"])
+	// Publishing stale events must NOT move the number: the source of truth is the
+	// coordinator's snapshot, and a dashboard that also counted would double.
+	for i := 0; i < 3; i++ {
+		s.Publish(coordinator.Event{Kind: coordinator.EventStale, RoomID: "standup",
+			Node: "frank", NodeID: "p7", Epoch: 1, Rev: 1, Count: uint64(i + 1)})
 	}
 
-	// One more after: it arrives as a delta the client adds to the snapshot value.
-	s.Publish(coordinator.Event{Kind: coordinator.EventStale, RoomID: "standup", Node: "frank"})
-	if got := readFrame(t, conn); got.Kind != "stale_rejected" {
-		t.Fatalf("kind = %q", got.Kind)
-	}
-	writeOp(t, conn, "resync")
-	f = readFrame(t, conn)
-	if err := json.Unmarshal(f.Data, &snap); err != nil {
+	conn := dialEvents(t, url, "standup", "")
+	f := readFrame(t, conn)
+	var body map[string]any
+	if err := json.Unmarshal(f.Data, &body); err != nil {
 		t.Fatal(err)
 	}
-	if snap["stale_rejected"] != float64(3) {
-		t.Errorf("after 3 rejections the resynced snapshot says %v", snap["stale_rejected"])
+	if body["stale_rejected"] != float64(2) {
+		t.Errorf("snapshot stale_rejected = %v, want 2 from RoomSnapshot.StaleRejected "+
+			"(the dashboard must not be counting events itself)", body["stale_rejected"])
+	}
+	for i := 0; i < 3; i++ {
+		if got := readFrame(t, conn); got.Kind != "stale_rejected" {
+			t.Fatalf("frame %d kind = %q", i, got.Kind)
+		}
+	}
+
+	// The peer rejoins: its fence resets, so the meet total DROPS. The dashboard must
+	// report the drop rather than clamping to what it saw before.
+	snap = sampleSnapshot()
+	snap.StaleRejected = 0
+	sub.set(snap)
+	writeOp(t, conn, "resync")
+	f = readFrame(t, conn)
+	if err := json.Unmarshal(f.Data, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["stale_rejected"] != float64(0) {
+		t.Errorf("after a rejoin reset, stale_rejected = %v, want 0 — a DECREASE is "+
+			"legitimate and must not read as corruption", body["stale_rejected"])
 	}
 }
 
