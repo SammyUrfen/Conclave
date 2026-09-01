@@ -402,7 +402,20 @@ export class EventSocket {
 
   _scheduleReconnect() {
     this._setStatus('reconnecting');
+    // `connectedAt` records WHEN the connection that just ended was established, not
+    // whether we are still inside it — those two facts diverge the instant the socket
+    // closes. Read it once, here, to judge whether THAT connection survived long enough
+    // to earn a fresh ladder, then clear it immediately: a reconnect attempt that fails
+    // before ever reaching 'open' again must not keep re-reading a "survived" verdict
+    // that describes a connection long gone. Skipping the clear was the bug — every
+    // failure after one 30s-plus connection kept computing `survived = true` forever
+    // (Date.now() - connectedAt only grows), so backoffIndex reset to 0 on EVERY
+    // failure and the ladder never climbed: a dead server got hammered every ~500ms
+    // indefinitely. Clearing it here means only the failure immediately following a
+    // real 'open' can see a genuine `survived`; every failure after that (no new 'open'
+    // in between) correctly climbs the ladder instead of re-triggering the reset.
     const survived = this.connectedAt && Date.now() - this.connectedAt >= STABLE_RESET_MS;
+    this.connectedAt = 0;
     if (survived) this.backoffIndex = 0;
 
     const delay = this.backoffIndex < BACKOFF_STEPS_MS.length
