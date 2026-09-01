@@ -361,21 +361,45 @@ func bestParent(u Node, byName map[string]Node, c Constraints, depth, children m
 	// they are all re-admitted, because a degraded parent beats no parent. Two passes
 	// over the same set rather than a score, so "degradation is a preference,
 	// disconnection is not" stays a structural fact instead of a weight.
+	//
+	// healthyAvailable is THE COUPLING: rank 0b's filter and rank 1's void are the same
+	// decision, so they read one variable computed once per placement. They were two
+	// independent conditions once, and they drifted — the filter removed impaired
+	// candidates while the void fired unconditionally, so an all-impaired fleet (where
+	// 0b re-admits everyone) reshuffled children between impaired parents on every
+	// recompute. One variable makes that class of drift unrepresentable.
 	healthy := make([]string, 0, len(eligible))
 	for _, name := range eligible {
 		if !byName[name].Impaired {
 			healthy = append(healthy, name)
 		}
 	}
-	if len(healthy) > 0 {
+	healthyAvailable := len(healthy) > 0
+	if healthyAvailable {
 		eligible = healthy
 	}
 
-	// Rank 1: incumbency. Only a materially closer parent breaks it — and an IMPAIRED
-	// incumbent gets no protection at all. This is the single rank that turns a fired
-	// dwell timer into an actual re-parent.
+	// Rank 1: incumbency. Only a materially closer parent breaks it — and an impaired
+	// incumbent gets no protection, BUT ONLY WHEN healthyAvailable. This is the single
+	// rank that turns a fired dwell timer into an actual re-parent, and the guard is
+	// what keeps it from turning into a churn generator: the void exists to move
+	// children off an impaired relay ONTO A HEALTHY ONE, so with nowhere healthy to go
+	// its premise is absent and only the interruption remains — repeatedly, since
+	// impairment is sustained by definition. When there is nowhere healthy to go,
+	// stability is the only value left.
+	//
+	// NOTE for a future maintainer, because it is not obvious and matters if 0b ever
+	// changes: under the coupling, `voided` is REDUNDANT BY CONSTRUCTION. Whenever it
+	// could be true, healthyAvailable is true, and 0b has therefore already removed the
+	// impaired incumbent from `eligible` — so the contains() check below fails anyway.
+	// Deleting the term changes no behaviour today. It is kept because it makes rank 1
+	// state its own rule instead of silently inheriting it from rank 0b, and it becomes
+	// load-bearing the moment 0b's filter is weakened from an elimination to a
+	// preference. Do not "simplify" it without re-reading rank 0b.
 	if prev != nil {
-		if incumbent := prev.ParentOf(u.Name); incumbent != "" && !byName[incumbent].Impaired && contains(eligible, incumbent) {
+		incumbent := prev.ParentOf(u.Name)
+		voided := healthyAvailable && byName[incumbent].Impaired
+		if incumbent != "" && !voided && contains(eligible, incumbent) {
 			incumbentRTT := rttTo(u, incumbent)
 			beaten := false
 			for _, q := range eligible {
