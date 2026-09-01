@@ -188,6 +188,11 @@ func TestSetEpochIsPerMeet(t *testing.T) {
 }
 
 // TestSetEpochResetsRev: a new term restarts the revision counter at 1 (§5.7 rule 2).
+//
+// PHASE 6 CHANGE: adopting a higher epoch now also enters the rebuild window (§6.6), so
+// the clock advance below is not padding — without it the coordinator is still waiting
+// for the fleet's realized state and has deliberately published nothing. The epoch/rev
+// claim this test exists for is unchanged; phase6_test.go covers the window itself.
 func TestSetEpochResetsRev(t *testing.T) {
 	h := newHarness(t, baseConfig())
 	h.member("room", "p1", "a", 8000)
@@ -200,6 +205,10 @@ func TestSetEpochResetsRev(t *testing.T) {
 	h.c.SetEpoch("room", 2)
 	h.sync()
 	h.member("room", "p4", "d", 0)
+	if got := h.published("room"); got != nil {
+		t.Fatalf("nothing may be published inside the rebuild window, got %+v", got)
+	}
+	h.advance(metrics.RebuildWindow)
 
 	topo := h.published("room")
 	if topo.Epoch != 2 || topo.Rev != 1 {
