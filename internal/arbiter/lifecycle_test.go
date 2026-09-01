@@ -38,8 +38,11 @@ func TestMeetReaping(t *testing.T) {
 		h := newHarness(t, electing())
 		h.join("m", "p1", strong("alice"))
 		h.join("m", "p2", mid("bob"))
+
+		h.clk.Advance(90 * time.Second)
 		h.leave("m", "p1")
 		h.leave("m", "p2")
+		emptied := h.clk.Now()
 
 		h.clk.Advance(arbiter.MeetTTL)
 		if got := h.meetIDs(); len(got) != 0 {
@@ -56,8 +59,60 @@ func TestMeetReaping(t *testing.T) {
 		if got.Elections < 1 {
 			t.Errorf("Elections = %d, want at least the bootstrap", got.Elections)
 		}
-		if !got.EndedAt.After(got.CreatedAt) {
-			t.Errorf("EndedAt %v is not after CreatedAt %v", got.EndedAt, got.CreatedAt)
+		// EndedAt is when the last participant LEFT, not when the sweep happened.
+		// Reaping is lazy, so on a quiet server a reap-time stamp could be arbitrarily
+		// late — and "ended 14:20" for a call that finished at 11:59 is the kind of
+		// wrong nobody notices and nobody can debug. A tombstone that APPEARS late is
+		// visibly late; a wrong timestamp is invisibly wrong.
+		if !got.EndedAt.Equal(emptied) {
+			t.Errorf("EndedAt = %v, want %v (the moment the meet went empty, not the reap at %v)",
+				got.EndedAt, emptied, emptied.Add(arbiter.MeetTTL))
+		}
+	})
+
+	t.Run("a meet that empties, refills, and empties again carries the LAST emptiness", func(t *testing.T) {
+		h := newHarness(t, electing())
+		h.join("m", "p1", strong("alice"))
+		h.leave("m", "p1") // first emptiness, at epoch0
+
+		h.clk.Advance(time.Minute)
+		h.join("m", "p2", mid("bob")) // refilled: the first emptiness is void
+		h.clk.Advance(30 * time.Second)
+		h.leave("m", "p2")
+		emptied := h.clk.Now()
+
+		h.clk.Advance(arbiter.MeetTTL)
+		ended := h.ended()
+		if len(ended) != 1 {
+			t.Fatalf("tombstones = %d, want 1", len(ended))
+		}
+		if !ended[0].EndedAt.Equal(emptied) {
+			t.Errorf("EndedAt = %v, want the LAST emptiness %v, not the first (%v)",
+				ended[0].EndedAt, emptied, epoch0)
+		}
+	})
+
+	t.Run("ended is newest-first by EndedAt, then id ascending", func(t *testing.T) {
+		h := newHarness(t, electing())
+		// Two meets end at the same instant, in the WRONG id order; a third ends
+		// later. Reap order is by id, so returning the ring reversed produces
+		// [zz bb aa] — a different answer from the contract's [bb aa zz].
+		for _, id := range []string{"zz", "aa"} {
+			h.join(id, "p1", strong("alice"))
+			h.leave(id, "p1")
+		}
+		h.clk.Advance(100 * time.Second)
+		h.join("bb", "p1", strong("alice"))
+		h.leave("bb", "p1")
+
+		h.clk.Advance(arbiter.MeetTTL)
+		ended := h.ended()
+		ids := make([]string, 0, len(ended))
+		for _, e := range ended {
+			ids = append(ids, e.ID)
+		}
+		if want := []string{"bb", "aa", "zz"}; !reflect.DeepEqual(ids, want) {
+			t.Errorf("ended = %v, want %v (EndedAt descending, then id ascending)", ids, want)
 		}
 	})
 
@@ -130,6 +185,23 @@ func TestMeetReaping(t *testing.T) {
 			t.Fatalf("CreateMeet after reap = %v, want success", err)
 		}
 	})
+}
+
+// TestMeetCarriesNoEndedAt: a reaped meet leaves the registry, so a live listing can
+// never carry a non-zero EndedAt — the field would be structurally always zero. A field
+// that cannot hold a value states something false about the type, which is the same
+// trap class as an algorithm step that provably cannot execute. The tombstone's
+// EndedMeet.EndedAt is the real one, and it is asserted above.
+func TestMeetCarriesNoEndedAt(t *testing.T) {
+	mt := reflect.TypeOf(arbiter.Meet{})
+	for i := 0; i < mt.NumField(); i++ {
+		if n := mt.Field(i).Name; strings.EqualFold(n, "endedat") {
+			t.Errorf("Meet.%s: structurally always zero — a reaped meet is not in the registry", n)
+		}
+	}
+	if _, ok := mt.FieldByName("EndedAt"); ok {
+		t.Error("Meet.EndedAt exists; only EndedMeet carries an end time")
+	}
 }
 
 // TestMaxMeets bounds the only unauthenticated write surface in the system.
