@@ -10,6 +10,7 @@ package coordinator_test
 // acceptance test in a test would prove only that the test agrees with itself.
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/SammyUrfen/conclave/internal/coordinator"
@@ -350,29 +351,84 @@ func TestRebuildIgnoresAnUnheardMember(t *testing.T) {
 // TestRebuildFallsBackWhenTheReconstructionIsTorn: the residual case §6.6 admits is
 // real — a mid-flight re-parent captured half-applied. The coordinator must notice that
 // what the peers described is not a legal tree and drop to prev = nil rather than seed
-// the builder with nonsense.
+// the builder with it.
+//
+// The two subtests are deliberately different in what they can prove, and the
+// difference is worth stating rather than hiding:
+//
+//   - "a cycle" asserts the OUTCOME is still correct, but it does NOT discriminate the
+//     Validate gate. Remove the gate and it still passes, because BuildTree treats prev
+//     as a pure PREFERENCE and re-checks every hard constraint itself — so a baseline
+//     naming edges it cannot honour simply loses, and the torn edges never reach the
+//     published tree either way.
+//   - "deeper than MaxDepth" is the discriminator. There the illegal baseline IS
+//     honourable up to its last edge, so stickiness pins four incumbents, the fifth
+//     node has nowhere legal left, the sticky attempt fails, and the meet takes the
+//     relaxed retry — re-parenting nearly everyone because of one bad heartbeat. The
+//     gate is what turns that into an ordinary build.
 func TestRebuildFallsBackWhenTheReconstructionIsTorn(t *testing.T) {
-	h := fiveNodeMeet(t)
-	h.c.SetEpoch("room", 2)
-	h.sync()
+	t.Run("a cycle", func(t *testing.T) {
+		h := fiveNodeMeet(t)
+		h.c.SetEpoch("room", 2)
+		h.sync()
 
-	// b and c each name the other as parent: a cycle, and two nodes with no path to a.
-	h.beat("room", "p1", realizedBeat("a", "", "x"))
-	h.beat("room", "p2", realizedBeat("x", "a"))
-	h.beat("room", "p3", realizedBeat("b", "c"))
-	h.beat("room", "p4", realizedBeat("c", "b"))
-	h.beat("room", "p5", realizedBeat("d", "x"))
+		// b and c each name the other as parent: neither has a path to a.
+		h.beat("room", "p1", realizedBeat("a", "", "x"))
+		h.beat("room", "p2", realizedBeat("x", "a"))
+		h.beat("room", "p3", realizedBeat("b", "c"))
+		h.beat("room", "p4", realizedBeat("c", "b"))
+		h.beat("room", "p5", realizedBeat("d", "x"))
 
-	topo := h.published("room")
-	if topo == nil {
-		t.Fatal("a torn reconstruction must still produce a tree, from scratch")
-	}
-	if topo.ParentOf("b") == "c" || topo.ParentOf("c") == "b" {
-		t.Fatalf("the torn edges must not survive into the published tree: %+v", topo.Edges)
-	}
-	if err := overlay.Validate(topo, nodesFor(h.snapshot("room"), nil), consFor(topo)); err != nil {
-		t.Fatalf("published tree fails Validate: %v", err)
-	}
+		topo := h.published("room")
+		if topo == nil {
+			t.Fatal("a torn reconstruction must still produce a tree, from scratch")
+		}
+		if topo.ParentOf("b") == "c" || topo.ParentOf("c") == "b" {
+			t.Fatalf("the torn edges must not survive into the published tree: %+v", topo.Edges)
+		}
+		if err := overlay.Validate(topo, nodesFor(h.snapshot("room"), nil), consFor(topo)); err != nil {
+			t.Fatalf("published tree fails Validate: %v", err)
+		}
+	})
+
+	t.Run("deeper than MaxDepth", func(t *testing.T) {
+		// a can serve 3, x exactly 1, and h is the only other relay-capable peer. The
+		// realized state below puts c at depth 3, one past the bound.
+		h := newHarness(t, baseConfig())
+		h.member("room", "p1", "a", 6000)
+		h.member("room", "p2", "x", 2000)
+		h.member("room", "p3", "h", 7000)
+		h.member("room", "p4", "b", 0)
+		h.member("room", "p5", "d", 0)
+		h.member("room", "p6", "c", 0)
+		h.c.SetEpoch("room", 2)
+		h.sync()
+		h.fp.reset()
+
+		h.beat("room", "p1", realizedBeat("a", "", "b", "d", "x"))
+		h.beat("room", "p2", realizedBeat("x", "a", "h"))
+		h.beat("room", "p3", realizedBeat("h", "x", "c"))
+		h.beat("room", "p4", realizedBeat("b", "a"))
+		h.beat("room", "p5", realizedBeat("d", "a"))
+		h.beat("room", "p6", realizedBeat("c", "h")) // depth 3, with MaxDepth 2
+
+		ev, ok := h.fp.lastOf(coordinator.EventTopology)
+		if !ok {
+			t.Fatalf("no tree published; events=%+v", h.fp.all())
+		}
+		if ev.Outcome != coordinator.OutcomeBuilt {
+			t.Fatalf("an illegal baseline must be REJECTED, not honoured: honouring it pins four "+
+				"incumbents, strands the fifth, and forces the relaxed retry — outcome %q, reason %q",
+				ev.Outcome, ev.Reason)
+		}
+		topo := h.published("room")
+		if got := topo.Depth("c"); got < 0 || got > 2 {
+			t.Fatalf("c must be placed within MaxDepth, got depth %d in %+v", got, topo.Edges)
+		}
+		if err := overlay.Validate(topo, nodesFor(h.snapshot("room"), nil), consFor(topo)); err != nil {
+			t.Fatalf("published tree fails Validate: %v", err)
+		}
+	})
 }
 
 // TestBootstrapEpochDoesNotStallAnEmptyMeet: a bootstrap election arrives before anyone
@@ -496,4 +552,104 @@ func uploadOf(name string) int {
 		return 8000
 	}
 	return 0
+}
+
+// TestRebuildWithNoRealizedStateSaysSo is the case a coordinator must never diagnose as
+// a healthy handover: every peer beat, but none of them named a parent, so there was
+// nothing to reconstruct and the term's first tree is a full rebuild.
+//
+// It is a real wire state, not a hypothetical — a peer whose media layer cannot name its
+// own edges beats with Parent empty — and it is indistinguishable from a healthy
+// handover in the published TREE, because a from-scratch build is perfectly valid. The
+// only place the difference can live is the reason attached to it. Without that, an
+// operator watching every handover re-parent the whole meet has no way to tell missing
+// telemetry from genuine churn.
+func TestRebuildWithNoRealizedStateSaysSo(t *testing.T) {
+	h := fiveNodeMeet(t)
+	h.c.SetEpoch("room", 2)
+	h.sync()
+	h.fp.reset()
+
+	for id, name := range map[string]string{"p1": "a", "p2": "x", "p3": "b", "p4": "c", "p5": "d"} {
+		h.c.Heartbeat("room", id, mustJSON(t, realizedBeat(name, "")))
+	}
+	h.sync()
+
+	ev, ok := h.fp.lastOf(coordinator.EventTopology)
+	if !ok {
+		t.Fatalf("a tree must still be published; events=%+v", h.fp.all())
+	}
+	if ev.Reason != coordinator.ReasonNoRealizedState {
+		t.Fatalf("a handover with no realized state to rebuild from must SAY so, got Reason=%q", ev.Reason)
+	}
+	if h.published("room") == nil {
+		t.Fatal("the meet must still get a tree — degraded, not broken")
+	}
+}
+
+// TestRebuildWithTornRealizedStateSaysSo: the other degradation, and it must be
+// distinguishable from the one above. Same visible symptom (everyone re-parents),
+// different cause (churn, not missing telemetry), different fix.
+func TestRebuildWithTornRealizedStateSaysSo(t *testing.T) {
+	h := fiveNodeMeet(t)
+	h.c.SetEpoch("room", 2)
+	h.sync()
+	h.fp.reset()
+
+	h.beat("room", "p1", realizedBeat("a", "", "x"))
+	h.beat("room", "p2", realizedBeat("x", "a"))
+	h.beat("room", "p3", realizedBeat("b", "c"))
+	h.beat("room", "p4", realizedBeat("c", "b"))
+	h.beat("room", "p5", realizedBeat("d", "x"))
+
+	ev, ok := h.fp.lastOf(coordinator.EventTopology)
+	if !ok {
+		t.Fatalf("a tree must still be published; events=%+v", h.fp.all())
+	}
+	if !strings.HasPrefix(ev.Reason, coordinator.ReasonRealizedStateInvalid) {
+		t.Fatalf("a torn reconstruction must be reported as such, got Reason=%q", ev.Reason)
+	}
+	if ev.Reason == coordinator.ReasonNoRealizedState {
+		t.Fatal("churn and missing telemetry must not collapse into one reason")
+	}
+}
+
+// TestHealthyHandoverCarriesNoDegradationReason is the other half of the pair: a
+// handover that actually reconstructed must say NOTHING, or the signal is noise. A
+// reason that fires on every healthy handover teaches operators to ignore reasons.
+func TestHealthyHandoverCarriesNoDegradationReason(t *testing.T) {
+	h := fiveNodeMeet(t)
+	h.c.SetEpoch("room", 2)
+	h.sync()
+	h.fp.reset()
+
+	h.beat("room", "p1", realizedBeat("a", "", "b", "c", "x"))
+	h.beat("room", "p2", realizedBeat("x", "a", "d"))
+	h.beat("room", "p3", realizedBeat("b", "a"))
+	h.beat("room", "p4", realizedBeat("c", "a"))
+	h.beat("room", "p5", realizedBeat("d", "x"))
+
+	ev, _ := h.fp.lastOf(coordinator.EventTopology)
+	if ev.Reason != "" {
+		t.Fatalf("a successful rebuild-from-peers must carry no degradation reason, got %q", ev.Reason)
+	}
+}
+
+// TestBootstrapCarriesNoDegradationReason: a term over a meet nobody has joined yet has
+// nothing to rebuild from and nothing is wrong with that. Reporting degraded telemetry
+// there would fire on the very first tree of every meet.
+func TestBootstrapCarriesNoDegradationReason(t *testing.T) {
+	h := newHarness(t, baseConfig())
+	h.c.SetEpoch("fresh", 4)
+	h.sync()
+	h.member("fresh", "p1", "a", 8000)
+	h.member("fresh", "p2", "b", 0)
+
+	ev, ok := h.fp.lastOf(coordinator.EventTopology)
+	if !ok {
+		t.Fatal("no tree published")
+	}
+	if ev.Reason != "" {
+		t.Fatalf("a bootstrap term has no realized state BY CONSTRUCTION and must not be flagged, got %q", ev.Reason)
+	}
 }
