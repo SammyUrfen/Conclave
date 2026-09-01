@@ -485,10 +485,12 @@ func TestNegotiationLadderExhaustionIsReported(t *testing.T) {
 //
 // The nudge was spawned BEFORE SetRemoteDescription, so it read the signaling state
 // while the pc was still `have-local-offer`, deferred, and left pendingLocalChange
-// set — and pion provably never re-fires for a removal (see
-// TestPionRemoveTrackDoesNotRenegotiate), so nothing ever picked it up. The departed
-// source's m-line then lingered as exactly the stale sendrecv that stopPeer exists to
-// clean up.
+// set — and pion does not re-fire from a non-stable pc either (its
+// negotiationNeededOp aborts on the same signaling-state check), so nothing ever
+// picked it up. The departed source's m-line then lingered as exactly the stale
+// sendrecv that stopPeer exists to clean up. This is the regime pendingLocalChange
+// exists for; the connected regime, where pion DOES fire, is
+// TestPionRenegotiatesARemovalOnceConnected.
 //
 // Discrimination: the removal happens while an offer is OUTSTANDING, which is the
 // only window in which the ordering matters, and the assertion is on the SDP that
