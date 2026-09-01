@@ -1,14 +1,14 @@
 {
-  "_dev_only": "Hand-written fixture for web/?mock=1 local development. NOT shipped server behaviour. Also doubles as the WS snapshot payload in mock mode.",
+  "_dev_only": "Hand-written fixture for web/?mock=1 local development and web/tests/convergence.test.html. NOT shipped server behaviour. Variant of meet-standup.json where `dave` is DIVERGED: the published tree moved it under `carol` (a precomputed-backup reparent), but its own last heartbeat still reports `bob` as parent — a lagging or fenced-out peer, the exact fault the `diverged` convergence state exists to surface. §9.4b: Convergence is 'diverged' whenever diverged[] is non-empty, computed BEFORE the no_tree check, so a real disagreement is reported even over a tree with edges.",
   "api_version": 1,
   "id": "standup",
   "epoch": 3,
-  "rev": 11,
+  "rev": 14,
   "coordinator": "alice",
   "coordinator_id": "p2",
   "arbiter_is_coordinator": false,
   "root": "alice",
-  "at_unix_ms": 1756684812345,
+  "at_unix_ms": 1756684818345,
   "nodes": [
     {
       "id": "p2", "name": "alice",
@@ -27,7 +27,7 @@
       "roles": ["relay"],
       "health": "degraded",
       "parent": "alice", "backup": "",
-      "children": ["dave"],
+      "children": [],
       "depth": 1,
       "upload_kbps": 3000, "nat": "direct",
       "rtt_server_ms": 240.0, "loss_pct": 6.1, "cpu_pct": 55.0,
@@ -36,7 +36,7 @@
     },
     {
       "id": "p4", "name": "carol",
-      "roles": ["leaf"],
+      "roles": ["relay"],
       "health": "healthy",
       "parent": "alice", "backup": "",
       "children": [],
@@ -57,30 +57,16 @@
       "rtt_server_ms": 44.0, "loss_pct": 1.2, "cpu_pct": 8.0,
       "fitness_lower_bound": 0.0,
       "last_beat_seq": 401, "last_beat_unix_ms": 1756684811900
-    },
-    {
-      "id": "p6", "name": "erin",
-      "roles": ["leaf"],
-      "health": "gone",
-      "parent": "", "backup": "",
-      "children": [],
-      "depth": -1,
-      "upload_kbps": 0, "nat": "direct",
-      "rtt_server_ms": 0.0, "loss_pct": 100.0, "cpu_pct": 0.0,
-      "fitness_lower_bound": 0.0,
-      "last_beat_seq": 390, "last_beat_unix_ms": 1756684790000
     }
   ],
   "edges": [
     { "parent": "alice", "child": "bob" },
     { "parent": "alice", "child": "carol" },
-    { "parent": "bob", "child": "dave" }
+    { "parent": "carol", "child": "dave" }
   ],
-  "backups": [
-    { "node": "dave", "parent": "carol" }
-  ],
+  "backups": [],
   "stale_rejected": 2,
-  "convergence": "converged",
-  "diverged": [],
+  "convergence": "diverged",
+  "diverged": ["dave"],
   "provenance": "intended"
 }

@@ -8,6 +8,12 @@
 h2, h3, h4 { margin: var(--space-3) 0 var(--space-2); font-weight: 600; }
 .fg-muted { color: var(--fg-muted); }
 .text-warn { color: var(--warn); }
+/* §9.4b's `no_tree` convergence state: "nothing to compare" is NOT healthy and must
+   never read as green (`--ok`) — that is the exact bug the boolean `converged` caused.
+   `--caution` (design-system.md §2.3: "near-threshold / dwell-pending") is the closest
+   existing frozen token for "informational, not yet resolved, not actionable" and keeps
+   this visibly distinct from both `.fg-muted` (converged) and `.text-warn` (diverged). */
+.text-caution { color: var(--caution); }
 
 /* --- buttons / inputs --- */
 .btn {

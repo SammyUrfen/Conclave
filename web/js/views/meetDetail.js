@@ -105,13 +105,38 @@ function renderEpochBar(meet, wsStatus) {
   const coordLabel = meet.arbiter_is_coordinator
     ? el('span', { class: 'pill pill-muted', title: 'The arbiter itself is hosting the coordinator role for this meet (no peer coordinator).' }, 'the arbiter')
     : (coordName || '(vacant)'); // §6.8 ReasonVacated: no coordinator, not a missing field
-  // §9.4b: Converged/Diverged expose the gap between the coordinator's INTENDED tree and
-  // what peers REALIZED from their own heartbeats — convergence lag, a failed apply, or a
-  // fenced-out peer, invisible if the UI only ever shows the number it fetched last.
+  // §9.4b: Convergence/Diverged expose the gap between the coordinator's INTENDED tree
+  // and what peers REALIZED from their own heartbeats — convergence lag, a failed apply,
+  // or a fenced-out peer, invisible if the UI only ever shows the number it fetched last.
+  //
+  // `convergence` is a THREE-VALUE ENUM (not the removed `converged` boolean) precisely
+  // because "no tree published yet" is a real third outcome, not a degenerate case of
+  // either the other two — a bare `diverged.length === 0` check cannot tell "everyone
+  // agrees" apart from "there was nothing to agree ON", and folding the latter into
+  // "converged" is the exact bug this enum replaced a boolean to fix (an operator seeing
+  // a green signal on a meet that never built a tree at all). All three states get a
+  // VISIBLY DISTINCT rendering so that mistake cannot recur by omission.
   const diverged = Array.isArray(meet.diverged) ? meet.diverged : [];
-  const convergedNode = meet.converged === false || diverged.length > 0
-    ? el('span', { class: 'epoch-item text-warn', title: 'Realized parent differs from the published tree for these peers.' }, `diverged: ${diverged.length ? diverged.join(', ') : '(unspecified)'}`)
-    : el('span', { class: 'epoch-item fg-muted' }, 'converged');
+  const convergence = str(meet.convergence);
+  let convergedNode;
+  if (convergence === 'diverged' || diverged.length > 0) {
+    convergedNode = el('span', { class: 'epoch-item text-warn', title: 'Realized parent differs from the published tree for these peers.' }, `diverged: ${diverged.length ? diverged.join(', ') : '(unspecified)'}`);
+  } else if (convergence === 'no_tree') {
+    // Deliberately says only THAT there is no tree, never WHY — the build-state banner
+    // (settling vs unbuildable, §5.9) and the event log already answer why; duplicating
+    // a reason here would be a second, driftable source of truth for the same fact.
+    // `--caution`, not `--ok`/green and not `--warn`: this is an absence of information,
+    // not a fault and not a healthy signal either.
+    convergedNode = el('span', { class: 'epoch-item text-caution', title: 'No tree has been published for this meet yet — see the event log for why.' }, 'no tree');
+  } else if (convergence === 'converged') {
+    convergedNode = el('span', { class: 'epoch-item fg-muted' }, 'converged');
+  } else {
+    // §9.4a: an enum value this build does not recognise (a future addition, or a
+    // missing/malformed field on an old server) renders verbatim in a neutral style —
+    // never silently assumed to be "converged", which is the very failure mode a string
+    // enum replaced a nullable/derived boolean to avoid.
+    convergedNode = el('span', { class: 'epoch-item fg-muted' }, convergence || '(convergence unknown)');
+  }
   return el('div', { class: 'epoch-bar tabular-nums' },
     el('span', { class: 'epoch-item' }, 'epoch ', el('strong', null, fmtId(meet.epoch))),
     el('span', { class: 'epoch-item' }, 'rev ', el('strong', null, fmtId(meet.rev))),
