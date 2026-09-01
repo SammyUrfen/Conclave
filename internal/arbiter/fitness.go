@@ -83,6 +83,34 @@ const (
 	weightUptime = 0.15
 )
 
+// ScoreQuantum is the granularity at which two peers' fitness counts as different.
+//
+// It exists because Score's inputs became MEASURED. While CPUPct, LossPct and
+// RTTServerMs were structurally zero every eligible peer scored identically, so
+// ranking candidates by raw score fell through to the name tiebreak and was perfectly
+// stable. With live sensors two comparable machines differ by microseconds of RTT,
+// their order flips about once a second, and anything that depends on a stable "best
+// challenger" — the election dwell above all — is defeated by noise rather than by
+// evidence.
+//
+// 0.01 is chosen to sit in the wide gap between the two scales. Sensor noise on a
+// quiet link is worth ~0.0005 of score (0.35 weight x 0.3ms of jitter / 300ms of
+// useful range), twenty times smaller. The smallest term that carries real meaning is
+// uptime at 0.15, fifteen times larger. Anything in between is a distinction the
+// inputs cannot actually support.
+//
+// It is deliberately NOT applied inside Score: the reported value stays exact, so the
+// dashboard and the logs show what was measured. Only ORDERING and the dwell's notion
+// of "the same target" are quantized, because those are the decisions a
+// hundredth-of-a-point difference must not be allowed to make.
+const ScoreQuantum = 0.01
+
+// bucket maps a score onto the ScoreQuantum grid, so that "which of these two peers
+// is fitter" is asked at a granularity the sensors can actually answer.
+func bucket(score float64) int {
+	return int(math.Round(score / ScoreQuantum))
+}
+
 // Score maps a Fitness to [0, 1]. Higher is fitter.
 //
 // It returns exactly 0 for a peer disqualified by ANY of: NAT == NATRelayed, !Live,
