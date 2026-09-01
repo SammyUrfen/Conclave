@@ -9,6 +9,7 @@ import * as realApi from './api.js';
 import * as mockApi from './mockApi.js';
 import { EventSocket } from './api.js';
 import { MockEventSocket } from './mockApi.js';
+import { isArbiterHosting } from './format.js';
 
 const STORAGE_KEY = 'conclave.serverUrl';
 const DEFAULT_SERVER = 'localhost:9000';
@@ -188,6 +189,19 @@ function pushEvent(frame) {
   store.setState((s) => ({ events: [frame, ...s.events].slice(0, MAX_EVENTS) }));
 }
 
+// `coordinator` and `arbiter_is_coordinator` must always agree (see isArbiterHosting's
+// doc comment in format.js for why an empty name is ambiguous on its own). Both fields
+// are set through this ONE function, never separately, because "two fields that must
+// always agree, updated in two places" is exactly how they drifted apart before:
+// applyDelta's 'election' case used to set `coordinator` alone, so the header
+// (meetDetail.js, gated on `arbiter_is_coordinator`) kept showing "the arbiter" after a
+// live handover moved the role to a peer, until the next resync overwrote the whole
+// snapshot and masked it as looking merely intermittent.
+function applyCoordinator(next, coordinator, reason) {
+  next.coordinator = coordinator;
+  next.arbiter_is_coordinator = isArbiterHosting(coordinator, reason);
+}
+
 /** Apply one delta frame's known, structural effects onto the current snapshot (best-effort). */
 function applyDelta(snapshot, frame) {
   if (!snapshot) return snapshot;
@@ -219,7 +233,7 @@ function applyDelta(snapshot, frame) {
       break;
     }
     case 'election': {
-      if (data.coordinator !== undefined) next.coordinator = data.coordinator;
+      if (data.coordinator !== undefined) applyCoordinator(next, data.coordinator, data.reason);
       if (data.epoch !== undefined) next.epoch = data.epoch;
       break;
     }
