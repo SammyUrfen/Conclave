@@ -206,8 +206,17 @@ func TestScoreConstants(t *testing.T) {
 		if arbiter.MinTermDuration.String() != "1m0s" {
 			t.Errorf("MinTermDuration = %v, want 1m0s", arbiter.MinTermDuration)
 		}
-		if arbiter.RebuildWindow.String() != "3s" {
-			t.Errorf("RebuildWindow = %v, want 3s", arbiter.RebuildWindow)
+		// RebuildWindow is deliberately NOT asserted here: it moved out of this
+		// package to metrics, whose copy is the one that matters. The repair path's
+		// use of that grace is covered behaviourally in repair_test.go instead.
+		if arbiter.MeetTTL.String() != "5m0s" {
+			t.Errorf("MeetTTL = %v, want 5m0s", arbiter.MeetTTL)
+		}
+		if arbiter.MaxEndedMeets != 20 {
+			t.Errorf("MaxEndedMeets = %d, want 20", arbiter.MaxEndedMeets)
+		}
+		if arbiter.MaxMeets != 100 {
+			t.Errorf("MaxMeets = %d, want 100", arbiter.MaxMeets)
 		}
 	})
 }

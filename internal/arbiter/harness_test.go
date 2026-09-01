@@ -3,8 +3,8 @@ package arbiter_test
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -75,18 +75,22 @@ func (c *fakeClock) After(time.Duration) <-chan time.Time {
 	panic("arbiter called After: it is specified to be event-driven (see harness_test.go)")
 }
 
-// sent is one announcement as the wire saw it.
+// sent is one announcement as the wire saw it. peerID is "" for a broadcast and the
+// target for a unicast repair, so one recorder can prove the two are different frames
+// going to different places.
 type sent struct {
 	roomID string
+	peerID string
 	ann    arbiter.Announcement
 }
 
 // recAnnouncer records every announcement and can be made to fail, which is how the
 // "the epoch was minted but the broadcast failed" case is exercised.
 type recAnnouncer struct {
-	mu   sync.Mutex
-	got  []sent
-	fail error
+	mu      sync.Mutex
+	got     []sent
+	repairs []sent
+	fail    error
 }
 
 func (r *recAnnouncer) AnnounceCoordinator(roomID string, a arbiter.Announcement) error {
@@ -94,6 +98,32 @@ func (r *recAnnouncer) AnnounceCoordinator(roomID string, a arbiter.Announcement
 	defer r.mu.Unlock()
 	r.got = append(r.got, sent{roomID: roomID, ann: a})
 	return r.fail
+}
+
+// RepairCoordinator is the unicast half: the repair rule re-sends the CURRENT
+// announcement to one lagging peer, so it must never show up in the broadcast log.
+func (r *recAnnouncer) RepairCoordinator(roomID, peerID string, a arbiter.Announcement) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.repairs = append(r.repairs, sent{roomID: roomID, peerID: peerID, ann: a})
+	return r.fail
+}
+
+func (r *recAnnouncer) allRepairs() []sent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]sent(nil), r.repairs...)
+}
+
+// repairsTo returns the unicast repairs addressed to one peer.
+func (r *recAnnouncer) repairsTo(peerID string) []arbiter.Announcement {
+	var out []arbiter.Announcement
+	for _, s := range r.allRepairs() {
+		if s.peerID == peerID {
+			out = append(out, s.ann)
+		}
+	}
+	return out
 }
 
 func (r *recAnnouncer) all() []sent {
@@ -119,10 +149,36 @@ func (r *recAnnouncer) setFail(err error) {
 	r.fail = err
 }
 
-// recPublisher records the dashboard-facing side of an election.
+// repairEvent is one PublishRepair call, flattened for comparison.
+type repairEvent struct {
+	roomID    string
+	name      string
+	peerEpoch uint64
+	meetEpoch uint64
+	resolved  bool
+}
+
+// recPublisher records the dashboard-facing side of an election and of a repair. The
+// two are separate slices because the whole point of the ruling is that a repair is
+// not an election and must not appear in that log.
 type recPublisher struct {
-	mu  sync.Mutex
-	got []arbiter.Announcement
+	mu      sync.Mutex
+	got     []arbiter.Announcement
+	repairs []repairEvent
+}
+
+func (p *recPublisher) PublishRepair(roomID, name string, peerEpoch, meetEpoch uint64, resolved bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.repairs = append(p.repairs, repairEvent{
+		roomID: roomID, name: name, peerEpoch: peerEpoch, meetEpoch: meetEpoch, resolved: resolved,
+	})
+}
+
+func (p *recPublisher) allRepairs() []repairEvent {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]repairEvent(nil), p.repairs...)
 }
 
 func (p *recPublisher) PublishElection(a arbiter.Announcement) {
@@ -137,6 +193,39 @@ func (p *recPublisher) all() []arbiter.Announcement {
 	return append([]arbiter.Announcement(nil), p.got...)
 }
 
+// logSink is a race-safe sink for the arbiter's slog output. Some behaviour this
+// package owns is observable ONLY as a log line — notably the "reports in hand, nobody
+// volunteered" warn, whose entire purpose is that an operator sees it — so the test has
+// to be able to read the log rather than assert around it.
+type logSink struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (l *logSink) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.buf = append(l.buf, p...)
+	return len(p), nil
+}
+
+func (l *logSink) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return string(l.buf)
+}
+
+// countLines returns how many logged lines contain sub.
+func (l *logSink) count(sub string) int {
+	n := 0
+	for _, line := range strings.Split(l.String(), "\n") {
+		if line != "" && strings.Contains(line, sub) {
+			n++
+		}
+	}
+	return n
+}
+
 // peerOpts is the telemetry a test wants a peer to declare.
 type peerOpts struct {
 	name          string
@@ -148,17 +237,6 @@ type peerOpts struct {
 	coordinatable bool
 }
 
-// wireReport is metrics.Report plus the coordinatable declaration.
-//
-// metrics.Report does NOT yet carry Coordinatable (PLAN §5.2 assigns that field to
-// WI-0, which has not shipped it), so the flag is written as a sibling JSON key
-// here exactly as the arbiter reads it. Collapse this into metrics.Report the
-// moment WI-0 lands the field.
-type wireReport struct {
-	metrics.Report
-	Coordinatable bool `json:"coordinatable"`
-}
-
 // harness owns one Arbiter under a virtual clock, plus the peers a scenario has
 // introduced so the test can beat all of them without restating the roster.
 type harness struct {
@@ -167,6 +245,7 @@ type harness struct {
 	clk  *fakeClock
 	ann  *recAnnouncer
 	pub  *recPublisher
+	logs *logSink
 	stop context.CancelFunc
 	done chan struct{} // CLOSED (not sent to) when Run returns, so a test that
 	// already waited for shutdown and the t.Cleanup that waits again can both
@@ -183,12 +262,13 @@ func newHarness(t *testing.T, cfg arbiter.Config) *harness {
 	cfg.Clock = clk
 	ann := &recAnnouncer{}
 	pub := &recPublisher{}
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logs := &logSink{}
+	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	a := arbiter.New(log, cfg, ann, pub)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &harness{
-		t: t, a: a, clk: clk, ann: ann, pub: pub, stop: cancel,
+		t: t, a: a, clk: clk, ann: ann, pub: pub, logs: logs, stop: cancel,
 		done:  make(chan struct{}),
 		peers: map[string][]string{},
 		names: map[string]string{},
@@ -257,15 +337,13 @@ func (h *harness) report(roomID, peerID string, o peerOpts) {
 	if o.nat == "" {
 		o.nat = overlay.NATDirect
 	}
-	body, err := json.Marshal(wireReport{
-		Report: metrics.Report{
-			Name:        o.name,
-			UploadKbps:  o.uploadKbps,
-			NAT:         o.nat,
-			RTTServerMs: o.rttMs,
-			LossPct:     o.lossPct,
-			CPUPct:      o.cpuPct,
-		},
+	body, err := json.Marshal(metrics.Report{
+		Name:          o.name,
+		UploadKbps:    o.uploadKbps,
+		NAT:           o.nat,
+		RTTServerMs:   o.rttMs,
+		LossPct:       o.lossPct,
+		CPUPct:        o.cpuPct,
 		Coordinatable: o.coordinatable,
 	})
 	if err != nil {
@@ -387,6 +465,55 @@ func (h *harness) silence(roomID string, d time.Duration, prod string) {
 		h.beat(roomID, prod)
 	}
 	h.sync()
+}
+
+// beatCurrent sends a heartbeat declaring the meet's current epoch, i.e. a peer whose
+// fence is up to date. The plain beat helper declares epoch 0, which is a peer that has
+// never adopted an announcement.
+func (h *harness) beatCurrent(roomID, peerID string) {
+	h.t.Helper()
+	h.beatWith(roomID, peerID, h.meet(roomID).Epoch, 0)
+}
+
+// elapseCurrent is elapse with every peer declaring the meet's current epoch, so a
+// scenario that is not about the repair path does not trip it.
+func (h *harness) elapseCurrent(roomID string, d time.Duration) {
+	h.t.Helper()
+	steps := int(d / metrics.HeartbeatInterval)
+	for i := 0; i < steps; i++ {
+		h.clk.Advance(metrics.HeartbeatInterval)
+		for _, id := range h.roster(roomID) {
+			h.beatCurrent(roomID, id)
+		}
+	}
+}
+
+// ended returns the tombstone ring.
+func (h *harness) ended() []arbiter.EndedMeet {
+	h.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), syncWait)
+	defer cancel()
+	got, err := h.a.ListEndedMeets(ctx)
+	if err != nil {
+		h.t.Fatalf("ListEndedMeets: %v", err)
+	}
+	return got
+}
+
+// meetIDs returns the live meet ids in ListMeets order.
+func (h *harness) meetIDs() []string {
+	h.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), syncWait)
+	defer cancel()
+	got, err := h.a.ListMeets(ctx)
+	if err != nil {
+		h.t.Fatalf("ListMeets: %v", err)
+	}
+	ids := make([]string, 0, len(got))
+	for _, m := range got {
+		ids = append(ids, m.ID)
+	}
+	return ids
 }
 
 func (h *harness) meet(roomID string) arbiter.Meet {
