@@ -53,6 +53,7 @@ type fakeSender struct {
 	mu      sync.Mutex
 	pushes  []push
 	block   chan struct{} // non-nil ⇒ every send blocks on it (the stall test)
+	entered chan struct{} // non-nil ⇒ signalled once, on entry to the first blocked send
 	failAll bool
 }
 
@@ -60,9 +61,18 @@ func newFakeSender() *fakeSender { return &fakeSender{} }
 
 func (f *fakeSender) SendTopology(roomID, peerID string, topo *overlay.Topology) error {
 	f.mu.Lock()
-	blocked, fail := f.block, f.failAll
+	blocked, fail, entered := f.block, f.failAll, f.entered
 	f.pushes = append(f.pushes, push{roomID: roomID, peerID: peerID, topo: topo})
 	f.mu.Unlock()
+	if entered != nil {
+		// Non-blocking: only the FIRST wedged send needs to announce itself, and a
+		// send on a full channel here would deadlock the very goroutine the test is
+		// trying to park.
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
 	if blocked != nil {
 		<-blocked
 	}
@@ -88,6 +98,21 @@ func (f *fakeSender) count() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.pushes)
+}
+
+// sinceRev returns every push carrying a topology newer than rev, in call order. It is
+// how a test asks "what actually went out after this point" without depending on how
+// many members happened to be in the meet.
+func (f *fakeSender) sinceRev(rev uint64) []push {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []push
+	for _, p := range f.pushes {
+		if p.topo != nil && p.topo.Rev > rev {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 type constErr string
@@ -214,6 +239,14 @@ func (h *harness) advance(d time.Duration) {
 	h.t.Helper()
 	h.clk.Advance(d)
 	h.sync()
+}
+
+// advanceNoSync moves virtual time WITHOUT settling. It exists for the tests that must
+// observe the loop mid-reaction — a Sync there would be the very barrier the test is
+// trying to race past.
+func (h *harness) advanceNoSync(d time.Duration) {
+	h.t.Helper()
+	h.clk.Advance(d)
 }
 
 func (h *harness) snapshot(roomID string) coordinator.RoomSnapshot {

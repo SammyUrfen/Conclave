@@ -254,3 +254,98 @@ func TestIsDegradedSample(t *testing.T) {
 		})
 	}
 }
+
+// TestReconstructObserved pins §6.6 step 4's reconstruction: the stickiness baseline for
+// a new term is built from what the peers say they have REALIZED, never from any
+// topology, and never from the previous coordinator's beliefs.
+func TestReconstructObserved(t *testing.T) {
+	cases := []struct {
+		name    string
+		parents map[string]string
+		want    string // "" ⇒ unreconstructable
+		root    string
+	}{
+		{
+			name:    "a star",
+			parents: map[string]string{"a": "", "b": "a", "c": "a"},
+			root:    "a",
+			want:    "a>b a>c ",
+		},
+		{
+			// Emission is BFS from the root with children sorted by name, so the same
+			// realized fleet always reconstructs to byte-identical edges however the
+			// heartbeats were ordered on the wire.
+			name:    "two levels, emitted parents-first and name-ordered",
+			parents: map[string]string{"a": "", "x": "a", "d": "x", "b": "a", "c": "a"},
+			root:    "a",
+			want:    "a>b a>c a>x x>d ",
+		},
+		{
+			name:    "a member whose parent was not heard from becomes a second root",
+			parents: map[string]string{"a": "", "b": "gone-relay"},
+			want:    "",
+		},
+		{
+			name:    "no root at all is unreconstructable",
+			parents: map[string]string{"b": "c", "c": "b"},
+			want:    "",
+		},
+		{
+			// The torn case §6.6 admits: a is a clean root, but b and c form a cycle
+			// off to the side. The reconstruction emits what it can reach; Validate is
+			// the gate that then rejects it, which is where the fallback lives.
+			name:    "a cycle beside a clean root is emitted only as far as it reaches",
+			parents: map[string]string{"a": "", "x": "a", "b": "c", "c": "b"},
+			root:    "a",
+			want:    "a>x ",
+		},
+		{
+			name:    "a lone root reconstructs to an edgeless tree",
+			parents: map[string]string{"a": ""},
+			root:    "a",
+			want:    "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := reconstructObserved(tc.parents, 7)
+			if tc.root == "" {
+				if got != nil {
+					t.Fatalf("want nil (unreconstructable), got %+v", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("want a reconstruction rooted at %q, got nil", tc.root)
+			}
+			if got.Root != tc.root {
+				t.Fatalf("root = %q, want %q", got.Root, tc.root)
+			}
+			if s := edgeString(got); s != tc.want {
+				t.Fatalf("edges = %q, want %q", s, tc.want)
+			}
+			if got.Epoch != 7 {
+				t.Fatalf("the baseline must carry the new term, got epoch %d", got.Epoch)
+			}
+			// Rev 0 is load-bearing: BuildTree refuses a prev whose Rev does not
+			// advance, and the first tree of a new term is Rev 1.
+			if got.Rev != 0 {
+				t.Fatalf("the baseline must be stamped Rev 0, got %d", got.Rev)
+			}
+		})
+	}
+}
+
+// TestReconstructObservedIsDeterministic: the same realized fleet must reconstruct
+// identically every time. Go randomises map iteration, so a reconstruction that leaked
+// it would make the first tree of every new term depend on nothing but the hash seed —
+// silently destroying the replayability the whole test strategy rests on.
+func TestReconstructObservedIsDeterministic(t *testing.T) {
+	parents := map[string]string{"a": "", "x": "a", "y": "a", "b": "x", "c": "x", "d": "y", "e": "y"}
+	first := edgeString(reconstructObserved(parents, 1))
+	for i := 0; i < 50; i++ {
+		if got := edgeString(reconstructObserved(parents, 1)); got != first {
+			t.Fatalf("reconstruction %d differs: %q vs %q", i, got, first)
+		}
+	}
+}
