@@ -28,3 +28,6 @@ go.work.sum
 
 # Local tool caches (serena code-intelligence index, etc.) — machine-local, not project source
 .serena/
+
+# Playwright MCP scratch output from local UI verification
+.playwright-mcp/
