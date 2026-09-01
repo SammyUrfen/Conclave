@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"regexp"
 	"sort"
 	"sync"
 	"time"
@@ -15,6 +14,7 @@ import (
 	"github.com/coder/websocket/wsjson"
 
 	"github.com/SammyUrfen/conclave/internal/clock"
+	"github.com/SammyUrfen/conclave/internal/policy"
 )
 
 const (
@@ -78,16 +78,19 @@ const (
 // The same pattern governs POST /api/meets. Enforcing it here too is what stops a
 // meet existing that /ws admitted but the API would reject — a meet the dashboard
 // could never render.
-const RoomIDPattern = `^[a-z0-9][a-z0-9_-]{0,63}$`
+//
+// RULING A (docs/PLAN.md §2.4): the rule itself lives in internal/policy now, so
+// the dashboard's meet-creation endpoint can share it without importing signaling
+// (the DAG forbids dashboard → signaling — see §2.3). This is a documented alias
+// kept for source compatibility with every Phase 1-4 call site that named
+// RoomIDPattern/ValidRoomID directly; it is not a second copy of the rule, and
+// TestRoomIDValidation pins that it never becomes one.
+const RoomIDPattern = policy.MeetIDPattern
 
-// roomIDRe is the compiled RoomIDPattern. A package-level var holding an immutable
-// compiled regexp is not the mutable global state this project forbids; it is the
-// standard Go idiom for "compile once, at init, and fail loudly if the literal is
-// wrong".
-var roomIDRe = regexp.MustCompile(RoomIDPattern)
-
-// ValidRoomID reports whether id is an acceptable meet id (RoomIDPattern).
-func ValidRoomID(id string) bool { return roomIDRe.MatchString(id) }
+// ValidRoomID reports whether id is an acceptable meet id (RoomIDPattern). See
+// RoomIDPattern for why this delegates to internal/policy instead of owning the
+// rule.
+func ValidRoomID(id string) bool { return policy.ValidMeetID(id) }
 
 // Observer is the control-plane's window into room membership and telemetry. A Hub
 // with an observer set (Phase 4's coordinator) calls it when a peer joins or
@@ -144,11 +147,12 @@ type HubConfig struct {
 	// AllowedOrigins gates the WebSocket upgrade. Empty means same-origin only,
 	// which is the Phase 1-4 behaviour and is correct for a Go peer (it sends no
 	// Origin header at all). The browser dashboard lives on a different origin, so
-	// it needs its host listed here — the SAME list the REST surface uses for CORS,
-	// injected in both places rather than written down twice. Patterns are matched
-	// by path.Match against "scheme://host", so "http://localhost:*" is a port
-	// wildcard. Never pass "*".
-	AllowedOrigins []string
+	// it needs its host listed here — the SAME internal/policy.Origins value the
+	// REST surface uses for CORS (see policy.ParseOrigins), injected in both
+	// places rather than written down twice (docs/PLAN.md §2.4, §9.8). Patterns
+	// are matched by path.Match against "scheme://host", so "http://localhost:*"
+	// is a port wildcard. Never pass "*".
+	AllowedOrigins policy.Origins
 	// PingInterval / PingTimeout override the keepalive cadence. 0 ⇒ the WSPing*
 	// defaults. They exist so a test can observe a reap without waiting seconds,
 	// and so an operator running a non-default -heartbeat can keep the two liveness
@@ -163,7 +167,7 @@ type Hub struct {
 
 	// allowedOrigins, pingInterval and pingTimeout are fixed at construction and
 	// read-only thereafter, so they need no lock.
-	allowedOrigins []string
+	allowedOrigins policy.Origins
 	pingInterval   time.Duration
 	pingTimeout    time.Duration
 
@@ -180,18 +184,39 @@ type Hub struct {
 // NewHub returns a ready Hub with default configuration, logging through the given
 // logger. It is the Phase 1-4 constructor and is kept so no existing call site has
 // to change; it delegates to NewHubWithConfig.
-func NewHub(log *slog.Logger) *Hub { return NewHubWithConfig(HubConfig{Log: log}) }
-
-// NewHubWithConfig returns a ready Hub built from cfg.
 //
-// It PANICS on a self-contradictory ping configuration (a pong timeout at least as
-// long as the ping interval, which would let pings overlap and make the detection
-// window unbounded). That is the fail-loud discipline this project uses for config:
-// the alternative is a Hub that silently never reaps a dead socket. The signature
-// has no error return because this is a programmer error at startup, not a runtime
-// condition — the same call the standard library makes for regexp.MustCompile and
-// time.NewTicker.
-func NewHubWithConfig(cfg HubConfig) *Hub {
+// It cannot fail and so keeps the non-erroring signature: HubConfig{Log: log}'s
+// defaults (WSPingInterval, WSPingTimeout) are compile-time constants, known-good,
+// and pinned by TestHubConfigDefaults — a constructor that cannot fail should not
+// pretend it can (docs/PLAN.md §4.2). If NewHubWithConfig ever rejected them, that
+// would mean the defaults themselves regressed, which is a programmer error worth
+// a panic naming the bug, not a startup error naming an operator's flag.
+func NewHub(log *slog.Logger) *Hub {
+	h, err := NewHubWithConfig(HubConfig{Log: log})
+	if err != nil {
+		panic(fmt.Sprintf("signaling: NewHub's own defaults are self-contradictory: %v", err))
+	}
+	return h
+}
+
+// ErrInvalidPingConfig reports a self-contradictory HubConfig ping configuration:
+// PingTimeout is not strictly shorter than PingInterval. Wrapped with %w in the
+// error NewHubWithConfig returns, so a caller can match it with errors.Is rather
+// than parsing a message.
+var ErrInvalidPingConfig = errors.New("signaling: ping timeout must be strictly shorter than ping interval")
+
+// NewHubWithConfig returns a ready Hub built from cfg, or an error if cfg is
+// self-contradictory (currently: PingTimeout >= PingInterval, which would let
+// pings overlap and make WSLivenessBudget's detection window unbounded).
+//
+// RULING B (docs/PLAN.md §2.4/§4.2, §15.4): this returns an error rather than
+// panicking, because PingInterval/PingTimeout are OPERATOR INPUT — the same
+// family as -allowed-origins, destined to be wired from flags — not a programmer
+// error. The project's rule is errors-as-values with fail-loud-at-startup,
+// translated by run() error into one sentence on stderr (e.g.
+// "server: signaling: ..."); a panic there produces a stack trace where the
+// operator needs one sentence naming the field they got wrong.
+func NewHubWithConfig(cfg HubConfig) (*Hub, error) {
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
@@ -205,8 +230,8 @@ func NewHubWithConfig(cfg HubConfig) *Hub {
 		cfg.PingTimeout = WSPingTimeout
 	}
 	if cfg.PingTimeout >= cfg.PingInterval {
-		panic(fmt.Sprintf("signaling: PingTimeout %v must be shorter than PingInterval %v",
-			cfg.PingTimeout, cfg.PingInterval))
+		return nil, fmt.Errorf("%w: HubConfig.PingTimeout=%v, HubConfig.PingInterval=%v",
+			ErrInvalidPingConfig, cfg.PingTimeout, cfg.PingInterval)
 	}
 	return &Hub{
 		log:            cfg.Log.With(slog.String("component", "signaling")),
@@ -215,7 +240,7 @@ func NewHubWithConfig(cfg HubConfig) *Hub {
 		pingInterval:   cfg.PingInterval,
 		pingTimeout:    cfg.PingTimeout,
 		rooms:          make(map[string]map[string]*member),
-	}
+	}, nil
 }
 
 // LivenessBudget is the worst case time this Hub takes to notice a dead socket. It
@@ -254,7 +279,7 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 	// all, so the library's same-origin default already passes it; this list only
 	// widens the policy for the browser dashboard, and never to "*".
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		OriginPatterns: h.allowedOrigins,
+		OriginPatterns: h.allowedOrigins.Patterns(),
 	})
 	if err != nil {
 		// Accept has already written an error response to w.
