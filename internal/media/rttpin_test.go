@@ -52,6 +52,14 @@ func TestPionPopulatesSelectedPairRTT(t *testing.T) {
 	if err := answerer.AddRecvOnlyVideo(); err != nil {
 		t.Fatalf("recv-only: %v", err)
 	}
+	// The offerer needs an m-line to offer or the SDP carries no media section, no
+	// candidates are exchanged, and ICE never starts — a genuinely empty
+	// PeerConnection between two conclave Sessions does not connect at all. Nothing
+	// is ever WRITTEN to this track, which is the point: the measurement below is
+	// taken on an edge that has negotiated but is carrying no RTP.
+	if _, err := initiator.AddVideoTrack("probe", "probe"); err != nil {
+		t.Fatalf("add track: %v", err)
+	}
 	answerer.Start(ctx)
 	initiator.Start(ctx)
 
@@ -70,9 +78,10 @@ func TestPionPopulatesSelectedPairRTT(t *testing.T) {
 		return okA && okB
 	})
 
-	// No media flowed in this test at all — that is deliberate, and it is half the
-	// point: the sensor must work on an edge carrying nothing, because a peer needs
-	// RTT to a candidate parent before it has agreed to take media from it.
+	// No RTP was ever written — that is deliberate, and it is half the point: the
+	// sensor must work on an edge that is negotiated but carrying nothing, because
+	// the RTT of a candidate parent matters before any media is taken from it, and
+	// because a relay measures a child that has not started sending yet.
 	for name, ms := range map[string]float64{"offerer": gotOfferer, "answerer": gotAnswerer} {
 		if ms <= 0 || ms > 5000 {
 			t.Errorf("%s measured %v ms, which is not a plausible loopback RTT", name, ms)

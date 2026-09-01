@@ -63,6 +63,12 @@ type forwarder struct {
 
 	pliForwarded atomic.Int64 // upstream PLIs sent; asserted by the relay test
 
+	// loss is the uplink-loss sensor, fed from drainRTCP's reception reports. It
+	// carries its own mutex rather than living under f.mu because it is written on
+	// every child's drain goroutine and read on the metrics reporter's, and it shares
+	// no invariant with the source map f.mu guards.
+	loss lossTracker
+
 	mu      sync.RWMutex
 	sources map[string]*forwardSource // keyed by SOURCE peer name
 }
@@ -253,7 +259,7 @@ func (f *forwarder) registerOut(src, dst string, track rtpTrack, sender *webrtc.
 	f.meter.addPeer(1)
 	f.spawn(func() {
 		defer f.meter.addPeer(-1)
-		f.drainRTCP(src, sender)
+		f.drainRTCP(src, dst, sender)
 	})
 }
 
@@ -457,18 +463,30 @@ func (f *forwarder) fanout(src string, gen uint64, pkt *rtp.Packet) {
 // interceptor chain (NACK responder, reports) and what catches the child's keyframe
 // requests. On PLI/FIR it asks the source for a keyframe. It returns when the child
 // leaves (its sender closes), which is the signal to drop this leg's meter count.
-func (f *forwarder) drainRTCP(src string, sender *webrtc.RTPSender) {
+func (f *forwarder) drainRTCP(src, dst string, sender *webrtc.RTPSender) {
+	// The child's last reported loss must not outlive the child: a departed leg's
+	// final bad report would otherwise derate this relay permanently.
+	defer f.loss.forget(dst)
 	for {
 		pkts, _, err := sender.ReadRTCP()
 		if err != nil {
 			return // io.ErrClosedPipe when the child's sender stops → child gone
 		}
 		for _, p := range pkts {
-			switch p.(type) {
+			switch pkt := p.(type) {
 			case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
 				// Normalise PLI and FIR to one upstream PLI — we don't need FIR's
 				// per-request sequence bookkeeping, just "send a keyframe".
 				f.requestUpstreamKeyframe(src)
+			case *rtcp.ReceiverReport:
+				// The child telling us what IT lost of what WE sent. This loop is the
+				// only place in the process that already sees it, which is why the
+				// uplink-loss sensor lives here rather than in a second RTCP reader:
+				// pion v4 collects no RTPSender stats at all, so GetStats cannot
+				// answer this (see TestPionPopulatesSelectedPairRTT).
+				for _, rr := range pkt.Reports {
+					f.loss.observe(dst, fractionLost(rr))
+				}
 			}
 		}
 	}
