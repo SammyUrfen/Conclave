@@ -340,6 +340,26 @@ func (c *Coordinator) project(rs *roomState) (nodes []overlay.Node, waiting []st
 			if ns.report.NAT != "" {
 				n.NAT = ns.report.NAT
 			}
+			// The measured pairwise RTT, which is what BuildTree's min-latency rank
+			// (and therefore the whole stickiness margin) reads. Before the peer-side
+			// sensor existed this was always nil, so rttTo returned unknownRTT for
+			// every candidate and no challenger could ever beat an incumbent — see
+			// TestACloserRelayWinsTheReParent.
+			//
+			// A FRESH MAP PER PROJECTION, never a reference into ns.report. overlay
+			// is handed this value on every rebuild and the coordinator keeps the
+			// report; sharing one map would let anything that writes into Node.RTT
+			// silently rewrite stored telemetry, which reads back as a tree that
+			// changed with no event to explain it. It is also left NIL when the peer
+			// measured nothing, because BuildTree treats a missing entry as unknown
+			// and an empty non-nil map means the same thing more expensively.
+			if len(ns.report.PeerRTT) > 0 {
+				rtt := make(map[string]float64, len(ns.report.PeerRTT))
+				for _, pr := range ns.report.PeerRTT {
+					rtt[pr.Name] = pr.RTTMs
+				}
+				n.RTT = rtt
+			}
 		} else {
 			waiting = append(waiting, ns.name)
 		}
