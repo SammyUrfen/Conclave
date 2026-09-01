@@ -245,3 +245,110 @@ func TestRouterRealizedChildOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestRouterRealizedStaticTopology is the static-mode sibling of the managed case
+// above, and it exists because the two modes reach the realized-parent field by
+// completely different routes: managed mode maintains it from applyTopology and the
+// re-parent state machine, while a hand-authored -topology peer runs NEITHER of
+// those. A field only ever written by a state machine that does not run in this mode
+// is uninitialised in it, and the parent then falls through the "not my parent" arm
+// into the children list.
+//
+// The failure that produces is the worst shape available: a REVERSED EDGE. A leaf
+// reports parent="" and names its own parent as its child, so a coordinator
+// rebuilding a tree from that heartbeat points the tree backwards — silently, since
+// every field is populated and well-formed.
+//
+// Discrimination: against an unseeded parentInUse, the leaf and relay rows fail with
+// exactly that reversal. The root row is the control — a root has no parent, so the
+// bug is invisible there and it must pass either way; a test suite where every row
+// flipped would not be telling us where the defect actually is.
+func TestRouterRealizedStaticTopology(t *testing.T) {
+	// The Phase-3 shape: a hand-authored chain, no coordinator anywhere.
+	static := func() *overlay.Topology {
+		return &overlay.Topology{
+			Epoch: overlay.StaticEpoch, Rev: 1, Root: "a",
+			Edges: []overlay.Edge{{Parent: "a", Child: "b"}, {Parent: "b", Child: "c"}},
+		}
+	}
+
+	cases := []struct {
+		name         string
+		self         string
+		neighbours   []string // peers this node holds a session to, in the static tree
+		wantParent   string
+		wantChildren []metrics.ChildLink
+	}{
+		{
+			name: "a leaf reports its parent, not a child",
+			self: "c", neighbours: []string{"b"},
+			wantParent: "b", wantChildren: nil,
+		},
+		{
+			name: "a relay splits its parent from its child",
+			self: "b", neighbours: []string{"a", "c"},
+			wantParent:   "a",
+			wantChildren: []metrics.ChildLink{{Name: "c", State: webrtc.PeerConnectionStateNew.String()}},
+		},
+		{
+			// Control: the root genuinely has no parent, so this row passes with or
+			// without the fix and localises the defect to the non-root case.
+			name: "the root has no parent to confuse",
+			self: "a", neighbours: []string{"b"},
+			wantParent:   "",
+			wantChildren: []metrics.ChildLink{{Name: "b", State: webrtc.PeerConnectionStateNew.String()}},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Static mode: Topology is set and Managed is NOT, so applyTopology
+			// returns early and the re-parent state machine never runs.
+			r := NewRouter(discardLog(), nil, RouterConfig{SelfName: tc.self, Topology: static()})
+			for _, peer := range tc.neighbours {
+				linkStaticPeer(t, r, "p-"+peer, peer)
+			}
+
+			parent, parentState, children := r.Realized()
+			if parent != tc.wantParent {
+				t.Errorf("parent = %q, want %q", parent, tc.wantParent)
+			}
+			wantState := webrtc.PeerConnectionStateNew.String()
+			if tc.wantParent == "" {
+				wantState = ""
+			}
+			if parentState != wantState {
+				t.Errorf("parentState = %q, want %q", parentState, wantState)
+			}
+			if !reflect.DeepEqual(children, tc.wantChildren) {
+				t.Errorf("children = %+v, want %+v", children, tc.wantChildren)
+			}
+			for _, ch := range children {
+				if ch.Name == tc.wantParent {
+					t.Errorf("the parent %q is listed as a child: this is the REVERSED EDGE, and a "+
+						"coordinator rebuilding from it points the tree backwards", ch.Name)
+				}
+			}
+		})
+	}
+}
+
+// linkStaticPeer registers a live session toward peerName without any network: the
+// far end of the transport never answers, so the PeerConnection stays in its initial
+// state for the whole test and every assertion above is about bookkeeping rather
+// than timing.
+func linkStaticPeer(t *testing.T, r *Router, id, peerName string) {
+	t.Helper()
+	tr, _ := newGatedPair(id, "self")
+	sess, err := NewSession(SessionConfig{
+		Log: discardLog(), SelfID: "self", PeerID: id, Transport: tr,
+	})
+	if err != nil {
+		t.Fatalf("new session for %s: %v", peerName, err)
+	}
+	t.Cleanup(func() { _ = sess.Close() })
+	r.learnPeer(id, peerName)
+	r.mu.Lock()
+	r.peers[id] = &peerLink{session: sess, cancel: func() {}}
+	r.mu.Unlock()
+}
