@@ -86,7 +86,7 @@ REPLAYABLE_PKGS := internal/overlay internal/simnet internal/coordinator interna
 # to test it. Holding them to tier 1 would force those tests to fake a socket, which
 # would test less. They are gated so that a future edit cannot silently opt them out.
 # (§4.7 rule 1.)
-INJECTED_CLOCK_PKGS := internal/dashboard internal/signaling internal/metrics internal/policy
+INJECTED_CLOCK_PKGS := internal/dashboard internal/signaling internal/metrics internal/policy cmd/server cmd/peer
 
 # DELIBERATELY OUTSIDE BOTH, and why — this list is the honest part of the gate:
 #
