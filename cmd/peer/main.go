@@ -26,6 +26,7 @@ import (
 
 	"github.com/pion/webrtc/v4"
 
+	"github.com/SammyUrfen/conclave/internal/clock"
 	"github.com/SammyUrfen/conclave/internal/logging"
 	"github.com/SammyUrfen/conclave/internal/media"
 	"github.com/SammyUrfen/conclave/internal/metrics"
@@ -189,7 +190,7 @@ func runCall(logger *slog.Logger, cfg callConfig) error {
 		// declared budget + NAT) and ships it through this send closure, which is the
 		// only thing that knows about the wire. Telemetry is best-effort — a send
 		// error is the reporter's to log, never the peer's to fail on.
-		reporter := metrics.NewReporter(logger, metrics.DefaultInterval,
+		reporter := metrics.NewReporter(logger, metrics.DefaultInterval, clock.System(),
 			func() metrics.Report {
 				return metrics.Report{Name: cfg.name, UploadKbps: cfg.uploadKbps, NAT: cfg.nat}
 			},
