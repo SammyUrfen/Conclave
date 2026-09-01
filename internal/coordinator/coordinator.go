@@ -57,11 +57,18 @@ const eventBuffer = 256
 // to "every meet in the process stops".
 const sendBuffer = 1024
 
-// maxDeadlineRounds bounds one advance pass. Every deadline this package arms is
-// strictly in the future once it has been fired, so the loop below always
-// terminates; the bound exists so a future handler that re-arms at a non-positive
-// delay fails loudly instead of spinning a goroutine forever. A wedged test is
-// strictly worse than a failing one.
+// maxDeadlineRounds bounds one advance pass.
+//
+// UNREACHABLE TODAY, and kept on purpose. All six deadline classes are self-clearing:
+// each one either disarms itself when it fires (settle, cooldown, rebuild) or advances
+// the state it is computed from (gone, degraded, dwell), so every fired deadline is
+// strictly in the future or gone by the time the loop re-examines it, and advance always
+// terminates. The bound is a backstop against a FUTURE handler that re-arms at a
+// non-positive delay — a bug that would otherwise spin a goroutine forever and hang the
+// process with no stack, no seed, and no clue. A wedged test is strictly worse than a
+// failing one. Do not write a test that fakes reachability for it; the honest statement
+// is that it cannot fire against today's handlers, which is why it is documented rather
+// than covered.
 const maxDeadlineRounds = 10_000
 
 // Coordinator ingests room membership and telemetry, computes a forwarding tree on
@@ -620,7 +627,13 @@ func (c *Coordinator) advance() {
 		}
 		d := next.Sub(c.cfg.Clock.Now())
 		if d <= 0 {
-			// Virtual time moved under us between fireDue and here. Go fire it.
+			// UNREACHABLE TODAY. fireDue has just reported nothing is due, so every
+			// remaining deadline is strictly in the future — unless the clock moved
+			// between the two calls, which the injected clock never does on this
+			// goroutine and a virtual clock never does mid-handler. Kept because
+			// arming a timer for a non-positive delay is the one way this loop could
+			// stop waking: the timer would be due immediately and, on a virtual clock,
+			// only ever fire inside an Advance nobody is running.
 			continue
 		}
 		if c.wakeArmed && c.wakeAt.Equal(next) {

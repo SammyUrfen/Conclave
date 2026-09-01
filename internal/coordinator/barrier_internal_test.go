@@ -1,28 +1,39 @@
 package coordinator
 
 // The one property everything else in this repo's deterministic test strategy rests
-// on: Sync is a SOUND quiescence barrier.
+// on: Sync is a SOUND quiescence barrier. Plus the package's other guards that can
+// only be reached white-box.
 //
-// It is proved here, white-box and single-goroutine, rather than by racing a real
-// loop. A concurrent test of this cannot discriminate: a fired timer and a sync
-// arriving at one parked select are resolved by Go's uniform-random choice, but on a
-// multi-core machine the Run goroutine is almost always already awake and reacting
-// by the time the sync is enqueued — so a broken loop passes anyway, and the test
-// reads as coverage while proving nothing. (surface_test.go's 200-trial race test is
-// kept as an end-to-end check of the same claim, but THIS is the discriminator.)
+// The barrier is proved here rather than by racing a real loop. A concurrent test
+// cannot discriminate: a fired timer and a sync arriving at one parked select are
+// resolved by Go's uniform-random choice, but on a multi-core machine the Run goroutine
+// is almost always already awake and reacting by the time the sync is enqueued — so a
+// broken loop passes anyway, and the test reads as coverage while proving nothing.
+// surface_test.go's 200-trial race test is kept as an end-to-end check of the same
+// claim, and its own comment records that it does not discriminate.
 //
-// The construction: drive handle() directly on the test goroutine, fire a deadline
-// into the wake channel with nobody consuming it, and then hand the loop a sync. The
-// sync branch must react to the pending deadline BEFORE it acks.
+// TWO MUTATIONS, TWO TESTS, and the distinction matters — a mutation audit found the
+// original claim ("THIS is the discriminator") was true for only one of them:
+//
+//   - DELETING the drain is caught by TestSyncDrainsFiredDeadlinesBeforeAcking, which
+//     drives handle() synchronously: fire a deadline into the wake channel with nobody
+//     consuming it, then hand the loop a sync, and the reaction must have happened.
+//   - REORDERING it — acking before draining — is invisible to that test, because both
+//     statements complete before handle() returns. TestSyncDrainsBeforeItAcks catches it
+//     by freezing the loop inside the reaction and asking whether the ack has already
+//     been given.
 
 import (
+	"context"
 	"io"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/SammyUrfen/conclave/internal/clock"
 	"github.com/SammyUrfen/conclave/internal/metrics"
+	"github.com/SammyUrfen/conclave/internal/overlay"
 )
 
 // stubClock is a minimal manual clock: time moves only when advance is called, and
@@ -97,22 +108,74 @@ func (t *stubTimer) Stop() bool {
 type driver struct {
 	c   *Coordinator
 	clk *stubClock
+	pub *gatedPublisher
+}
+
+// gatedPublisher records events and can PARK the goroutine that is publishing. The
+// parking is what turns an ordering question into a deterministic one: with the
+// publisher held inside a reaction, a test can look at the outside world and ask "has
+// the acknowledgement already been given?" without racing anything.
+type gatedPublisher struct {
+	mu      sync.Mutex
+	events  []Event
+	entered chan struct{} // signalled on entry to a gated Publish
+	release chan struct{} // gated Publish blocks until this is closed
+}
+
+func (p *gatedPublisher) Publish(ev Event) {
+	p.mu.Lock()
+	p.events = append(p.events, ev)
+	entered, release := p.entered, p.release
+	p.mu.Unlock()
+	if entered == nil {
+		return
+	}
+	select {
+	case entered <- struct{}{}:
+	default:
+	}
+	<-release
+}
+
+// arm makes the NEXT Publish park until release is closed.
+func (p *gatedPublisher) arm() (entered, release chan struct{}) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.entered, p.release = make(chan struct{}, 1), make(chan struct{})
+	return p.entered, p.release
+}
+
+func (p *gatedPublisher) all() []Event {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]Event(nil), p.events...)
+}
+
+func (p *gatedPublisher) countOf(k EventKind) int {
+	n := 0
+	for _, ev := range p.all() {
+		if ev.Kind == k {
+			n++
+		}
+	}
+	return n
 }
 
 func newDriver(t *testing.T) *driver {
 	t.Helper()
 	clk := newStubClock()
+	pub := &gatedPublisher{}
 	c := New(slog.New(slog.NewTextHandler(io.Discard, nil)), Config{
 		MaxDepth: 2, StreamKbps: 2000, Clock: clk,
-		// Liveness out of the way: this test is about the barrier, and a fleet that
-		// never beats would otherwise be reaped by the backstop mid-test.
+		// Liveness out of the way: these tests are about ordering and guards, and a
+		// fleet that never beats would otherwise be reaped by the backstop mid-test.
 		DegradedAfter: time.Hour, GoneAfter: time.Hour,
-	}, nil, nil)
+	}, nil, pub)
 	// Run would own these; here the test goroutine does.
 	c.wake = clk.NewTimer(time.Hour)
 	c.wake.Stop()
 	c.wakeArmed = false
-	return &driver{c: c, clk: clk}
+	return &driver{c: c, clk: clk, pub: pub}
 }
 
 func (d *driver) join(peerID, name string, upload int) {
@@ -129,8 +192,18 @@ func (d *driver) rev() uint64 {
 	return rs.published.Rev
 }
 
-// TestSyncDrainsFiredDeadlinesBeforeAcking is the discriminator. Remove the
-// drainWake call from handle's evSync branch and this test fails deterministically.
+// guard bounds a wait in REAL time so a wedged loop fails the test instead of hanging
+// it with no stack. It never affects a decision — only whether a deadlock is reported.
+const guard = 10 * time.Second
+
+// TestSyncDrainsFiredDeadlinesBeforeAcking is the DELETION discriminator: remove the
+// drainWake call from handle's evSync branch and this fails deterministically.
+//
+// It cannot catch REORDERING (acking before draining), because it drives handle
+// synchronously and both statements complete before handle returns — the ordering is
+// invisible from outside a single call. TestSyncDrainsBeforeItAcks below closes that,
+// so between them the claim "this file is the discriminator" is finally true for both
+// mutations.
 func TestSyncDrainsFiredDeadlinesBeforeAcking(t *testing.T) {
 	d := newDriver(t)
 	d.join("p1", "a", 8000)
@@ -225,5 +298,189 @@ func TestDeadlinesFireInOrder(t *testing.T) {
 	}
 	if topo := d.c.rooms["r"].published; topo.ParentOf("c") == "" {
 		t.Fatalf("the silent joiner must be placed when the window closes: %+v", topo)
+	}
+}
+
+// TestSyncDrainsBeforeItAcks is the REORDERING discriminator, and it is deterministic
+// rather than probabilistic.
+//
+// The trick is to freeze the loop INSIDE the reaction the drain triggers: the publisher
+// parks on its first event, so while it is parked the drained recompute has provably
+// started and provably not finished. At that instant the acknowledgement must not yet
+// have been given. Swap the two statements in handle's evSync branch — close(ev.ack)
+// before c.drainWake() — and the ack is already closed when the publisher parks.
+//
+// This is the ordering question asked as a state question, which is the only way to ask
+// it without a race: "is the ack already closed at a moment we control" rather than
+// "did the ack happen after the drain", which nothing can observe directly.
+func TestSyncDrainsBeforeItAcks(t *testing.T) {
+	d := newDriver(t)
+	d.join("p1", "a", 8000)
+	d.join("p2", "b", 0)
+	d.join("p3", "c", 0)
+	built := d.rev()
+	if built == 0 {
+		t.Fatal("precondition: the meet must have built")
+	}
+
+	// A leave is not urgent, so it is suppressed and arms the cooldown deadline.
+	d.c.handle(event{kind: evLeave, roomID: "r", peerID: "p3"})
+	if !d.c.wakeArmed {
+		t.Fatal("precondition: the suppressed recompute must have armed a deadline")
+	}
+	// Fire it, with nobody consuming the delivery: the wake channel is now hot.
+	d.clk.advance(RecomputeCooldown)
+
+	entered, release := d.pub.arm()
+	ack := make(chan struct{})
+	go d.c.handle(event{kind: evSync, ack: ack})
+
+	ctx, cancel := context.WithTimeout(context.Background(), guard)
+	defer cancel()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("the fired deadline was never reacted to: the sync branch did not drain")
+	}
+
+	select {
+	case <-ack:
+		t.Fatal("Sync acknowledged BEFORE the reaction it exists to wait for had finished: " +
+			"the drain must complete before the ack, not merely happen in the same call")
+	default:
+	}
+
+	close(release)
+	select {
+	case <-ack:
+	case <-ctx.Done():
+		t.Fatal("Sync never acknowledged")
+	}
+	if got := d.rev(); got != built+1 {
+		t.Fatalf("the drained deadline must have rebuilt; rev %d, want %d", got, built+1)
+	}
+}
+
+// TestPublishIsGatedByTheIndependentOracle covers the LAST LINE OF DEFENCE between a
+// buggy builder and the whole fleet: a computed tree is validated by an independent
+// oracle before it is published, and a tree that fails is never sent.
+//
+// It is untestable through recompute, because overlay.BuildTree is correct — there are
+// no inputs that make it emit a tree Validate rejects. So the gate is exercised at its
+// own seam: commit() takes an already-computed tree, which is exactly the boundary
+// where a bug in the layer below would arrive.
+func TestPublishIsGatedByTheIndependentOracle(t *testing.T) {
+	d := newDriver(t)
+	d.join("p1", "a", 8000)
+	d.join("p2", "b", 0)
+	good := d.c.rooms["r"].published
+	if good == nil {
+		t.Fatal("precondition: the meet must have built")
+	}
+	nodes, _ := d.c.project(d.c.rooms["r"])
+	cons := overlay.Constraints{
+		Root: good.Root, MaxDepth: 2, StreamKbps: 2000,
+		Epoch: good.Epoch, Rev: good.Rev + 1, StickinessMs: overlay.DefaultStickinessMs,
+	}
+
+	cases := []struct {
+		name string
+		tree *overlay.Topology
+	}{
+		{
+			name: "an edge naming a node that is not in the fleet",
+			tree: &overlay.Topology{Epoch: good.Epoch, Rev: good.Rev + 1, Root: "a",
+				Edges: []overlay.Edge{{Parent: "a", Child: "ghost"}}},
+		},
+		{
+			name: "a node left unattached",
+			tree: &overlay.Topology{Epoch: good.Epoch, Rev: good.Rev + 1, Root: "a"},
+		},
+		{
+			name: "an unstamped revision no peer would accept",
+			tree: &overlay.Topology{Epoch: good.Epoch, Rev: 0, Root: "a",
+				Edges: []overlay.Edge{{Parent: "a", Child: "b"}}},
+		},
+		{
+			name: "a root disagreeing with the constraints",
+			tree: &overlay.Topology{Epoch: good.Epoch, Rev: good.Rev + 1, Root: "b",
+				Edges: []overlay.Edge{{Parent: "b", Child: "a"}}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rs := d.c.rooms["r"]
+			before := rs.published
+			beforeUnbuildable := d.pub.countOf(EventUnbuildable)
+			beforeTopology := d.pub.countOf(EventTopology)
+
+			d.c.commit(rs, tc.tree, nodes, cons, OutcomeBuilt, "", "oracle test")
+
+			if rs.published != before {
+				t.Fatalf("a tree that fails its own validator must NEVER be published; "+
+					"rev %d replaced rev %d", rs.published.Rev, before.Rev)
+			}
+			if d.pub.countOf(EventTopology) != beforeTopology {
+				t.Fatal("no topology event may be emitted for a rejected tree")
+			}
+			if d.pub.countOf(EventUnbuildable) != beforeUnbuildable+1 {
+				t.Fatal("a rejected tree must be reported, not silently dropped")
+			}
+		})
+	}
+
+	// And the gate is not simply refusing everything: a legal tree still goes out.
+	rs := d.c.rooms["r"]
+	valid, err := overlay.BuildTree(nodes, rs.working, cons)
+	if err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	d.c.commit(rs, valid, nodes, cons, OutcomeBuilt, "", "oracle test")
+	if rs.published != valid {
+		t.Fatal("a tree that passes the oracle must be published")
+	}
+}
+
+// TestOutboundQueueDropsRatherThanBlocks: a wedged Sender must cost one meet a missed
+// push, never the control loop. The queue is bounded and the enqueue is non-blocking,
+// so the degradation is a drop — counted, so it is visible rather than silent.
+func TestOutboundQueueDropsRatherThanBlocks(t *testing.T) {
+	d := newDriver(t)
+	// A queue of one, with nothing draining it: the second push has nowhere to go.
+	d.c.sendQ = make(chan sendOp, 1)
+
+	if !d.c.enqueueSend(sendOp{roomID: "r", peerID: "p1"}) {
+		t.Fatal("the first push must be accepted")
+	}
+	if d.c.enqueueSend(sendOp{roomID: "r", peerID: "p2"}) {
+		t.Fatal("a full queue must DROP rather than block the Run goroutine")
+	}
+	if d.c.dropped != 1 {
+		t.Fatalf("a drop must be counted so it is visible in a log; dropped = %d", d.c.dropped)
+	}
+}
+
+// TestDeriveWorkingEmitsEveryEdgeEvenWhenItCannotOrderThem: the working copy is a HINT
+// to the builder, not a tree, so a promotion that names a descendant — something the
+// backup invariant forbids and only a misbehaving peer could report — must not cause
+// edges to be silently dropped. Truncating the hint would move nodes the coordinator had
+// no reason to move.
+func TestDeriveWorkingEmitsEveryEdgeEvenWhenItCannotOrderThem(t *testing.T) {
+	published := &overlay.Topology{
+		Epoch: 1, Rev: 3, Root: "r",
+		Edges: edges("r", "u", "r", "p"),
+	}
+	// u and p each claim the other as their new parent: a cycle with no placeable end.
+	got := deriveWorking(published, map[string]bool{"r": true, "u": true, "p": true},
+		map[string]string{"u": "p", "p": "u"})
+
+	if got == nil {
+		t.Fatal("deriveWorking returned nil for a non-nil published tree")
+	}
+	if len(got.Edges) != 2 {
+		t.Fatalf("every surviving edge must reach the hint; got %v", got.Edges)
+	}
+	if got.ParentOf("u") != "p" || got.ParentOf("p") != "u" {
+		t.Fatalf("the reported parents must survive into the hint; got %v", got.Edges)
 	}
 }
