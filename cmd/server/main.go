@@ -120,6 +120,14 @@ func newPlane(log *slog.Logger, f *serverFlags, res resolved) (*plane, error) {
 		return nil, err
 	}
 
+	// 2b. The tuning this server would announce to an elected peer. It is checked here
+	//     rather than trusted because arbiter.New only warns about an unusable one, and
+	//     the symptom of ignoring that warning — every elected peer publishing no tree —
+	//     points nowhere near its cause.
+	if err := validateMeetConfig(f, hub.LivenessBudget()); err != nil {
+		return nil, err
+	}
+
 	// 3. The dashboard is the Publisher for both control planes, but it cannot exist
 	//    until they do. Bind late.
 	pub := &publisherRef{}
@@ -135,7 +143,7 @@ func newPlane(log *slog.Logger, f *serverFlags, res resolved) (*plane, error) {
 	//    because it is the sole minter of epochs, and without an epoch the coordinator
 	//    has no term to serve — even in the Phase 5 posture where the arbiter simply
 	//    announces itself.
-	p.arbCfg = f.arbiterConfig()
+	p.arbCfg = f.arbiterConfig(hub.LivenessBudget())
 	announcer := &hubAnnouncer{log: log, bus: hub, roles: p.roles}
 	if p.coord != nil {
 		announcer.term = p.coord
@@ -331,7 +339,7 @@ func (p *plane) logStartup() {
 		p.log.Info("coordinator enabled",
 			slog.Int("max_depth", p.coordCfg.MaxDepth),
 			slog.Int("stream_kbps", p.coordCfg.StreamKbps),
-			slog.Float64("stickiness_ms", p.coordCfg.StickinessMs),
+			slog.Float64("stickiness_ms", *p.coordCfg.StickinessMs),
 			slog.Duration("join_settle", p.coordCfg.JoinSettle),
 			slog.Duration("dwell", p.coordCfg.Dwell),
 			slog.String("degraded_after", thresholdLabel(p.coordCfg.DegradedAfter)),

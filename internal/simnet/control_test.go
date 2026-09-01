@@ -62,9 +62,13 @@ func controlConstraints() overlay.Constraints {
 func controlConfig(clk *VirtualClock) coordinator.Config {
 	c := controlConstraints()
 	return coordinator.Config{
-		MaxDepth:        c.MaxDepth,
-		StreamKbps:      c.StreamKbps,
-		StickinessMs:    c.StickinessMs,
+		MaxDepth:   c.MaxDepth,
+		StreamKbps: c.StreamKbps,
+		// Stickiness() because coordinator.Config.StickinessMs is a *float64: nil is
+		// the struct's zero value and resolves to the stability-preserving default,
+		// so an explicit value — including 0 — must be constructed. Passing the
+		// constraint's value keeps this harness and overlay.Constraints in agreement.
+		StickinessMs:    coordinator.Stickiness(c.StickinessMs),
 		DegradedAfter:   time.Hour,
 		GoneAfter:       time.Hour,
 		SocketDetection: 0,

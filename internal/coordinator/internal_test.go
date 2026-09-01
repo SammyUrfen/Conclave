@@ -220,8 +220,14 @@ func TestNormalizeFillsDefaults(t *testing.T) {
 	if cfg.JoinSettle != JoinSettle {
 		t.Errorf("JoinSettle = %v, want %v", cfg.JoinSettle, JoinSettle)
 	}
-	if cfg.StickinessMs != overlay.DefaultStickinessMs {
-		t.Errorf("StickinessMs = %v, want %v", cfg.StickinessMs, overlay.DefaultStickinessMs)
+	// nil resolves to the default, and it resolves to a POINTER so every reader can
+	// dereference without a nil check. An explicit zero is a different request and is
+	// covered in stickiness_internal_test.go.
+	if cfg.StickinessMs == nil {
+		t.Fatal("normalize must leave StickinessMs non-nil so callers may dereference it")
+	}
+	if *cfg.StickinessMs != overlay.DefaultStickinessMs {
+		t.Errorf("StickinessMs = %v, want %v", *cfg.StickinessMs, overlay.DefaultStickinessMs)
 	}
 	if cfg.Clock == nil {
 		t.Error("Clock must default to the system clock")

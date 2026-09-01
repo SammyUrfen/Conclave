@@ -100,8 +100,15 @@ func parseFlags(args []string, errOut io.Writer) (*serverFlags, error) {
 		"coordinator: assumed per-stream upload cost, kbit/s (child capacity = upload budget / this)")
 	fs.IntVar(&f.defaultUploadKbps, "default-upload-kbps", 0,
 		"coordinator: upload budget assumed for a peer that has not reported yet; 0 ⇒ leaf until it reports")
+	// The help text describes what the value MEANS and deliberately does not imply it
+	// currently changes a live tree. Stickiness is observable only where pairwise RTT
+	// is measured — `unknown + margin < unknown` is false for every margin — and the
+	// coordinator's projection leaves Node.RTT nil because Phase 5 has no RTT source.
+	// So the flag is presently inert on a running meet, which is a Limitation of the
+	// telemetry rather than of this flag, and overstating it here would be the more
+	// misleading of the two errors.
 	fs.Float64Var(&f.stickinessMs, "stickiness-ms", overlay.DefaultStickinessMs,
-		"coordinator: RTT margin (ms) a challenger must beat an incumbent parent by; 0 ⇒ memoryless rebuilds")
+		"coordinator: RTT margin (ms) by which a challenger must beat a node's incumbent parent before it is re-parented; 0 ⇒ no margin (memoryless)")
 	fs.IntVar(&f.rootChangeMarginKbps, "root-change-margin-kbps", overlay.RootChangeMarginKbps,
 		"coordinator: extra upload (kbit/s) a challenger needs before the subnet is re-rooted")
 	fs.DurationVar(&f.joinSettle, "join-settle", coordinator.JoinSettle,
@@ -343,27 +350,101 @@ func validateLivenessBudget(goneAfter, socketDetection time.Duration) error {
 	return nil
 }
 
-// coordinatorConfig builds the coordinator's Config from the flags plus the one value
-// that does not come from a flag: the Hub's own socket-death detection window, which
-// floors every per-node gone threshold (§5). Passing it here is what stops a
-// fast-beating peer shrinking its threshold below the window in which the Hub may
-// still consider it present — a bug no flag check can reach, because the cadence is
-// declared by the peer at run time.
-func (f *serverFlags) coordinatorConfig(socketDetection time.Duration) coordinator.Config {
-	return coordinator.Config{
-		MaxDepth:          f.maxDepth,
-		StreamKbps:        f.streamKbps,
-		DefaultUploadKbps: f.defaultUploadKbps,
-		StickinessMs:      f.stickinessMs,
-		Dwell:             f.dwell,
-		RecomputeCooldown: f.recomputeCooldown,
-		DegradedAfter:     f.degradedAfter,
-		GoneAfter:         f.goneAfter,
-		JoinSettle:        f.joinSettle,
-		SocketDetection:   socketDetection,
-		// SelfName stays empty: this coordinator runs inside the arbiter process, not
-		// on an elected peer, which is exactly what the empty value means (§5.8).
+// meetCoordinatorConfig is THE tuning this server gives every meet it arbitrates.
+//
+// It is the single source for two consumers that must never disagree: the arbiter
+// announces it to whichever peer is elected, and this process's own coordinator runs
+// under it. Two literals would drift — that is the DefaultArbiterID/ServerID lesson —
+// so coordinatorConfig below is a TRANSLATION of this value rather than a second
+// spelling of the same flags.
+//
+// EVERY VALUE HERE IS THE RESOLVED EFFECTIVE ONE. arbiter.CoordinatorConfig makes
+// absence unrepresentable per field precisely so no reader has to know which sense a
+// zero carries, so emitting a raw flag that still needs defaulting would put the
+// ambiguity back — on the wire, where it is worst. Two zeros survive deliberately and
+// are not absences: DegradedAfterMs/GoneAfterMs 0 means "derive the threshold per node
+// from the cadence each peer declared", and StickinessMs 0 means memoryless. Startup
+// validation forces -dwell, -recompute-cooldown and -join-settle strictly positive, so
+// none of them can reach this function as a zero needing interpretation.
+//
+// socketDetection is the one input that is not a flag: it is the Hub's own
+// socket-death window, and it is the field an elected peer could not possibly supply
+// for itself because it describes THIS server's transport. Without it a peer
+// coordinator leaves the permanent-ejection window open.
+func (f *serverFlags) meetCoordinatorConfig(socketDetection time.Duration) arbiter.CoordinatorConfig {
+	return arbiter.CoordinatorConfig{
+		Resolved:            true,
+		MaxDepth:            f.maxDepth,
+		StreamKbps:          f.streamKbps,
+		DefaultUploadKbps:   f.defaultUploadKbps,
+		StickinessMs:        f.stickinessMs,
+		DwellMs:             millis(f.dwell),
+		RecomputeCooldownMs: millis(f.recomputeCooldown),
+		DegradedAfterMs:     millis(f.degradedAfter),
+		GoneAfterMs:         millis(f.goneAfter),
+		JoinSettleMs:        millis(f.joinSettle),
+		SocketDetectionMs:   millis(socketDetection),
 	}
+}
+
+// millis converts a duration to the wire's millisecond representation. Durations cross
+// this boundary as milliseconds — matching metrics.Heartbeat.IntervalMs — because
+// time.Duration marshals as nanoseconds, which round-trips fine and is unreadable in a
+// log line at exactly the moment someone is debugging a mis-shaped meet.
+func millis(d time.Duration) int64 { return int64(d / time.Millisecond) }
+
+// coordinatorConfig builds this process's own coordinator Config by TRANSLATING the
+// meet configuration above.
+//
+// Deriving rather than re-reading the flags is the whole point: the announced tuning
+// and the tuning the local coordinator runs under are then the same values by
+// construction, so the meet cannot silently re-shape the moment the role moves off the
+// arbiter. What remains testable is the translation itself, which is a strictly
+// smaller thing to guard than two independent literals.
+func (f *serverFlags) coordinatorConfig(socketDetection time.Duration) coordinator.Config {
+	return coordinatorConfigFrom(f.meetCoordinatorConfig(socketDetection))
+}
+
+// coordinatorConfigFrom is the translator, and it is a free function taking the wire
+// type on purpose: an elected peer performs exactly this translation on the
+// announcement it receives, so keeping it independent of serverFlags is what lets that
+// code be the same shape rather than a re-derivation.
+func coordinatorConfigFrom(cc arbiter.CoordinatorConfig) coordinator.Config {
+	return coordinator.Config{
+		MaxDepth:          cc.MaxDepth,
+		StreamKbps:        cc.StreamKbps,
+		DefaultUploadKbps: cc.DefaultUploadKbps,
+		// The pointer is a LOCAL API convenience and never crosses the wire: nil is
+		// coordinator.Config's zero value and resolves to the safe stability-preserving
+		// default, while Stickiness(0) is an unambiguous request for memoryless. Here
+		// the value is always known, so it is always an explicit request — including
+		// when it is 0, which is the case the pointer exists for.
+		StickinessMs:      coordinator.Stickiness(cc.StickinessMs),
+		Dwell:             cc.Dwell(),
+		RecomputeCooldown: cc.RecomputeCooldown(),
+		DegradedAfter:     cc.DegradedAfter(),
+		GoneAfter:         cc.GoneAfter(),
+		JoinSettle:        cc.JoinSettle(),
+		SocketDetection:   cc.SocketDetection(),
+		// SelfName stays empty: this coordinator runs inside the arbiter process, not
+		// on an elected peer, which is exactly what the empty value means (§5.8). It is
+		// also the one field that must NOT travel — it is the holder's own identity.
+	}
+}
+
+// validateMeetConfig fails startup on a meet configuration that cannot drive a
+// coordinator.
+//
+// arbiter.New only WARNS about this, deliberately: an arbiter that refuses to start is
+// worse than one that says why every meet is uncoordinated. cmd/server is where it
+// becomes fatal, because a server whose every elected peer would publish nothing
+// should not start and look healthy. The error names the offending JSON key, which is
+// the vocabulary a peer's operator sees on the wire.
+func validateMeetConfig(f *serverFlags, socketDetection time.Duration) error {
+	if err := f.meetCoordinatorConfig(socketDetection).Validate(); err != nil {
+		return fmt.Errorf("the coordinator configuration this server would announce is unusable: %w", err)
+	}
+	return nil
 }
 
 // arbiterConfig builds the arbiter's Config from the flags.
@@ -374,13 +455,18 @@ func (f *serverFlags) coordinatorConfig(socketDetection time.Duration) coordinat
 // sees both constants, so it is the one place responsible for passing the wire value
 // across the forbidden edge. Leaving the field empty would work by accident today and
 // break silently the day either constant moves.
-func (f *serverFlags) arbiterConfig() arbiter.Config {
+func (f *serverFlags) arbiterConfig(socketDetection time.Duration) arbiter.Config {
 	return arbiter.Config{
 		Elect:         f.elect,
 		Coordinate:    f.coordinate,
 		ArbiterID:     signaling.ServerID,
 		ElectionDwell: f.electionDwell,
 		MinTerm:       f.minTerm,
+		// The tuning travels with the role. It is the SAME value coordinatorConfig
+		// translates for this process's own coordinator, so an elected peer and the
+		// arbiter shape the meet identically and a handover changes nothing but who
+		// is doing the shaping.
+		CoordinatorConfig: f.meetCoordinatorConfig(socketDetection),
 		// ValidMeetID is wired explicitly rather than left nil, for the same reason:
 		// nil resolves to policy.ValidMeetID inside arbiter, which is correct but
 		// invisible. Naming it here makes the shared boundary predicate greppable
