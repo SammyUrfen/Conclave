@@ -4,21 +4,19 @@ import "github.com/SammyUrfen/conclave/internal/overlay"
 
 // This file is the SINGLE point at which simnet calls into internal/overlay.
 //
-// It exists because the overlay contract is still moving: PickRoot, BuildTree, and
-// ValidateLocalRepair have all changed shape once already and are scheduled to change
-// again (a stream-cost parameter on PickRoot; a Churn struct and the fleet projection
-// on ValidateLocalRepair). Scattering those calls across the harness and its tests
-// would turn each amendment into a twenty-site edit; funnelled here it is a few
-// lines, and the wrappers already take every argument the next signature wants even
-// where today's does not use it. That is deliberate: the caller's shape is stable
-// even while the callee's is not.
+// It exists because the overlay contract has moved twice under this package already:
+// PickRoot gained a stream-cost parameter, and ValidateLocalRepair gained the fleet
+// projection, the Constraints, and a Churn struct in place of three string slices.
+// Both amendments landed here as a few lines instead of a twenty-site edit across the
+// harness and its tests, which is the whole point of the indirection — the caller's
+// shape stays stable while the callee's moves.
 
-// pickRoot chooses the tree's root. cons is taken whole (rather than just the fields
-// used today) so the stream cost is already at hand when PickRoot starts judging
-// "can this node parent at the real per-stream price" rather than "upload > 0".
+// pickRoot chooses the tree's root. cons is taken whole rather than as a bare stream
+// cost because PickRoot's eligibility rule now spans three Constraints-adjacent facts
+// (the per-stream price, and via the Node, impairment and provisionality) and will
+// plausibly span more.
 func pickRoot(nodes []overlay.Node, prev *overlay.Topology, cons overlay.Constraints) string {
-	_ = cons
-	return overlay.PickRoot(nodes, prev)
+	return overlay.PickRoot(nodes, prev, cons.StreamKbps)
 }
 
 // buildTree computes the next tree from the fleet, the previous tree, and the
@@ -33,13 +31,17 @@ func validateTopology(t *overlay.Topology, nodes []overlay.Node, cons overlay.Co
 }
 
 // validateRepair asks the independent oracle whether a TRANSITION was bounded by the
-// churn that caused it — the headline stability property. nodes and cons are taken
-// even though today's ValidateLocalRepair is a pure function of the two trees,
-// because the impairment signal it is about to gain lives on the fleet, not on the
-// trees.
-func validateRepair(prev, next *overlay.Topology, nodes []overlay.Node, cons overlay.Constraints, gone, joined, promoted []string) error {
-	_, _ = nodes, cons
-	return overlay.ValidateLocalRepair(prev, next, gone, joined, promoted)
+// churn that caused it — the headline stability property.
+//
+// prev MUST be the last PUBLISHED tree, never the coordinator's working copy. Two
+// reasons, the second decisive: an oracle fed the patched copy asserts against the
+// very belief it exists to check, and the published tree is the ONLY artifact still
+// carrying the Backups assignment, so it is the only one against which "the promoted
+// node landed on the backup it was actually ASSIGNED" can be checked at all. Callers
+// in this package keep `published` and `working` in separate variables for exactly
+// this reason; conflating them was a critical defect in an earlier contract.
+func validateRepair(prev, next *overlay.Topology, nodes []overlay.Node, cons overlay.Constraints, ch overlay.Churn) error {
+	return overlay.ValidateLocalRepair(prev, next, nodes, cons, ch)
 }
 
 // nextConstraints fills in the fields a scenario should never have to hand-crank:

@@ -239,3 +239,125 @@ func TestNodeImpairment(t *testing.T) {
 		})
 	}
 }
+
+// TestDegradedRelayLosesItsChildren is the C8 behaviour end to end: a SUSTAINED
+// degradation injected on the Network must reach BuildTree as an impaired node and
+// actually move that relay's children onto a healthy one.
+//
+// overlay proves the mechanism with a hand-set Node.Impaired. What this proves is the
+// WIRING — that Degrade/NodeLossPct/Impaired are not bookkeeping the builder never
+// sees. Those are different failures and only this test catches the second.
+//
+// The fixture isolates impairment from latency, which is the whole difficulty here.
+// The degradation is injected on P↔u at the SAME round-trip the link already
+// measured, so no RTT changes anywhere; and the assertion is about v, whose link to P
+// was never touched at all. If v moves off P, the only remaining explanation is that
+// P reached the builder impaired. The sub-threshold control run pins the other half:
+// loss below ImpairedLossPct must move nobody, so the test cannot pass merely because
+// something was injected.
+func TestDegradedRelayLosesItsChildren(t *testing.T) {
+	// R roots (cap 2, so it fills with P and Q). u and v hang off P because P is
+	// much closer to them than Q is.
+	fleet := func() *Network {
+		n := New()
+		n.Add(overlay.Node{Name: "R", UploadKbps: 4000})
+		n.Add(overlay.Node{Name: "P", UploadKbps: 8000})
+		n.Add(overlay.Node{Name: "Q", UploadKbps: 8000})
+		n.Add(overlay.Node{Name: "u", UploadKbps: 0})
+		n.Add(overlay.Node{Name: "v", UploadKbps: 0})
+		n.SetRTT("Q", "R", 1) // pin Q as R's child rather than P's
+		n.SetRTT("u", "P", 5)
+		n.SetRTT("v", "P", 5)
+		n.SetRTT("u", "Q", 90)
+		n.SetRTT("v", "Q", 90)
+		return n
+	}
+	cons := overlay.Constraints{Root: "R", MaxDepth: 3, StreamKbps: 2000, StickinessMs: overlay.DefaultStickinessMs}
+
+	build := func(t *testing.T, n *Network, prev *overlay.Topology) (*overlay.Topology, []overlay.Node, overlay.Constraints) {
+		t.Helper()
+		topo, c, err := n.Build(prev, cons)
+		if err != nil {
+			t.Fatalf("build: %v", err)
+		}
+		nodes := n.OverlayNodes()
+		if verr := validateTopology(topo, nodes, c); verr != nil {
+			t.Fatalf("validate: %v", verr)
+		}
+		return topo, nodes, c
+	}
+
+	t.Run("baseline puts u and v under P", func(t *testing.T) {
+		base, _, _ := build(t, fleet(), nil)
+		for _, leaf := range []string{"u", "v"} {
+			if got := base.ParentOf(leaf); got != "P" {
+				t.Fatalf("%s parent = %q, want P — the fixture no longer sets up the C8 scenario", leaf, got)
+			}
+		}
+	})
+
+	t.Run("sub-threshold loss moves nobody", func(t *testing.T) {
+		n := fleet()
+		base, _, _ := build(t, n, nil)
+		n.Degrade("P", "u", 5, ImpairedLossPct/2) // same RTT, loss below the bar
+		next, _, _ := build(t, n, base)
+		for _, leaf := range []string{"u", "v"} {
+			if got := next.ParentOf(leaf); got != "P" {
+				t.Errorf("%s moved to %q on sub-threshold loss; only a SUSTAINED degradation may re-parent", leaf, got)
+			}
+		}
+	})
+
+	t.Run("the projection carries impairment to the builder", func(t *testing.T) {
+		n := fleet()
+		n.Degrade("P", "u", 5, 20)
+		byName := map[string]overlay.Node{}
+		for _, node := range n.OverlayNodes() {
+			byName[node.Name] = node
+		}
+		if p := byName["P"]; !p.Impaired || p.LossPct != 20 {
+			t.Errorf("projected P = {Impaired:%v LossPct:%v}, want {true 20} — Degrade never reaches BuildTree",
+				p.Impaired, p.LossPct)
+		}
+		if q := byName["Q"]; q.Impaired || q.LossPct != 0 {
+			t.Errorf("projected Q = {Impaired:%v LossPct:%v}, want {false 0}; impairment leaked to an untouched node",
+				q.Impaired, q.LossPct)
+		}
+		if got, want := byName["P"].RTT["u"], 5.0; got != want {
+			t.Errorf("projected RTT P→u = %v, want %v; the fixture must change loss WITHOUT changing latency", got, want)
+		}
+	})
+
+	t.Run("sustained degradation moves the children", func(t *testing.T) {
+		n := fleet()
+		base, _, _ := build(t, n, nil)
+		n.Degrade("P", "u", 5, 20) // same RTT, loss well past ImpairedLossPct
+		next, nodes, c := build(t, n, base)
+
+		// v is the discriminator: nothing about v's own links changed, so the only
+		// thing that can have moved it is P being impaired.
+		if got := next.ParentOf("v"); got == "P" {
+			t.Errorf("v is still parented to the degraded P; impairment did not reach the builder")
+		}
+		if next.IsRelay("P") {
+			t.Errorf("degraded P still relays for %v while Q had room", next.ChildrenOf("P"))
+		}
+		// Impairment is a parenting disqualification, not an eviction.
+		if next.Depth("P") < 0 {
+			t.Error("degraded P was dropped from the tree; it must stay attached as a leaf")
+		}
+
+		var impaired []string
+		for _, node := range nodes {
+			if node.Impaired {
+				impaired = append(impaired, node.Name)
+			}
+		}
+		if len(impaired) == 0 {
+			t.Fatal("no node projected as impaired")
+		}
+		if rerr := validateRepair(base, next, nodes, c, overlay.Churn{Impaired: impaired}); rerr != nil {
+			t.Errorf("moving a degraded relay's children is justified churn: %v", rerr)
+		}
+	})
+}

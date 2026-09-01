@@ -156,8 +156,15 @@ func runSimChurn(t *testing.T, seed int64, steps int) []simStep {
 		delta := 0
 		if published != nil {
 			delta = len(changedParents(published, next))
-			gone, joined, promoted := sortedKeys(pendGone), sortedKeys(pendJoined), sortedKeys(pendPromoted)
-			rerr := validateRepair(published, next, nodes, c, gone, joined, promoted)
+			// published, NOT working: the oracle needs the tree the fleet actually
+			// realized, and it is the only one still carrying the Backups assignment
+			// a promotion is checked against.
+			churn := overlay.Churn{
+				Gone:     sortedKeys(pendGone),
+				Joined:   sortedKeys(pendJoined),
+				Promoted: sortedKeys(pendPromoted),
+			}
+			rerr := validateRepair(published, next, nodes, c, churn)
 			switch {
 			case next.Root != published.Root && !pendGone[published.Root]:
 				// A VOLUNTARY re-root (a challenger cleared RootChangeMarginKbps) is
@@ -294,7 +301,7 @@ func TestSingleDepartureMovesOnlyItsSubtree(t *testing.T) {
 				if verr := validateTopology(next, nodes, c); verr != nil {
 					t.Fatalf("rebuild fails Validate: %v", verr)
 				}
-				if rerr := validateRepair(prev, next, nodes, c, []string{victim}, nil, nil); rerr != nil {
+				if rerr := validateRepair(prev, next, nodes, c, overlay.Churn{Gone: []string{victim}}); rerr != nil {
 					t.Fatalf("rebuild churned more than one departure justifies: %v", rerr)
 				}
 
