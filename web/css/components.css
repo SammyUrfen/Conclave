@@ -65,10 +65,11 @@ input[type="text"]:focus, select:focus, .btn:focus, .subnet-node:focus {
   font-size: 11px;
   padding: 2px 8px;
   border-radius: 999px;
-  background: var(--warn);
   color: var(--bg);
   font-weight: bold;
 }
+.pill-warn { background: var(--warn); }
+.pill-muted { background: var(--fg-muted); }
 
 /* --- meets list --- */
 .create-form { display: flex; gap: var(--space-2); margin-bottom: var(--space-3); flex-wrap: wrap; }
@@ -96,6 +97,9 @@ input[type="text"]:focus, select:focus, .btn:focus, .subnet-node:focus {
 table { border-collapse: collapse; width: 100%; }
 .meets-table th, .meets-table td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--surface); white-space: nowrap; }
 .meets-table th { color: var(--fg-muted); font-weight: normal; }
+.ended-panel { margin-top: var(--space-3); color: var(--fg-muted); }
+.ended-panel summary { cursor: pointer; color: var(--fg); font-weight: bold; padding: var(--space-1) 0; }
+.ended-panel .meets-table td, .ended-panel .meets-table th { color: inherit; }
 .meet-row { cursor: pointer; }
 .meet-row:hover { background: var(--surface); }
 .meet-row a { color: var(--edge); text-decoration: none; }

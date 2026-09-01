@@ -7,7 +7,7 @@ import { fmtUnixMs, fmtId, str } from '../format.js';
 const MEET_ID_HINT = 'lowercase letters, digits, "-", "_" — or leave blank to auto-generate';
 
 export function render(container, state, actions) {
-  const { meets, meetsLoading, meetsError, serverStatus, lastCreated } = state;
+  const { meets, endedMeets, meetsLoading, meetsError, serverStatus, lastCreated } = state;
 
   const createForm = el(
     'form',
@@ -46,6 +46,10 @@ export function render(container, state, actions) {
     nodes.push(el('div', { class: 'empty-state' }, 'No meets yet. Create one above.'));
   } else {
     nodes.push(renderTable(meets, actions));
+  }
+
+  if (serverStatus === 'ok' && Array.isArray(endedMeets) && endedMeets.length > 0) {
+    nodes.push(renderEnded(endedMeets));
   }
 
   setChildren(container, nodes);
@@ -99,13 +103,19 @@ function fallbackCopy(text) {
 function renderTable(meets, actions) {
   const rows = meets.map((m) => {
     const id = str(m.id, '(unknown)');
+    // Coordinator is "" for both "vacant" and "the arbiter itself is coordinating" —
+    // arbiter_is_coordinator (never testing the name for "") tells the two apart.
+    const coordName = str(m.coordinator);
+    const coordCell = m.arbiter_is_coordinator
+      ? el('span', { class: 'pill pill-muted', title: 'The arbiter itself is hosting the coordinator role for this meet.' }, 'the arbiter')
+      : (coordName ? el('span', null, coordName) : el('span', { class: 'fg-muted' }, 'none'));
     return el(
       'tr',
       { class: 'meet-row', onclick: () => actions.onOpenMeet(id) },
       el('td', null, el('a', { href: `#/meets/${encodeURIComponent(id)}`, onclick: (e) => e.preventDefault() }, id)),
       el('td', { class: 'num' }, typeof m.members === 'number' ? String(m.members) : '—'),
       el('td', { class: 'num' }, fmtId(m.epoch)),
-      el('td', null, str(m.coordinator) || el('span', { class: 'fg-muted' }, 'none')),
+      el('td', null, coordCell),
       el('td', null, fmtUnixMs(m.created_at_unix_ms)),
     );
   });
@@ -120,6 +130,34 @@ function renderTable(meets, actions) {
           el('th', null, 'coordinator'), el('th', null, 'created'),
         )),
       el('tbody', null, rows),
+    ),
+  );
+}
+
+function renderEnded(endedMeets) {
+  const rows = endedMeets.map((e) => el(
+    'tr', null,
+    el('td', null, str(e.id, '(unknown)')),
+    el('td', { class: 'num' }, typeof e.peak_members === 'number' ? String(e.peak_members) : '—'),
+    el('td', { class: 'num' }, fmtId(e.final_epoch)),
+    el('td', { class: 'num' }, typeof e.elections === 'number' ? String(e.elections) : '—'),
+    el('td', null, fmtUnixMs(e.ended_at_unix_ms)),
+  ));
+
+  return el(
+    'details', { class: 'ended-panel' },
+    el('summary', null, `Ended (${endedMeets.length})`),
+    el(
+      'div', { class: 'table-scroll' },
+      el(
+        'table', { class: 'meets-table' },
+        el('thead', null,
+          el('tr', null,
+            el('th', null, 'id'), el('th', null, 'peak members'), el('th', null, 'final epoch'),
+            el('th', null, 'elections'), el('th', null, 'ended'),
+          )),
+        el('tbody', null, rows),
+      ),
     ),
   );
 }

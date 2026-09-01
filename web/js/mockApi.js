@@ -48,14 +48,10 @@ export async function getMeet(_httpBase, _id) {
   return loadFixture('meet-standup.json');
 }
 
-// Fixture mode reports the demo capability as available so the render path (§9.6) gets
-// exercised locally, even though the real api.js now hard-codes this to `false` (absent
-// means off — see api.js's hasDemoCapability doc comment). This is synchronous and touches
-// no network, unlike the speculative-evict probe this replaced.
-export function hasDemoCapability() {
-  return true;
-}
-
+// No hasDemoCapability export here any more: `demo_enabled` (§9.6) rides the listMeets
+// body like the real server, so fixtures/meets.json's own `"demo_enabled": true` is what
+// makes the demo-controls render path exercisable in fixture mode — one read path for
+// both api.js and mockApi.js, not a second mock-only mechanism.
 export async function demoEvict(_httpBase, _meetId, name) {
   return { ok: true, action: 'evict', target: name };
 }
