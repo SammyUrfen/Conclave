@@ -1,0 +1,70 @@
+# The gate, run on every push and pull request.
+#
+# It is deliberately the SAME four commands `make check` runs locally, spelled out
+# rather than delegated, so a red job names which of them failed in its own step title
+# instead of burying it in one make target's output. If CI and `make check` ever
+# disagree about what "green" means, the definition of done has quietly moved.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The default token needs nothing beyond reading the repo here. Narrowing it is free
+# and means a compromised action in this workflow cannot write to the repository.
+permissions:
+  contents: read
+
+# One run per ref. A push that supersedes an in-flight run cancels it rather than
+# queueing behind it — the older result is about to be irrelevant anyway.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Read from go.mod rather than pinned here, so the toolchain cannot drift
+          # from what the module declares — one source of truth for the Go version.
+          go-version-file: go.mod
+          cache: true
+
+      # gofmt -l prints the files that WOULD change and exits 0 either way, so the
+      # exit code is useless as a gate. The output is the signal: any line at all is a
+      # failure, and printing the offending names first is what makes it actionable.
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # The determinism gate: no control-plane package may reach for the wall clock,
+      # because a package that does is silently un-replayable and every scenario test
+      # over it becomes a coin flip. It is a build gate rather than a review note for
+      # exactly that reason — the failure mode is invisible in a diff.
+      - name: determinism
+        run: make check-determinism
+
+      # -race is not optional on this project: the control planes are single-goroutine
+      # by design and the whole safety argument rests on that being true, so a data
+      # race is a design violation and not merely a bug. -count=1 defeats the test
+      # cache, which would otherwise let a green result outlive the code that earned it.
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+      # The binaries are what a deployment actually runs; compiling them here catches a
+      # build-tag or platform break that `go test` on packages alone would not.
+      - name: build binaries
+        run: make build

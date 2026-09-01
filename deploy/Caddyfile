@@ -1,0 +1,36 @@
+# Caddy in front of the conclave arbiter: TLS termination and nothing else.
+#
+# Replace `localhost` with a real hostname and Caddy provisions a Let's Encrypt
+# certificate automatically; on localhost it issues a locally-trusted one from its own
+# internal CA. Either way the arbiter behind it speaks plain HTTP and never learns TLS
+# exists — which is exactly why it must be told its public identity with -public-url.
+
+localhost {
+	# reverse_proxy carries the WebSocket upgrade natively: Caddy 2 forwards
+	# Connection/Upgrade and streams bidirectionally with no per-path configuration.
+	# Both WebSocket surfaces — /ws for peers and /api/meets/{id}/events for the
+	# dashboard — therefore need no special-casing here.
+	reverse_proxy arbiter:9000 {
+		# The arbiter logs RemoteAddr into the advisory `by_remote_addr` field of demo
+		# events (§9.4a). Behind a proxy every request otherwise reads as the proxy,
+		# which makes that field useless rather than merely imprecise. It is still
+		# ADVISORY and still spoofable; forwarding it just stops it being uniformly
+		# wrong.
+		header_up X-Forwarded-For {remote_host}
+
+		# No read/write timeout on the proxy: signaling WebSockets are long-lived and
+		# mostly idle between frames. The Hub's own 5s ping / 2s pong keepalive is what
+		# detects a dead socket (signaling.WSLivenessBudget), and it also keeps the
+		# connection warm through any intermediary's idle timeout.
+		flush_interval -1
+	}
+
+	# Compress the JSON surfaces. Caddy skips already-compressed and streaming
+	# responses, so this never touches an upgraded WebSocket.
+	encode gzip
+
+	log {
+		output stdout
+		format json
+	}
+}
