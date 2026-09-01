@@ -401,7 +401,7 @@ func TestBuildTreeProcessingOrder(t *testing.T) {
 	if err := Validate(topo, nodes, cons); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
-	if err := ValidateLocalRepair(prev, topo, nil, []string{"strong"}, nil); err != nil {
+	if err := ValidateLocalRepair(prev, topo, nodes, cons, Churn{Joined: []string{"strong"}}); err != nil {
 		t.Errorf("a pure join must not re-parent anyone: %v", err)
 	}
 
@@ -464,10 +464,11 @@ func TestBuildTreeDeterministic(t *testing.T) {
 // deterministic fallback.
 func TestPickRoot(t *testing.T) {
 	tests := []struct {
-		name  string
-		nodes []Node
-		prev  *Topology
-		want  string
+		name       string
+		nodes      []Node
+		prev       *Topology
+		streamKbps int // 0 ⇒ the 2000 default used by most rows
+		want       string
 	}{
 		{
 			name: "highest upload wins when there is no incumbent",
@@ -500,6 +501,31 @@ func TestPickRoot(t *testing.T) {
 				{Name: "b", UploadKbps: 2000},
 			},
 			want: "b",
+		},
+		{
+			// RULING E: the half of the live defect UploadKbps > 0 could not close.
+			name: "a real-but-insufficient budget cannot root a fleet",
+			nodes: []Node{
+				{Name: "weak", UploadKbps: 1200}, // a genuine report, under one stream
+				{Name: "fit", UploadKbps: 4000},
+			},
+			want: "fit",
+		},
+		{
+			name: "nobody can serve a child at this stream cost",
+			nodes: []Node{
+				{Name: "weak", UploadKbps: 1200},
+				{Name: "weaker", UploadKbps: 800},
+			},
+			want: "",
+		},
+		{
+			name: "loss derate can push a node under one stream",
+			nodes: []Node{
+				{Name: "lossy", UploadKbps: 2400, LossPct: 40}, // 1440 effective
+				{Name: "clean", UploadKbps: 2000},
+			},
+			want: "clean",
 		},
 		{
 			name:  "TURN-bound nodes cannot root",
@@ -555,7 +581,11 @@ func TestPickRoot(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := PickRoot(tt.nodes, tt.prev); got != tt.want {
+			stream := tt.streamKbps
+			if stream == 0 {
+				stream = 2000
+			}
+			if got := PickRoot(tt.nodes, tt.prev, stream); got != tt.want {
 				t.Errorf("PickRoot = %q, want %q", got, tt.want)
 			}
 		})
@@ -563,21 +593,19 @@ func TestPickRoot(t *testing.T) {
 }
 
 // TestPickRootNeverRootsAGuess replays the fleet from the live defect: a 3-peer
-// managed run where the strong relay had not yet reported, the projection showed it
-// at the assumed default, and PickRoot handed BuildTree a root that could serve
-// nobody ("root \"leaf-b\" cannot serve any children").
+// managed run where the strong relay had not yet reported, the projection showed it at
+// the assumed default, and PickRoot handed BuildTree a root that could serve nobody
+// (`root "leaf-b" cannot serve any children`).
 //
-// What the Provisional rule closes, and is asserted here: a node whose number is a
-// GUESS can never be rooted, in any arrival order.
+// Both halves are now closed, and the second half is what RULING E bought:
 //
-// What it does NOT close, stated rather than papered over: a node that has really
-// reported an upload too small to serve one child at the fleet's StreamKbps is
-// still eligible here, because PickRoot's frozen signature does not receive
-// Constraints and so cannot compute capacity. In that window PickRoot returns a
-// truthful-but-useless root and BuildTree rejects it — an honest "unbuildable" over
-// real telemetry rather than a guess, and one the coordinator's first-build settle
-// rule is what actually suppresses. Closing it inside overlay needs StreamKbps (or
-// a minimum-upload argument) on PickRoot; that is a contract gap, not a code bug.
+//   - Provisional closes "rooted a guess" — a node whose number is an assumed default
+//     can never be rooted, in any arrival order;
+//   - streamKbps closes "rooted a real-but-useless report" — leaf-b's genuine
+//     1200 kbit/s cannot serve one 2000 kbit/s stream, so it is not eligible either.
+//
+// The assertion is therefore the strong one: over EVERY arrival order, whatever PickRoot
+// returns must build. No permutation may produce a root BuildTree then rejects.
 func TestPickRootNeverRootsAGuess(t *testing.T) {
 	real := map[string]int{"relay-a": 8000, "leaf-b": 1200, "leaf-c": 1200}
 	names := []string{"relay-a", "leaf-b", "leaf-c"}
@@ -594,9 +622,11 @@ func TestPickRootNeverRootsAGuess(t *testing.T) {
 				nodes = append(nodes, Node{Name: n, Provisional: true})
 			}
 		}
-		root := PickRoot(nodes, nil)
+		root := PickRoot(nodes, nil, cons.StreamKbps)
 		if root == "" {
-			continue // nobody eligible yet: the coordinator waits, which is correct
+			// Nobody eligible yet: the coordinator waits, which is the correct answer
+			// and the one the weak-first orders must now produce.
+			continue
 		}
 		for _, n := range nodes {
 			if n.Name == root && n.Provisional {
@@ -606,12 +636,19 @@ func TestPickRootNeverRootsAGuess(t *testing.T) {
 		c := cons
 		c.Root = root
 		if _, err := BuildTree(nodes, nil, c); err != nil {
-			// The only legal failure left: the chosen root really did report an
-			// upload below one stream. Anything else would be the old defect.
-			if real[root] >= cons.StreamKbps {
-				t.Fatalf("order %v: build over root %q failed although it can serve a child: %v", order, root, err)
-			}
+			t.Fatalf("order %v: PickRoot returned %q but BuildTree rejected it: %v", order, root, err)
 		}
+	}
+
+	// And the specific window from the incident: leaf-b has reported, relay-a has not.
+	// The only honest answer is "not yet".
+	window := []Node{
+		{Name: "leaf-b", UploadKbps: 1200},
+		{Name: "relay-a", Provisional: true},
+		{Name: "leaf-c", Provisional: true},
+	}
+	if got := PickRoot(window, nil, 2000); got != "" {
+		t.Errorf("PickRoot = %q in the incident window, want \"\" (wait for telemetry)", got)
 	}
 }
 
@@ -655,7 +692,7 @@ func TestReportOrderInvarianceSettledPath(t *testing.T) {
 			nodes = append(nodes, byName[n])
 		}
 		cons := Constraints{MaxDepth: 2, StreamKbps: 2000, Epoch: 1, Rev: 1, StickinessMs: DefaultStickinessMs}
-		cons.Root = PickRoot(nodes, nil)
+		cons.Root = PickRoot(nodes, nil, cons.StreamKbps)
 		topo, err := BuildTree(nodes, nil, cons)
 		if err != nil {
 			t.Fatalf("order %v: %v", order, err)
@@ -729,7 +766,7 @@ func TestStragglerPathIsPathDependent(t *testing.T) {
 				}
 			}
 			c := cons
-			c.Root = PickRoot(nodes, prev)
+			c.Root = PickRoot(nodes, prev, c.StreamKbps)
 			if c.Root == "" {
 				continue
 			}
@@ -840,7 +877,7 @@ func TestBuildTreePrevRootOrdering(t *testing.T) {
 
 	// The fixture is only meaningful if the root really did change, and PickRoot is
 	// what decides that in production — so assert it rather than assuming it.
-	if got := PickRoot(nodes, prev); got != "new" {
+	if got := PickRoot(nodes, prev, cons.StreamKbps); got != "new" {
 		t.Fatalf("fixture drifted: PickRoot = %q, want new (a re-root is the case under test)", got)
 	}
 
@@ -860,7 +897,7 @@ func TestBuildTreePrevRootOrdering(t *testing.T) {
 	// Stated as a churn property too, which is the form the coordinator asserts in:
 	// a re-root is the one legitimately global repair, so the oracle must report it
 	// as such — and report nothing else, since nobody but "old" actually moved.
-	err := ValidateLocalRepair(prev, topo, nil, []string{"new"}, nil)
+	err := ValidateLocalRepair(prev, topo, nodes, cons, Churn{Joined: []string{"new"}})
 	if err == nil || !strings.Contains(err.Error(), "root changed") {
 		t.Errorf("ValidateLocalRepair = %v, want it to flag the re-root (and only that)", err)
 	}

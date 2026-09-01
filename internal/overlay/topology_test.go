@@ -109,6 +109,34 @@ func TestDepthAndSubtree(t *testing.T) {
 	}
 }
 
+// TestHeight covers the accessor the backup-legality rule is written in terms of: a
+// promotion moves the promoted node AND everything under it, so bounding the backup's
+// own depth is not enough. Height is how far the subtree extends below the node that
+// would move.
+func TestHeight(t *testing.T) {
+	topo := &Topology{Root: "A", Edges: []Edge{
+		{Parent: "A", Child: "R"},
+		{Parent: "R", Child: "B"},
+		{Parent: "R", Child: "C"},
+		{Parent: "B", Child: "D"},
+	}}
+	want := map[string]int{"A": 3, "R": 2, "B": 1, "C": 0, "D": 0, "ghost": -1}
+	for name, w := range want {
+		if got := topo.Height(name); got != w {
+			t.Errorf("Height(%q) = %d, want %d", name, got, w)
+		}
+	}
+	// A one-node tree: the root is a leaf of itself.
+	if got := (&Topology{Root: "solo"}).Height("solo"); got != 0 {
+		t.Errorf("Height(root of a one-node tree) = %d, want 0", got)
+	}
+	// Depth + Height together bound what a promotion costs, which is the only reason
+	// both exist: moving B under a node at depth d puts D at d+1+Height(B).
+	if d, h := topo.Depth("B"), topo.Height("B"); d+h != topo.Depth("D") {
+		t.Errorf("Depth(B)+Height(B) = %d, want Depth(D) = %d", d+h, topo.Depth("D"))
+	}
+}
+
 // TestBackupOf covers the accessor peers call on parent failure.
 func TestBackupOf(t *testing.T) {
 	topo := &Topology{Root: "A", Edges: []Edge{
