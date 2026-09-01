@@ -14,22 +14,27 @@ import (
 // defined in the dashboard and returned by the arbiter would invert the dependency
 // and drag the browser-facing surface into the control plane.
 //
-// Rev, Relays, and Depth describe the REALIZED subnet — reconstructed from the
-// heartbeats the arbiter already terminates, not from the coordinator's beliefs. The
-// arbiter may not import the coordinator, and asking the coordinator would
-// reintroduce exactly the circularity Fitness.Live exists to avoid; reporting ground
-// truth is also the more honest thing for a dashboard to draw.
+// Relays and Depth describe the REALIZED subnet — reconstructed from the heartbeats
+// the arbiter already terminates, not from the coordinator's beliefs. The arbiter may
+// not import the coordinator, and asking the coordinator would reintroduce exactly the
+// circularity Fitness.Live exists to avoid; reporting ground truth is also the more
+// honest thing for a dashboard to draw, which is why the dashboard labels every field
+// here provenance "realized".
+//
+// Rev is deliberately ABSENT. Rev is a coordinator counter, not an observable, so a
+// heartbeat-derived Rev would be a fabricated number wearing an authoritative name.
+// Epoch stays because the arbiter MINTS it and is its single writer.
 type Meet struct {
 	ID        string
 	CreatedAt time.Time
-	Members   int
+	// EndedAt is zero while the meet is live, and set when it is reaped. A reaped
+	// meet leaves the registry, so a live listing never carries a non-zero EndedAt;
+	// the field exists so one type can describe a meet at either point in its life.
+	EndedAt time.Time
+	Members int
 	// Epoch is the current term. 0 means no coordinator has ever been named here.
 	Epoch uint64
-	// Rev is the newest topology revision any member reports having realized under
-	// the current Epoch. A revision reported under a different epoch is ignored:
-	// revisions are only meaningful within the term that minted them.
-	Rev uint64
-	// Coordinator is the peer name; "" means none yet, or the arbiter itself.
+	// Coordinator is the peer name; "" means vacant, or the arbiter itself.
 	// Distinguish the two with ArbiterIsCoord, never by testing this for "".
 	Coordinator string
 	// CoordinatorID is the peer id, or the arbiter's reserved id when it coordinates.
@@ -40,6 +45,20 @@ type Meet struct {
 	// tree exists yet.
 	Depth          int
 	ArbiterIsCoord bool
+}
+
+// EndedMeet is the tombstone left behind when a meet is reaped, so an operator can
+// still review the demo they just ran instead of watching it vanish the instant the
+// last peer disconnects. Deliberately small and fixed-size: it carries counts, never
+// telemetry, because an unbounded history is the same denial of service in a
+// different map.
+type EndedMeet struct {
+	ID          string
+	CreatedAt   time.Time
+	EndedAt     time.Time
+	PeakMembers int
+	FinalEpoch  uint64
+	Elections   int
 }
 
 // peerState is everything the arbiter knows about one member. It is owned by the Run
@@ -64,6 +83,12 @@ type peerState struct {
 	// peer's own liveness threshold) and for the realized topology it carries.
 	beat    metrics.Heartbeat
 	hasBeat bool
+	// lagging is the LATCHED fence-repair state: this peer's declared epoch has been
+	// behind the meet's for longer than the propagation window. It exists so the
+	// dashboard sees two events per episode (entering, leaving) rather than one per
+	// heartbeat — the transition-not-sample discipline. The wire repair still fires
+	// every beat; only the event is latched.
+	lagging bool
 }
 
 // interval is the cadence this peer declared, defaulting when it has not spoken. It
@@ -84,13 +109,24 @@ type meetState struct {
 	createdAt time.Time
 	members   map[string]*peerState
 
-	// epoch is the fencing token. Incremented on, and only on, a coordinator change.
+	// epoch is the fencing token. Incremented on, and only on, a change of holder —
+	// including a change TO nobody, because a vacancy fences the outgoing coordinator.
 	epoch uint64
-	// coordID/coordName name the sitting PEER coordinator; both are "" when the
-	// arbiter holds the role or when the meet has none. arbiterIsCoord disambiguates.
-	coordID        string
-	coordName      string
-	arbiterIsCoord bool
+	// who currently holds the role. A struct rather than three loose fields so that
+	// "is this the same holder we already announced" is one comparison and cannot be
+	// got half right.
+	who holder
+
+	// emptyAt is when the meet last became memberless, zero while it has members. A
+	// meet is reaped only after MeetTTL of CONTINUOUS emptiness, so a rejoin clears
+	// this rather than merely restarting a countdown.
+	emptyAt time.Time
+	// peakMembers and elections are the only history a tombstone keeps.
+	peakMembers int
+	elections   int
+	// noVolunteers latches "reports are in hand and nobody is willing to coordinate",
+	// so the operator-facing warning fires on the transition rather than per report.
+	noVolunteers bool
 
 	// lastAnn is replayed verbatim on a membership change so a joiner adopts the
 	// current authority. Keeping the original frame rather than minting a fresh one
@@ -115,13 +151,15 @@ func newMeetState(id string, now time.Time) *meetState {
 }
 
 // hasHolder reports whether anyone currently coordinates this meet.
-func (ms *meetState) hasHolder() bool { return ms.arbiterIsCoord || ms.coordID != "" }
+func (ms *meetState) hasHolder() bool { return ms.who.kind != holderNone }
 
-// clearHolder vacates the role. It also drops lastAnn: a stored announcement naming
-// a coordinator that no longer exists must never be replayed to a joiner, because
-// the joiner would fence itself to a dead node and reject everything after.
-func (ms *meetState) clearHolder() {
-	ms.coordID, ms.coordName, ms.arbiterIsCoord = "", "", false
+// abandon drops both the holder and the retained announcement. It is used ONLY when
+// the meet has no members left: there is nobody to announce a vacancy to, and keeping
+// an announcement that names a departed coordinator would fence the next joiner to a
+// corpse. While the meet still has members the correct move is the opposite — announce
+// the vacancy (see elect) — because a live peer may still believe it coordinates.
+func (ms *meetState) abandon() {
+	ms.who = holder{}
 	ms.lastAnn, ms.hasAnn = Announcement{}, false
 }
 
@@ -131,23 +169,34 @@ func (ms *meetState) clearPending() {
 
 // snapshot copies this meet out for a caller on another goroutine.
 func (ms *meetState) snapshot(arbiterID string) Meet {
-	relays, depth, rev := ms.realized()
+	relays, depth := ms.realized()
 	m := Meet{
 		ID:             ms.id,
 		CreatedAt:      ms.createdAt,
 		Members:        len(ms.members),
 		Epoch:          ms.epoch,
-		Rev:            rev,
-		Coordinator:    ms.coordName,
-		CoordinatorID:  ms.coordID,
+		Coordinator:    ms.who.name,
+		CoordinatorID:  ms.who.id,
 		Relays:         relays,
 		Depth:          depth,
-		ArbiterIsCoord: ms.arbiterIsCoord,
+		ArbiterIsCoord: ms.who.kind == holderArbiter,
 	}
-	if ms.arbiterIsCoord {
+	if m.ArbiterIsCoord {
 		m.CoordinatorID = arbiterID
 	}
 	return m
+}
+
+// tombstone renders this meet as the record left behind when it is reaped.
+func (ms *meetState) tombstone(now time.Time) EndedMeet {
+	return EndedMeet{
+		ID:          ms.id,
+		CreatedAt:   ms.createdAt,
+		EndedAt:     now,
+		PeakMembers: ms.peakMembers,
+		FinalEpoch:  ms.epoch,
+		Elections:   ms.elections,
+	}
 }
 
 // realized reconstructs the subnet from the members' last heartbeats.
@@ -158,7 +207,7 @@ func (ms *meetState) snapshot(arbiterID string) Meet {
 // visited set, and a parent naming a peer that has not reported is treated as the
 // top of the chain rather than an error — this is a display value, and a torn frame
 // must degrade to a slightly stale number, never to a hang or a panic.
-func (ms *meetState) realized() (relays []string, depth int, rev uint64) {
+func (ms *meetState) realized() (relays []string, depth int) {
 	parent := make(map[string]string, len(ms.members))
 	known := make(map[string]bool, len(ms.members))
 	// Iterating the member map is safe here because every result is either sorted
@@ -175,14 +224,11 @@ func (ms *meetState) realized() (relays []string, depth int, rev uint64) {
 		if len(ps.beat.Children) > 0 {
 			relays = append(relays, ps.name)
 		}
-		if ms.epoch != 0 && ps.beat.Epoch == ms.epoch && ps.beat.Rev > rev {
-			rev = ps.beat.Rev
-		}
 	}
 	sort.Strings(relays)
 
 	if len(parent) == 0 {
-		return relays, -1, rev
+		return relays, -1
 	}
 	depth = 0
 	for name := range known {
@@ -201,5 +247,5 @@ func (ms *meetState) realized() (relays []string, depth int, rev uint64) {
 			depth = hops
 		}
 	}
-	return relays, depth, rev
+	return relays, depth
 }

@@ -488,6 +488,24 @@ func (h *harness) elapseCurrent(roomID string, d time.Duration) {
 	}
 }
 
+// stepLagging advances one heartbeat interval and beats EVERY member, with lagging
+// declaring epoch 0 and everyone else the meet's current epoch.
+//
+// Beating everyone matters: a peer the arbiter stops hearing from is declared gone
+// after GoneAfter, so a repair scenario that beats only the lagging peer quietly turns
+// into a failover scenario and stops testing what it claims to.
+func (h *harness) stepLagging(roomID, lagging string) {
+	h.t.Helper()
+	h.clk.Advance(metrics.HeartbeatInterval)
+	for _, id := range h.roster(roomID) {
+		if id == lagging {
+			h.beat(roomID, id)
+		} else {
+			h.beatCurrent(roomID, id)
+		}
+	}
+}
+
 // ended returns the tombstone ring.
 func (h *harness) ended() []arbiter.EndedMeet {
 	h.t.Helper()

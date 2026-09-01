@@ -66,8 +66,7 @@ func TestAnnouncementRepair(t *testing.T) {
 		before := len(h.ann.forRoom("m"))
 		h.clk.Advance(repairGrace)
 		for i := 0; i < 5; i++ {
-			h.clk.Advance(time.Second)
-			h.beat("m", "p2")
+			h.stepLagging("m", "p2")
 		}
 
 		if got := len(h.ann.forRoom("m")); got != before {
@@ -84,23 +83,20 @@ func TestAnnouncementRepair(t *testing.T) {
 		h := setup(t)
 		h.clk.Advance(repairGrace)
 		for i := 0; i < 30; i++ {
-			h.clk.Advance(time.Second)
-			h.beat("m", "p2")
+			h.stepLagging("m", "p2")
 		}
 
-		// 31 beats past the window; the condition is indefinite so the repair is too.
-		if got := len(h.ann.repairsTo("p2")); got != 31 {
-			t.Errorf("repairs = %d, want 31 — one per lagging beat, no cap, no backoff", got)
+		// One per lagging beat past the window; the condition is indefinite, so the
+		// repair is too.
+		if got := len(h.ann.repairsTo("p2")); got != 30 {
+			t.Errorf("repairs = %d, want 30 — one per lagging beat, no cap, no backoff", got)
 		}
 	})
 
 	t.Run("a caught-up peer is never repaired", func(t *testing.T) {
 		h := setup(t)
 		h.clk.Advance(repairGrace)
-		for i := 0; i < 5; i++ {
-			h.clk.Advance(time.Second)
-			h.beatCurrent("m", "p2")
-		}
+		h.elapseCurrent("m", 5*time.Second)
 
 		if got := h.ann.allRepairs(); len(got) != 0 {
 			t.Fatalf("repairs = %d, want 0 for a peer at the current epoch", len(got))
@@ -128,8 +124,7 @@ func TestRepairEventsAreTransitionsOnly(t *testing.T) {
 
 	// Ten lagging beats.
 	for i := 0; i < 10; i++ {
-		h.clk.Advance(time.Second)
-		h.beat("m", "p2")
+		h.stepLagging("m", "p2")
 	}
 	if got := h.pub.allRepairs(); len(got) != 1 {
 		t.Fatalf("repair events after 10 lagging beats = %d, want 1 (entry only)", len(got))
@@ -139,10 +134,7 @@ func TestRepairEventsAreTransitionsOnly(t *testing.T) {
 	}
 
 	// bob finally adopts, and keeps beating.
-	for i := 0; i < 5; i++ {
-		h.clk.Advance(time.Second)
-		h.beatCurrent("m", "p2")
-	}
+	h.elapseCurrent("m", 5*time.Second)
 
 	got := h.pub.allRepairs()
 	if len(got) != 2 {
@@ -168,8 +160,7 @@ func TestRepairIsNotAnElection(t *testing.T) {
 	h.join("m", "p2", mid("bob"))
 	h.clk.Advance(repairGrace)
 	for i := 0; i < 10; i++ {
-		h.clk.Advance(time.Second)
-		h.beat("m", "p2")
+		h.stepLagging("m", "p2")
 	}
 
 	if got := h.pub.all(); len(got) != 1 {
