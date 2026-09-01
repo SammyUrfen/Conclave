@@ -1,6 +1,6 @@
 # PLAN.md — the Phase 5–6 architecture contract
 
-> **Status: v2.2, FROZEN**, 2026-09-01. v1 was frozen the same day, reviewed adversarially by
+> **Status: v2.3, FROZEN**, 2026-09-01. v1 was frozen the same day, reviewed adversarially by
 > two independent reviewers (12 critical + ~15 major findings), and amended in place. **§15 is
 > the amendment log — read it first if you built against v1**, because several frozen names
 > changed. v2 also reconciles the document with what WI-0 actually shipped; where the shipped
@@ -302,6 +302,39 @@ agree is *more* code than one implementation, and it only catches drift on the c
 enumerates — which is exactly the wrong shape for a matcher whose dangerous inputs are the
 ones nobody thought of.
 
+**Two duplications ruled on separately, because their natures differ (§15.10).** WI-5 hit
+both and correctly declined to resolve either unilaterally:
+
+- **`RebuildWindow` — MOVED.** Declared in `arbiter`, consumed only by `coordinator`, and
+  `coordinator → arbiter` is forbidden, so WI-6 would need a second copy with nothing
+  enforcing agreement. It now lives in **`metrics`**, which both already import. That is the
+  correct home and not a stretch of the charter: `RebuildWindow` is literally "how long until
+  every peer has reported at least once" — a metrics-plane cadence, sitting beside
+  `DefaultInterval`, `HeartbeatInterval`, `DegradedAfter`, `GoneAfter`. **It does NOT go in
+  `policy`**: this package's charter is untrusted input at the process boundary, and a
+  control-loop timing constant is neither. Diluting it into a junk drawer is exactly what the
+  precedent note below warns against.
+- **`signaling.ServerID` vs `arbiter.DefaultArbiterID` — DUPLICATION KEPT, with an enforced
+  equality test.** `arbiter` may not import `signaling`, so it hard-codes `"_server"` as a
+  fallback and `cmd/server` passes `signaling.ServerID` into `Config.ArbiterID`. Unlike
+  `RebuildWindow`, this constant has **no correct shared home**: it is a *wire protocol*
+  value, and moving it into `policy` would make `signaling`'s wire contract depend on a
+  package that has nothing to do with the wire. So the duplication stands — but it is one
+  string, and `cmd/server` is the one place that legitimately sees both, so **a test in
+  `cmd/server` asserting `arbiter.DefaultArbiterID == signaling.ServerID` is REQUIRED.**
+  `DefaultArbiterID` is a test fallback, never a second source of truth: `cmd/server` MUST
+  pass `Config.ArbiterID` explicitly.
+
+The two get different answers because one has a natural home and the other does not. "Move it
+somewhere shared" is right only when a *correct* shared home exists; otherwise it manufactures
+a worse coupling than the duplication it removes.
+
+**`DemoControl.Evict` lives in `cmd/server` — CONFIRMED (§15.10).** It is not implementable in
+`arbiter` (evicting a peer means closing a socket, which needs `signaling`). `DemoControl` is
+a consumer-defined interface in `dashboard`, and `cmd/server` is the only place holding both
+the `*Hub` and the `*Arbiter`. That is the seam pattern working as designed, not a gap:
+`ForceElection` delegates to the arbiter, `Evict` closes the socket via the Hub.
+
 **Precedent.** This is the second exception to "consumer-defined interfaces, no shared
 utility packages", after `clock` (§2.5). Both are the same kind of exception and it is worth
 naming the kind: a **shared vocabulary that multiple packages must agree on exactly**, where
@@ -524,35 +557,58 @@ still *become* a relay for later newcomers — which is the behaviour we want.
 | Rank | Rule | Kind |
 |---:|---|---|
 | 0 | **Hard filters.** Candidate `p` must be: already attached in this build; `capacityOf(p, c) > 0` (not TURN-bound, enough derated upload); `depth[p] < c.MaxDepth`; `children[p] < capacityOf(p, c)`; `p != u`. | eliminate |
-| 0b | **Impairment filter (SOFT).** Let **`healthyAvailable`** = "at least one candidate surviving rank 0 has `!Impaired`". If `healthyAvailable`, every `p.Impaired` candidate is excluded. If not, impaired candidates are **re-admitted** — degradation is a preference, disconnection is not, and a degraded parent beats no parent. Implement as two passes over the same candidate set, not as a score. | eliminate (soft) |
-| 1 | **Incumbency.** If `prev.ParentOf(u) == P` and `P` survived rank 0, then **`P` wins** — unless some surviving candidate `q` satisfies `rtt(u,q) + c.StickinessMs < rtt(u,P)`. Only a *materially* closer parent breaks incumbency; a merely-less-loaded or alphabetically-earlier parent never does. **An impaired incumbent gets no protection — but ONLY when `healthyAvailable`.** See the coupling rule immediately below; this is the single rank that turns a fired dwell timer into an actual re-parent, and it is the reason the dwell is not dead machinery. | prefer |
+| 0b | **Impairment filter (SOFT) — the ONLY place impairment is expressed.** Let **`healthyAvailable`** = "at least one candidate surviving rank 0 has `!Impaired`". If `healthyAvailable`, every `p.Impaired` candidate is excluded. If not, impaired candidates are **re-admitted** — degradation is a preference, disconnection is not, and a degraded parent beats no parent. Implement as two passes over the same candidate set, not as a score.<br><br>**This one rank produces BOTH impairment consequences, and both must be understood as coming from here.** (1) An impaired node takes no NEW children. (2) An impaired node **loses the children it has** — because eliminating it from the candidate set means its own incumbents cannot re-select it at rank 1. Consequence (2) is the mechanism by which a fired dwell timer becomes an actual re-parent, i.e. it is the entire answer to C8. | eliminate (soft) |
+| 1 | **Incumbency.** If `prev.ParentOf(u) == P` and `P` survived ranks 0 and 0b, then **`P` wins** — unless some surviving candidate `q` satisfies `rtt(u,q) + c.StickinessMs < rtt(u,P)`. Only a *materially* closer parent breaks incumbency; a merely-less-loaded or alphabetically-earlier parent never does. **Rank 1 carries no impairment clause of its own** — it does not need one, and specifying a no-op step would be worse than silence. See §3.4a. | prefer |
 
-> **COUPLING RULE (frozen).** Rank 0b's impairment *filter* and rank 1's impairment *void*
-> are the same decision and **must read the same `healthyAvailable` flag**. One variable,
-> computed once per node placement, consumed by both ranks.
->
-> **Why (ruling, §15.9).** WI-1 observed that the rank 1 `!Impaired` clause is unobservable
-> in normal fleets — 0b has already removed impaired candidates — and becomes observable in
-> exactly one situation: when *every* candidate is impaired and 0b re-admits them all. v2.1
-> as written then moved a child from one impaired parent to another marginally-closer
-> impaired parent. **That is not intended.**
->
-> The void exists for exactly one purpose, stated in its own justification below: *let the
-> dwell move children off an impaired relay onto a healthy one.* When no healthy relay
-> exists, the clause's entire premise is absent and all that remains is churn — a stream
-> interruption bought for an RTT delta, in the one situation where the fleet is already
-> degraded and least able to absorb interruptions. Worse, impairment is by definition a
-> **sustained** condition, so an all-impaired fleet can stay that way for a long time and
-> every recompute would reshuffle children between impaired parents. That is precisely the
-> thrash Phase 5 exists to prevent, arriving through the mechanism meant to prevent it.
->
-> So: **when there is nowhere healthy to go, stability is the only value left, and
-> incumbency is preserved.** WI-1's instinct was right; it built the contract as written and
-> flagged it rather than silently "fixing" it, which is exactly the behaviour §0 asks for.
->
-> The clause remains observable and testable in its intended case — impaired incumbent,
-> healthy candidate with spare capacity, children move — so C8's requirement that the dwell
-> not be inert machinery is untouched.
+### 3.4a The impaired-incumbent invariant (RULING — §15.11)
+
+v2.2 expressed impairment in **two** ranks: 0b filtered impaired candidates, and rank 1
+carried a matching `!Impaired` void, coupled to the same `healthyAvailable` flag. WI-1 then
+disclosed — correctly, and without claiming the clause was doing work — that **the void is
+redundant by construction**: whenever it could fire, `healthyAvailable` is true, so 0b has
+already removed the impaired incumbent from the candidate set, so the incumbency test fails
+anyway. Reverting the void leaves every test green.
+
+That is the shape C8 condemned — *inert machinery reads as a working safety property* — and
+the honest reading is that it applies here, with one real difference: this clause has a path
+to becoming live (weaken 0b from an elimination to a preference and it is load-bearing
+immediately), whereas C8's dwell had none.
+
+**RULING (§15.11): neither keep-and-document nor delete-and-note. Delete the clause, and
+promote what it stood for into a named, TESTED invariant.**
+
+> **IMPAIRED-INCUMBENT INVARIANT (frozen).** If `prev.ParentOf(u) == P`, `P.Impaired`, and at
+> least one non-impaired candidate is eligible for `u` in the new build, then
+> `next.ParentOf(u) != P`.
+
+Why this beats both options offered:
+
+- **Against (a) keep-and-document.** The ranks table is a *specification of an algorithm*, and
+  an algorithm step that provably cannot execute is not documentation, it is a trap. An
+  implementer following the spec literally writes dead code; a reviewer re-litigates it every
+  time; and "each rank states its own rule" is a good principle for rules, not for
+  consequences. The void was never an independent rule — it was 0b's effect, restated.
+- **Against (b) delete-and-note.** The manager's objection is exactly right: it leaves 0b
+  silently load-bearing for two distinct properties. But a *comment* naming the second
+  property is the same promise the void was making, in weaker form. The fix is not to
+  document the invariant better — it is to **enforce** it.
+
+So 0b's description above now names **both** consequences explicitly (the manager's concern,
+addressed in the specification rather than in prose beside it), and the invariant is asserted
+as a black-box property of `BuildTree`'s output in §12.2 — **independent of which rank
+produces it.** Weaken 0b to a preference and the property test fails immediately, which is
+precisely the protection the redundant clause was reaching for and could not provide.
+
+This is the structural-guard pattern the rest of this contract already uses: make the bad
+outcome impossible to merge rather than discouraged in review. A test enforces; a clause only
+asserts — and an unreachable clause does not even do that.
+
+**What the coupling rule still is.** `healthyAvailable` remains, computed once per placement,
+consumed by rank 0b alone. The coupling ruling itself (§15.9) is unaffected and was
+independently proven: decoupling reproduces the all-impaired reshuffle (WI-1 measured **two**
+nodes moving, not one), and hardening 0b into an unconditional filter fails with
+`cannot attach … every candidate was filtered out`. Both branches discriminate. Only the
+*second expression* of it in rank 1 is removed.
 | 2 | **Minimum RTT.** Among the remaining candidates (all of them, when rank 1 did not decide), lowest `rtt(u, p)`. Unknown RTT scores `unknownRTT` (worst), unchanged. | prefer |
 | 3 | **Fewest children.** Load balance. This is what makes attachment sane on a LAN where no RTT has been measured. | prefer |
 | 4 | **Name ascending.** Determinism. Total order, no ties survive. | prefer |
@@ -567,10 +623,12 @@ BELOW the hard constraints.** That placement is the whole design.
 - *Above load*: load-balancing is a nice-to-have; stability is a correctness-adjacent
   property here. Letting "P now has 3 children and Q has 1" re-parent a node would make the
   tree churn on every join, which is exactly the Phase 4 defect.
-- *Voided by impairment*: an incumbent that the control plane has classified impaired after
-  a full `DegradationDwell` has, by construction, been bad for ten seconds straight. That is
-  the evidence threshold at which stability stops being the right default — so rank 1 steps
-  aside and rank 2 moves the children to a healthy relay if one has room.
+- *Overridden by impairment, via rank 0b*: an incumbent the control plane has classified
+  impaired after a full `DegradationDwell` has, by construction, been bad for ten seconds
+  straight. That is the evidence threshold at which stability stops being the right default —
+  so 0b removes it from the candidate set entirely, incumbency finds nothing to protect, and
+  rank 2 moves the children to a healthy relay if one has room. Rank 1 needs no clause of its
+  own to achieve this (§3.4a).
 - *Below the hard constraints*: an incumbent parent that is gone, TURN-bound, at capacity,
   or too deep is simply not a candidate. Stickiness must never produce an invalid tree —
   `Validate` is an independent oracle and would catch it, loudly.
@@ -1371,6 +1429,17 @@ package metrics
 //	// explicitly even though the flag defaults to true, so a peer running an older build
 //	// is conservatively treated as unwilling rather than silently elected.
 //	Coordinatable bool `json:"coordinatable"`
+//
+// SHAPE CONFIRMED (§15.10). The field had not landed when WI-5 built, so `arbiter` reads the
+// raw `coordinatable` key alongside Report. That interim decode is CORRECT and must be
+// replaced by the typed field once WI-0b lands.
+//
+// INTEGRATION GAP, flagged so nobody debugs it for an hour: absent ⇒ false, so until BOTH
+// WI-0b (the field) and WI-8 (cmd/peer emitting it) have landed, every peer scores
+// Coordinatable=false, arbiter.Score returns a hard 0 for all of them, and NO PEER IS EVER
+// ELECTED. The symptom is a meet that stays on the arbiter forever with no error anywhere.
+// That is the conservative direction to fail in and the default is not changing, but the
+// two work items must land together or Phase 6 looks broken when it is merely unwired.
 
 // Heartbeat is the peer's 1-second liveness beat and its report of REALIZED topology
 // state — what it has actually connected, as opposed to what the coordinator believes it
@@ -2228,22 +2297,79 @@ func (a *Arbiter) Heartbeat(roomID, peerID string, payload []byte)
 func (a *Arbiter) Metrics(roomID, peerID string, payload []byte)
 
 // Meet is the arbiter-owned description of one meet, and the payload of the dashboard's
-// /api/meets endpoints (§9.3). v1 referenced a dashboard.Meet that was never defined and
-// would have inverted the import; this is that type, owned by its producer.
+// /api/meets LIST endpoint (§9.3). v1 referenced a dashboard.Meet that was never defined
+// and would have inverted the import; this is that type, owned by its producer.
 //
-// Relays is ascending. Depth is -1 when no tree exists.
+// PROVENANCE (ruling, §15.10). Every topology-shaped field here is REALIZED — derived from
+// peers' heartbeats, i.e. what the fleet actually did — never from the coordinator's
+// intent, which the arbiter cannot see (it may not import coordinator). That is the right
+// choice for a summary: it is ground truth, and it is what answers "is this meeting
+// working". The INTENDED tree lives in coordinator.RoomSnapshot and is served by the detail
+// endpoint. §9.4b requires the UI to label the two and to surface their difference rather
+// than mixing them silently.
+//
+// Rev is deliberately ABSENT. Rev is a coordinator counter, not an observable, so a
+// heartbeat-derived Rev would be a fabricated number wearing an authoritative name. Epoch
+// stays because the arbiter MINTS it and is its single writer (§5.7).
 type Meet struct {
-	ID             string
-	CreatedAt      time.Time
-	Members        int
-	Epoch          uint64
-	Rev            uint64
-	Coordinator    string // peer name; "" ⇒ none yet, or the arbiter itself
-	CoordinatorID  string // signaling.ServerID when the arbiter coordinates
-	Relays         []string
-	Depth          int
+	ID        string
+	CreatedAt time.Time
+	// EndedAt is zero while the meet is live; set when it is reaped (§6.9).
+	EndedAt time.Time
+	Members int
+	Epoch   uint64
+	Coordinator    string // peer name; "" ⇒ vacant (§6.8) or the arbiter itself
+	CoordinatorID  string // Config.ArbiterID when the arbiter coordinates
+	Relays         []string // REALIZED, ascending
+	Depth          int      // REALIZED; -1 when no tree is observable
 	ArbiterIsCoord bool
 }
+
+// EndedMeet is the tombstone left behind when a meet is reaped (§6.9), so an operator can
+// still review the demo they just ran instead of watching it vanish the instant the last
+// peer disconnects. Deliberately small and fixed-size — it carries counts, never telemetry.
+type EndedMeet struct {
+	ID          string
+	CreatedAt   time.Time
+	EndedAt     time.Time
+	PeakMembers int
+	FinalEpoch  uint64
+	Elections   int
+}
+
+// Sentinel errors. They exist so cmd/server can map failures to the frozen dashboard error
+// codes in §9.4a with errors.Is, rather than matching on message text. RATIFIED (§15.10);
+// the mapping is 1:1 and is part of the contract.
+//
+//	ErrMeetNotFound  -> "meet_not_found"   404
+//	ErrMeetExists    -> "meet_exists"      409
+//	ErrInvalidMeetID -> "invalid_meet_id"  400
+//	ErrNoCandidate   -> "no_candidate"     409
+//	ErrTooManyMeets  -> "too_many_meets"   429
+var (
+	ErrMeetNotFound  = errors.New("arbiter: meet not found")
+	ErrMeetExists    = errors.New("arbiter: meet already exists")
+	ErrInvalidMeetID = errors.New("arbiter: invalid meet id")
+	ErrNoCandidate   = errors.New("arbiter: no eligible coordinator candidate")
+	ErrTooManyMeets  = errors.New("arbiter: too many meets")
+)
+
+// Sync blocks until every event enqueued before the call has been processed. RATIFIED —
+// the arbiter is a single-goroutine loop like the coordinator, so it needs the same
+// quiescence barrier for simnet (§4.5) and for serving a consistent listing.
+func (a *Arbiter) Sync(ctx context.Context) error
+
+// DefaultArbiterID is the fallback value for Config.ArbiterID. RATIFIED as a FALLBACK ONLY —
+// never a second source of truth. cmd/server MUST set Config.ArbiterID explicitly from
+// signaling.ServerID, and a test in cmd/server MUST assert the two are equal (§2.4).
+const DefaultArbiterID = "_server"
+
+// MeetIDPattern: RATIFIED AS INTERIM ONLY. It duplicates policy.MeetIDPattern, which is the
+// single source of truth (§2.4) and which did not exist when WI-5 built. When WI-0b lands,
+// arbiter imports policy — the DAG already permits it — and this constant is DELETED in
+// favour of policy.ValidMeetID. Until then a test must assert the two patterns agree, for
+// the same reason the DefaultArbiterID test exists: two literals that must match need
+// something that fails when they stop matching.
 
 // Score maps a Fitness to [0, 1]. Higher is fitter.
 //
@@ -2300,6 +2426,15 @@ the formula is real; the inputs are not yet.** Do not claim otherwise in a demo.
 | **Promotion** | `Score(challenger) - Score(incumbent) > PromoteMarginScore`, sustained past `ElectionDwell`, and `MinTermDuration` has elapsed since the last change. | ≥ 20 s |
 | **Re-announce** | ANY membership change in a meet that already has a coordinator. Epoch is **unchanged**; the announcement is re-broadcast so a joiner (or a peer that lost its fence) adopts it. Not an election — see §8 routing rule 5 / §15/C6. | immediate |
 | **Manual** | `POST /api/demo/meets/{id}/elect` (demo surface only, §9.6). | immediate |
+| **Vacate** | The coordinator is lost or demoted and NO eligible candidate exists. Announce `ReasonVacated` at a bumped epoch (§6.8). | immediate |
+
+**PRECEDENCE when demotion and promotion both apply: DEMOTION wins (RATIFIED, §15.10).**
+WI-5 chose this and it is right. The two produce the same *action* — replace the incumbent —
+but a different `Reason`, and `Reason` is operator-facing. Demotion states an **absolute**
+fact ("the incumbent fell below the floor"), promotion a **relative** one ("someone is much
+better"). When both hold, the absolute fact is the more important thing to surface: an
+incumbent below `DemoteBelowScore` is a problem whether or not a challenger happens to exist,
+and labelling that moment "promotion" would hide the only part an operator can act on.
 
 ```go
 // ElectionDwell is the sustained-condition window for a VOLUNTARY handover. It is twice
@@ -2320,16 +2455,37 @@ const PromoteMarginScore = 0.20
 // half-broken one scores.
 const DemoteBelowScore = 0.35
 
-// MinTermDuration is the hard floor on how often the role may move voluntarily. It does
-// NOT apply to the failure path — a dead coordinator is replaced instantly regardless.
-// One minute makes a flapping-election bug obvious (it becomes a once-a-minute event in
-// the dashboard) rather than invisible (a hundred handovers a second).
+// MinTermDuration is the hard floor on how often the role may move voluntarily.
+//
+// SCOPE (CORRECTED, §15.10): it gates only transitions that COULD FLAP — i.e. voluntary
+// promotion or demotion BETWEEN PEERS. It does NOT gate:
+//   - the failure path: a dead coordinator is replaced instantly, always;
+//   - the -coordinate bootstrap handover from the ARBITER to the first fit peer.
+//
+// WI-5 applied it uniformly, which is the safe default but wrong for the bootstrap case. The
+// arbiter does not compete for the role, so arbiter->peer is a one-way transition that can
+// happen at most once per meet and CANNOT flap. Gating it buys nothing and costs a minute of
+// running in a configuration the ROADMAP itself calls a stepping stone. The general rule —
+// anti-flap machinery applies only where flapping is possible — is the thing to carry
+// forward, not the specific exemption.
+//
+// One minute makes a flapping-election bug obvious (a once-a-minute dashboard event) rather
+// than invisible (a hundred handovers a second).
 const MinTermDuration = 60 * time.Second
 
+// MOVED TO metrics (ruling, §15.10): metrics.RebuildWindow. It is declared in arbiter but
+// consumed only by coordinator, and coordinator -> arbiter is forbidden — so leaving it here
+// forces WI-6 to declare a second copy with nothing enforcing agreement. metrics is the
+// correct home rather than a new one: RebuildWindow is literally "how long until every peer
+// has reported at least once", i.e. a metrics-plane cadence, sitting naturally beside
+// DefaultInterval, HeartbeatInterval, DegradedAfter and GoneAfter — all of which both
+// packages already import. This is NOT a stretch of the metrics charter; it is the same kind
+// of value it already owns.
+//
 // RebuildWindow bounds how long a freshly promoted coordinator waits for peers to report
 // in before it publishes its first tree (§6.6). 3s ≈ 3 heartbeats + 1 metrics tick, which
 // is enough for every present peer to have spoken at least once.
-const RebuildWindow = 3 * time.Second
+const RebuildWindow = 3 * time.Second // now metrics.RebuildWindow
 ```
 
 ### 6.3 The arbiter's announcement frame
@@ -2346,6 +2502,9 @@ const (
 	ReasonPromotion Reason = "promotion" // a materially fitter peer took over
 	ReasonDemotion  Reason = "demotion"  // the incumbent fell below the floor
 	ReasonManual    Reason = "manual"    // forced through the demo surface
+	// ReasonVacated: the coordinator was lost or demoted and NO eligible candidate exists.
+	// Announcement.Coordinator is "" and the epoch is bumped. See §6.8.
+	ReasonVacated Reason = "vacated"
 )
 
 // Announcement is the arbiter's authoritative statement of who coordinates a meet, under
@@ -2358,7 +2517,13 @@ type Announcement struct {
 	CoordinatorID  string `json:"coordinator_id"`   // server-assigned peer id, or signaling.ServerID
 	Prev           string `json:"prev,omitempty"`   // the outgoing coordinator's name
 	Reason         Reason `json:"reason"`
-	IssuedAtUnixMs int64  `json:"issued_at_unix_ms"`
+	// IssuedAt is a time.Time carried as RFC3339 (RATIFIED, §15.10 — v2 froze an
+	// IssuedAtUnixMs int64 and the implementer's choice is better). The *_unix_ms
+	// convention in §9.4a is scoped to DASHBOARD bodies, which are consumed by JavaScript;
+	// this is a Go-to-Go signaling payload where time.Time is the idiomatic type, and the
+	// dashboard re-serializes it into its own envelope anyway rather than passing it
+	// through.
+	IssuedAt time.Time `json:"issued_at"`
 }
 
 // Announcer ships an Announcement to every member of a meet. Consumer-defined here so
@@ -2372,6 +2537,12 @@ type Announcer interface {
 // the dashboard. A nil Publisher means "publish nothing".
 type Publisher interface {
 	PublishElection(Announcement)
+	// PublishRepair reports that a peer's fence has fallen behind the meet's epoch, and
+	// again when it catches up. It is a SEPARATE method — and a separate dashboard event
+	// kind — from PublishElection on purpose: the election log is the Phase 6 demo's
+	// centrepiece and its value is that it lists actual leadership changes. A re-announce
+	// repair is not one. See §6.8.
+	PublishRepair(roomID, name string, peerEpoch, meetEpoch uint64, resolved bool)
 }
 ```
 
@@ -2531,6 +2702,135 @@ Not by timing, not by a lock ordering, not by a heuristic.
   but it will keep computing and keep logging, and its `slog` output will look alarming.
   Mitigation: on `GoneAfter` of silence *from the arbiter*, a coordinator peer stops its
   own control loop (`Yield`) rather than shouting into the void. Frozen as behaviour.
+
+### 6.8 Announcement repair, and vacancy (RULING — §15.10)
+
+**C6 through packet loss.** §8 routing rule 5 repairs a mis-fenced peer by re-broadcasting on
+every membership change. WI-5 correctly observed that this leaves a hole of the same
+criticality as C6 itself: if `AnnounceCoordinator` fails, or the Hub drops the frame on a
+full 32-deep send buffer, that peer stays fenced out — rejecting every push, receiving
+nothing — **until someone joins or leaves. In a static meet that is indefinite.** Reaching a
+CRITICAL failure mode through packet loss instead of through joining is still that CRITICAL.
+
+WI-5 proposed a timer-free repair and declined to apply it unilaterally because it changes
+announcement volume and touches the dashboard. That judgment was right. **Ratified, with the
+dashboard treatment specified:**
+
+> **REPAIR RULE (frozen).** On every `Heartbeat` from a peer in a meet that has an
+> announcement, if `hb.Epoch < meet.epoch` **and** `now - meet.termStart >= metrics.RebuildWindow`,
+> re-send the meet's current `Announcement` **to that peer** — verbatim, unchanged, same
+> epoch, same reason.
+>
+> - **Verbatim is required, not incidental.** The peer must adopt exactly the announcement it
+>   missed. Minting a fresh one with a different `Reason` would make two peers disagree about
+>   why the current coordinator holds the role.
+> - The `RebuildWindow` guard suppresses the repair during the legitimate propagation window
+>   right after an election, so a normal handover never triggers it.
+> - **Unicast, not broadcast** — only the lagging peer needs it, and broadcasting would turn
+>   one wedged peer into N frames per second.
+> - **No cap and no backoff.** The condition is indefinite, so the repair must be too. It
+>   costs ~150 bytes per lagging peer per second, which is nothing beside a 2 Mbit/s video
+>   stream. Log at Info on entry into lagging, Debug thereafter.
+
+**Dashboard treatment: a distinct kind, emitted on TRANSITION only.**
+
+A repair is emitted to `arbiter.Publisher.PublishRepair` when a peer *enters* the lagging
+state and again when it *leaves* it — **not once per heartbeat.** This is the same
+transition-not-sample discipline the health FSM already uses (§5.3), and applying it
+consistently is why 1 Hz of wire repair produces 2 events per episode instead of drowning the
+log at exactly the moment an operator is trying to read it.
+
+New dashboard kind, **`announce_repair`**:
+`data: {"name", "peer_epoch", "meet_epoch", "resolved": bool}`.
+
+It is **not** folded into `election`. The election log's whole value is that it lists actual
+leadership changes — it is what the Phase 6 demo points at — and a repair is not one. Keeping
+them separate also lets an operator correlate the server-side cause (`announce_repair`) with
+the peer-side symptom (`stale_rejected`), which are two views of one fault.
+
+> **This also disposes of the "re-announcement replays `reason: bootstrap`" concern.** The
+> frame must replay verbatim (see above), so the *wire* cannot distinguish them — but the
+> dashboard never sees a repair as an election, because it arrives through a different
+> `Publisher` method and a different `kind`. The distinction lives in the event stream, which
+> is where it was needed. No wire change.
+
+**The demoted coordinator that missed its announcement: ACCEPTED, and repaired by the same
+mechanism.** It is already safe — peers fence it out — but it is permanently noisy and wastes
+its own CPU. No new frame is needed to stop it: a demoted coordinator is a peer, it sends
+heartbeats, its `Epoch` lags, so the repair rule above re-announces to it, and §6.5's adoption
+rule already says *"if it was self and is no longer, cancel the control loop's context and
+drop every in-flight push."* One mechanism, both faults.
+
+The residual case — a coordinator partitioned from the arbiter, so no heartbeat and therefore
+no repair reaches it — is already covered by the `Yield`-on-arbiter-silence rule immediately
+above. Between the two, there is no state in which a stale coordinator keeps pushing forever.
+
+**Vacancy: CORRECTED.** WI-5 chose, on losing the coordinator with no eligible candidate, to
+vacate the role, keep the epoch, and drop `lastAnn` so no joiner is fenced to a corpse. The
+instinct is right and the mechanism is one step short:
+
+> **Announce the vacancy.** Emit `Announcement{Coordinator: "", CoordinatorID: "",
+> Reason: ReasonVacated}` at a **bumped** epoch, and **retain** it as `lastAnn`.
+
+Three things this buys that dropping `lastAnn` does not:
+
+1. It is the **only way to tell a live-but-demoted coordinator to stop.** Silence cannot do
+   that; a higher epoch naming nobody can.
+2. A joiner is fenced to a **vacancy**, which is the true state, rather than to nothing —
+   `Fence.AdoptAnnouncement` succeeds, `coordID` is `""`, and every push is correctly
+   rejected because no sender can match `""`.
+3. Any straggler push from the old term is fenced by the bump.
+
+The epoch bump is correct here even though no term begins: the epoch is a fencing token, not
+a term counter, and the thing being fenced is the old coordinator. Epochs are a free-running
+`uint64` minted by a single writer; spending one is free.
+
+### 6.9 Meet lifecycle — the DoS bound (RULING — §15.10)
+
+`POST /api/meets` is the **only unauthenticated write surface in the system**, and v2 gave it
+`MaxMeets` with no way for a meet to ever leave the map. That is not a bound; it is a
+one-shot fill. Frozen lifecycle:
+
+> - A meet becomes **empty** when its last member leaves; the arbiter records `emptyAt`.
+> - A member joining an empty meet clears `emptyAt`. **The epoch continues** — it is not
+>   reset. (Peers reset their own fence on `TypeJoined` either way, so this is not a
+>   correctness requirement; it is cheaper and it keeps the dashboard's epoch monotone
+>   across a lull, which is what an operator expects to see.)
+> - After `MeetTTL` of *continuous* emptiness the meet is **reaped**: removed from the
+>   registry, its epoch counter discarded, and an `EndedMeet` tombstone pushed onto a
+>   fixed-size ring.
+> - Reaping is **lazy** — performed on every registry mutation (create, join, leave) and on
+>   every listing — never on a timer. A server with no traffic cannot grow, so it does not
+>   need sweeping; and timer-free matches the same discipline §6.8's repair follows.
+
+```go
+// MeetTTL is how long a meet may sit empty before it is reaped.
+//
+// 5 minutes: comfortably longer than any reconnect storm a real meeting produces — a laptop
+// lid closing, a Wi-Fi roam, everyone refreshing a browser tab — so a meet does not
+// evaporate under the participants; and far shorter than any interval over which an
+// unauthenticated attacker could accumulate meaningful state, since MaxMeets caps the live
+// set at 100 regardless.
+const MeetTTL = 5 * time.Minute
+
+// MaxEndedMeets is the size of the tombstone ring (FIFO, oldest evicted).
+//
+// 20. A dashboard's value here is substantially retrospective — an operator wants to review
+// the failover they just watched — and a meet vanishing the instant its last peer
+// disconnects destroys exactly that, at exactly the wrong moment. An UNBOUNDED history is
+// the same DoS in a different map, so the ring is bounded by construction rather than by
+// policy. Tombstones carry counts only, never telemetry.
+const MaxEndedMeets = 20
+```
+
+`GET /api/meets` returns both, always: `{"meets": [...], "ended": [...]}`. No query
+parameter — `ended` is capped at 20 tiny objects, so making the frontend ask for it would be
+ceremony with no payoff.
+
+**Honest limitation:** this bounds *state*, not *request rate*. An attacker can still churn
+create/reap indefinitely. Per-IP rate limiting is out of scope for a portfolio system with no
+auth at all (§13.8), and the `-demo`-style answer does not apply because meet creation is the
+product. Recorded in §13 rather than papered over.
 
 ---
 
@@ -3108,20 +3408,39 @@ All paths are under `/api/`. All bodies are `application/json`. All responses ca
 
 ```json
 {
+  "api_version": 1,
   "meets": [
     {
       "id": "standup",
       "created_at_unix_ms": 1756684800000,
       "members": 4,
       "epoch": 3,
-      "rev": 11,
       "coordinator": "alice",
+      "coordinator_id": "p2",
+      "arbiter_is_coordinator": false,
       "relays": ["alice", "dave"],
-      "depth": 2
+      "depth": 2,
+      "provenance": "realized"
+    }
+  ],
+  "ended": [
+    {
+      "id": "m-7fa3k2qd",
+      "created_at_unix_ms": 1756681200000,
+      "ended_at_unix_ms": 1756684500000,
+      "peak_members": 5,
+      "final_epoch": 4,
+      "elections": 2
     }
   ]
 }
 ```
+
+`rev` is **absent** from a list row and this is deliberate — see §9.4b. `ended[]` is the
+tombstone ring (§6.9), always present, capped at `MaxEndedMeets`; it needs no query parameter
+because 20 tiny objects are cheaper to send than a flag is to explain. `provenance` is a
+literal `"realized"` on every list row, so a client cannot mistake these numbers for the
+coordinator's intent.
 
 #### `POST /api/meets` — create a meet
 
@@ -3250,7 +3569,8 @@ Every frame on `/api/meets/{id}/events` has exactly this shape:
 | `topology` | `{"root","edges":[…],"backups":[…],"depth","relays":[…],"outcome","reason"}` — `outcome` is `built` or `relaxed`; on `relaxed`, `reason` carries the sticky attempt's error (§5.9a) | `coordinator.EventTopology` |
 | `reparent` | `{"name","from","to","self_promoted":true,"reason"}` | `coordinator.EventReparent` |
 | `failover` | `{"name","orphans":[…],"reroot":false,"reason"}` | `coordinator.EventFailover` |
-| `election` | `{"epoch","coordinator","prev","reason"}` | `arbiter.Publisher` |
+| `election` | `{"epoch","coordinator","prev","reason"}` — `coordinator` is `""` when `reason` is `vacated` (§6.8) | `arbiter.Publisher.PublishElection` |
+| `announce_repair` | `{"name","peer_epoch","meet_epoch","resolved"}` — emitted on ENTERING and LEAVING the lagging state, never per heartbeat (§6.8) | `arbiter.Publisher.PublishRepair` |
 | `stale_rejected` | `{"name","epoch","rev","reason"}` | `coordinator.EventStale` |
 | `settling` | `{"waiting":[…],"reason"}` | `coordinator.EventSettling` |
 | `unbuildable` | `{"reason"}` | `coordinator.EventUnbuildable` |
@@ -3308,8 +3628,8 @@ neutral style, never by crashing):
 | `health` | `healthy`, `degraded`, `gone` |
 | `roles[]` | `coordinator`, `relay`, `leaf` |
 | `nat` | `direct`, `turn` |
-| `kind` | `snapshot`, `member_joined`, `member_left`, `health_changed`, `topology`, `reparent`, `failover`, `election`, `stale_rejected`, `settling`, `unbuildable`, `demo`, `pong` |
-| `reason` (election) | `bootstrap`, `failover`, `promotion`, `demotion`, `manual` |
+| `kind` | `snapshot`, `member_joined`, `member_left`, `health_changed`, `topology`, `reparent`, `failover`, `election`, `announce_repair`, `stale_rejected`, `settling`, `unbuildable`, `demo`, `pong` |
+| `reason` (election) | `bootstrap`, `failover`, `promotion`, `demotion`, `manual`, `vacated` |
 | `outcome` | `built`, `relaxed`, `settling`, `unbuildable` |
 
 **WebSocket protocol, complete.** The client sends **exactly two** operations — `{"op":"ping"}`
@@ -3374,6 +3694,53 @@ Renamed to **`by_remote_addr`** and documented as **advisory only**: it is the r
 `RemoteAddr` as the server saw it, is trivially spoofable behind a proxy, and exists so a
 demo operator can tell their own clicks from a colleague's on a shared screen. It is not an
 identity and the UI must not present it as one.
+
+### 9.4b Provenance: REALIZED vs INTENDED, and why the UI must show the gap
+
+There are two different answers to "what is the subnet", and v2 let them blur. WI-5 surfaced
+it: `arbiter.Meet` promised `Rev`/`Relays`/`Depth`, but the arbiter has no topology and may
+not import `coordinator`, so it derives them from **realized heartbeats** instead. That is a
+different number wearing the same name.
+
+**RULING (§15.10): every topology-shaped number the dashboard shows is labelled by
+provenance at the schema level, and the two sources are served by different endpoints.**
+
+| | **REALIZED** | **INTENDED** |
+|---|---|---|
+| Means | What peers actually did, from their heartbeats | What the coordinator computed and pushed |
+| Source | `arbiter` | `coordinator.RoomSnapshot` |
+| Served by | `GET /api/meets` (list rows) | `GET /api/meets/{id}`, WS `snapshot` |
+| Carries | `members`, `relays`, `depth`, `epoch` | `root`, `edges`, `backups`, `rev`, `epoch` |
+| Marked | `"provenance": "realized"` | `"provenance": "intended"` |
+
+- **`rev` exists only on the INTENDED side.** `Rev` is a coordinator counter, not an
+  observable; a heartbeat-derived `rev` would be a fabricated number wearing an authoritative
+  name, and the fence depends on that name meaning one thing. Hence its removal from
+  `arbiter.Meet`.
+- **`epoch` appears on both, and legitimately** — the arbiter *mints* it and is its single
+  writer (§5.7), so it is authoritative there too.
+- The detail snapshot already carries each node's realized `parent`/`children` from its last
+  heartbeat (`coordinator.MemberSnapshot`), so both views are available where they can be
+  compared.
+
+**The difference is the most useful diagnostic in the system, so the schema surfaces it
+rather than letting the UI stumble into it.** `GET /api/meets/{id}` and the WS `snapshot`
+gain two fields:
+
+```json
+"converged": false,
+"diverged": ["carol", "dave"]
+```
+
+`diverged` lists nodes whose realized parent differs from the intended one; `converged` is
+`len(diverged) == 0`. A non-empty `diverged` means convergence lag, a failed apply, or a
+fenced-out peer — the three faults hardest to see any other way, and each of them invisible
+if the UI simply renders whichever number it fetched last.
+
+**UI obligation (frozen):** never render a realized and an intended number in the same
+element. The subnet graph is drawn from **intended** edges, with diverged nodes badged in
+`--warn` and their realized parent shown on hover. The meet list is **realized** and says so.
+Mixing them silently is the specific failure this ruling exists to prevent.
 
 ### 9.5 What the UI renders (contract for `web/`)
 
@@ -3675,7 +4042,7 @@ safe.
 
 | Layer | Package | Style | Must cover |
 |---|---|---|---|
-| **Pure graph** | `overlay` | Table-driven + the independent `Validate` oracle. Never re-derive the expected tree. | Epoch/rev stamping; stickiness at rank 1 (an incumbent survives a lower-load and a marginally-closer challenger, loses to one beating `StickinessMs`); processing order (a strong joiner does not re-parent incumbents); backup invariant `B ∉ Subtree(P)`; root children have no backup; `ValidateLocalRepair` catches a gratuitous re-parent; `Validate` catches each new violation class; `LoadTopology` still accepts a Phase-3 file and stamps `StaticEpoch`; determinism over ≥50 repeats. **`PickRoot` never returns a provisional, impaired, or under-capacity node (a real 1200 kbit/s report against a 2000 kbit/s stream cost is NOT rootable — ruling E); an incumbent root survives a challenger inside `RootChangeMarginKbps` and loses to one beyond it; a demoted former root is processed first and its former children stay put (§3.4 step 0); `ValidateLocalRepair` accepts an RTT-justified move past `StickinessMs` and still rejects an unjustified one (ruling D).** **The impairment coupling rule, BOTH branches: with a healthy candidate available, an impaired incumbent loses its children (the void fires); with EVERY candidate impaired, the same fleet keeps every incumbent edge unchanged (the void is suppressed) — a fleet that differs only in whether one candidate is impaired must produce those two different outcomes, or the coupling is not wired.** |
+| **Pure graph** | `overlay` | Table-driven + the independent `Validate` oracle. Never re-derive the expected tree. | Epoch/rev stamping; stickiness at rank 1 (an incumbent survives a lower-load and a marginally-closer challenger, loses to one beating `StickinessMs`); processing order (a strong joiner does not re-parent incumbents); backup invariant `B ∉ Subtree(P)`; root children have no backup; `ValidateLocalRepair` catches a gratuitous re-parent; `Validate` catches each new violation class; `LoadTopology` still accepts a Phase-3 file and stamps `StaticEpoch`; determinism over ≥50 repeats. **`PickRoot` never returns a provisional, impaired, or under-capacity node (a real 1200 kbit/s report against a 2000 kbit/s stream cost is NOT rootable — ruling E); an incumbent root survives a challenger inside `RootChangeMarginKbps` and loses to one beyond it; a demoted former root is processed first and its former children stay put (§3.4 step 0); `ValidateLocalRepair` accepts an RTT-justified move past `StickinessMs` and still rejects an unjustified one (ruling D).** **The IMPAIRED-INCUMBENT INVARIANT (§3.4a) as a BLACK-BOX property of `BuildTree`'s output, asserted without reference to any rank: `prev.ParentOf(u)==P` ∧ `P.Impaired` ∧ a non-impaired candidate is eligible ⇒ `next.ParentOf(u) != P`. This must fail if rank 0b is ever weakened from an elimination to a preference — that is the whole point of stating it as a property rather than as a clause. Plus BOTH coupling branches: with a healthy candidate available an impaired incumbent loses its children; with EVERY candidate impaired the same fleet keeps every incumbent edge unchanged. A fleet differing only in whether one candidate is impaired must produce those two outcomes, or the coupling is not wired.** |
 | **Deterministic sim** | `simnet` | Seeded scenarios + property tests over many seeds. | Replay identity (same seed ⇒ identical trace); virtual-clock ordering (same-instant timers fire in creation order); each injection primitive; ≥200-step churn keeping **both** oracles green (the interim RTT-free / RTT-rich split collapses once ruling D lands); the dwell suppressing a noisy-but-stable metric stream; the dwell firing on a sustained one. **The three §12.3 properties**, including the 120-permutation enumeration asserting validity + bounded delta on each — and pinning `9 distinct trees, 1 root` as a regression check on the trade itself. |
 | **Control loop** | `coordinator` | `-race`, fake `Sender`, fake `Publisher`, `VirtualClock`, `Sync` barrier. | The eight threshold events and **only** those recompute; `RecomputeCooldown` coalescing a burst; the `OK:false` cooldown bypass; health FSM transitions in virtual time; local repair moves only orphans (asserted via `ValidateLocalRepair`); the ratification rule (a self-promoted parent survives the next rebuild); re-root on root loss; `Snapshot` never tears. **The settle rule: a 1-member meet never builds and never consumes the settle; every join RE-ARMS it; a join burst coalesces into one build; a join bypasses `RecomputeCooldown` but not the settle; `unbuildable` is emitted only post-settle.** **The §5.9a relaxed retry: a fleet that is sticky-unbuildable but fresh-buildable publishes with `OutcomeRelaxed` and NEVER reports `unbuildable`; a genuinely over-constrained fleet reports `unbuildable` and keeps its previous tree; the retry does not bypass the cooldown; `PickRoot == ""` short-circuits without a second attempt.** | |
 | **Election** | `arbiter` | Table-driven `Score`; scenario-driven election. | `Score` returns 0 for TURN-bound and non-healthy; upload is absent from the formula (assert a large `UploadKbps` changes nothing); every trigger in §6.2; `MinTermDuration` blocks a voluntary handover and does **not** block a failure one; epochs strictly increase and never repeat. |
@@ -3848,7 +4215,16 @@ Stated plainly, because a contract that oversells is worse than one that admits 
 15. **The C12 rewriter is the riskiest piece of Phase 5.** RTP sequence/timestamp continuity
     plus drop-until-keyframe is real SFU work. If it is not built, make-before-break must be
     abandoned on the relay's upstream edge and the gap accepted — explicitly, per §7.3.
-16. **Phase 7 is untouched.** No simulcast, no SVC, no TURN infrastructure. `overlay.NATRelayed`
+16. **Meet creation is state-bounded, not rate-bounded (§6.9).** `MaxMeets` + `MeetTTL` +
+    lazy reaping bound how much memory an unauthenticated caller can hold, but nothing bounds
+    how fast they can churn create/reap. Per-IP rate limiting is out of scope for a system
+    with no auth at all (§13.8), and unlike the demo routes there is no off-by-default answer
+    available, because meet creation *is* the product.
+17. **The dashboard shows two different truths and must label them (§9.4b).** Realized
+    (heartbeat-derived) and intended (coordinator-computed) topology genuinely disagree during
+    convergence, and the gap is diagnostic rather than erroneous. A UI that renders whichever
+    it fetched last will be confidently wrong at exactly the moments that matter.
+18. **Phase 7 is untouched.** No simulcast, no SVC, no TURN infrastructure. `overlay.NATRelayed`
     stays a *modelled* constraint declared by a flag; nothing detects a real symmetric NAT.
     A relay still sends one quality layer to every downstream.
 
@@ -4102,7 +4478,54 @@ necessary but insufficient: `GoneAfter` depends on a cadence each *peer* declare
 per-node threshold: `max(metrics.GoneAfter(declared), Config.SocketDetection)`, with
 `SocketDetection` wired from `hub.LivenessBudget()`. New `coordinator.Config.SocketDetection`.
 
-### 15.10 Where I think a reviewer is wrong
+### 15.10 v2.3 — WI-5 (`arbiter`) rulings
+
+| # | Finding | Ruling | § |
+|---|---|---|---|
+| 1 | A lost announcement leaves a peer mis-fenced until the next membership change — indefinite in a static meet. C6 reached through packet loss. | **Ratified WI-5's timer-free repair**: on a `Heartbeat` whose `Epoch` lags, past `RebuildWindow` since `termStart`, re-send the current announcement **verbatim and unicast**. Dashboard sees a distinct `announce_repair` kind emitted on **transition only** (enter/leave lagging), not per beat — the transition-not-sample discipline the health FSM already uses. Deliberately NOT an `election`: that log's value is that it lists real leadership changes. | 6.8 |
+| 1b | A demoted coordinator that missed its announcement pushes forever. | **Accepted as safe (fenced) and repaired by the same mechanism** — it is a peer, it heartbeats, its epoch lags, so it is re-announced and §6.5 cancels its control loop. The partitioned variant is already covered by `Yield`-on-arbiter-silence. No new frame needed. | 6.8 |
+| 1c | A re-announcement replays `reason: "bootstrap"` verbatim. | **No wire change** — verbatim replay is *required*, or the peer adopts a different announcement than the one it missed. The distinction lives in the event stream, which ruling 1 already provides. | 6.8 |
+| 2 | Meets are never garbage-collected on the only unauthenticated write surface. | **Lifecycle frozen**: `emptyAt` → `MeetTTL` (5 min) → lazy reap on registry mutation (timer-free) → bounded `EndedMeet` tombstone ring (`MaxEndedMeets` = 20), surfaced as `ended[]`. State is bounded; **rate is not**, recorded honestly in §13.16. | 6.9 |
+| 3a | `RebuildWindow` declared in `arbiter`, consumed only by `coordinator`. | **Moved to `metrics`** — it is a metrics-plane cadence and both packages already import it. Explicitly NOT `policy`, whose charter is boundary input. | 2.4 |
+| 3b | `signaling.ServerID` unimportable ⇒ `arbiter.DefaultArbiterID` duplicate. | **Duplication kept**, because unlike 3a there is no correct shared home for a *wire* constant. `cmd/server` MUST pass `Config.ArbiterID` explicitly, and a **test in `cmd/server` asserting equality is required**. | 2.4 |
+| 3c | `DemoControl.Evict` not implementable in `arbiter`. | **Confirmed as intended** — `cmd/server` supplies it; it is the only holder of both `*Hub` and `*Arbiter`. The seam working as designed. | 2.4 |
+| 4a | `Report.Coordinatable` never landed; arbiter reads the raw key. | **Shape confirmed**, interim decode correct. Flagged the integration gap: until WI-0b **and** WI-8 both land, every peer scores 0 and **no peer is ever elected**, silently. | 5.2 |
+| 4b | `Rev`/`Relays`/`Depth` derived from heartbeats, not coordinator intent. | **Provenance ruling**: list = REALIZED, detail/snapshot = INTENDED, both labelled `provenance`. **`Meet.Rev` REMOVED** — a derived `rev` is a fabricated number wearing an authoritative name. Snapshot gains `converged`/`diverged`, because the gap is the best diagnostic in the system and the UI must show it, not average it. | 9.4b |
+| 4c-i | Coordinator lost, no candidate. | **Corrected.** WI-5 vacated silently and dropped `lastAnn`; instead **announce the vacancy** (`ReasonVacated`, empty coordinator, **bumped** epoch) and retain it. It is the only way to tell a live-but-demoted coordinator to stop, and it fences a joiner to the true state rather than to nothing. | 6.8 |
+| 4c-ii | Does `MinTermDuration` gate the arbiter→peer bootstrap? | **Corrected: no.** It gates only transitions that *could flap*, i.e. peer↔peer. The arbiter does not compete for the role, so the bootstrap handover cannot flap; gating it buys nothing and costs a minute in a configuration the ROADMAP itself calls a stepping stone. | 6.2 |
+| 4c-iii | Demotion vs promotion precedence. | **Ratified: demotion.** Same action, different `Reason`; `Reason` is operator-facing, and the absolute fact ("below the floor") outranks the relative one ("someone is better"). | 6.2 |
+| 4e | `Sync`, 5 error values, `MeetIDPattern`, `DefaultArbiterID`, `Announcement.IssuedAt`. | **Ratified**, with two conditions: `MeetIDPattern` is **interim** and is deleted for `policy.ValidMeetID` when WI-0b lands; `DefaultArbiterID` is a fallback only. Error sentinels frozen as a 1:1 map to §9.4a's `code` set. `IssuedAt time.Time`/`issued_at` **supersedes** v2's `IssuedAtUnixMs` — the `*_unix_ms` convention is scoped to dashboard bodies, and this is a Go-to-Go signaling payload. | 6.1 |
+
+### 15.11 v2.3 — the impaired-incumbent void (RULING (c))
+
+WI-1 disclosed that rank 1's `!Impaired` void, added in v2.2, is **redundant by
+construction**: under the coupling rule, whenever it could fire `healthyAvailable` is true, so
+rank 0b has already removed the impaired incumbent from the candidate set and the incumbency
+test fails anyway. Reverting it leaves every test green. It kept the clause and documented the
+redundancy rather than claiming it did work — the right behaviour, and on record.
+
+**Neither (a) keep-and-document nor (b) delete-and-note. Ruling (c): delete the clause, and
+promote what it stood for into a named, TESTED invariant** (§3.4a):
+
+> If `prev.ParentOf(u) == P`, `P.Impaired`, and a non-impaired candidate is eligible for `u`,
+> then `next.ParentOf(u) != P`.
+
+C8's principle does apply — an algorithm step that provably cannot execute is not
+documentation, it is a trap, and "each rank states its own rule" is a principle for rules, not
+for restated consequences. But (b) leaves 0b silently load-bearing for two properties, and the
+manager was right about that. The resolution is that a *comment* naming the second property
+makes the same weak promise the dead clause made: the fix is not to document the invariant
+better but to **enforce** it. So rank 0b's specification now names **both** consequences
+explicitly, and the invariant is asserted as a black-box property of `BuildTree`'s output,
+independent of which rank produces it. Weaken 0b to a preference and the property test fails —
+which is exactly the protection the redundant clause reached for and could not provide.
+
+The coupling ruling itself (§15.9) is untouched and was independently proven: decoupling
+reproduces the all-impaired reshuffle (**two** nodes moving, not one), and hardening 0b into an
+unconditional filter fails with `cannot attach … every candidate was filtered out`. Only the
+second expression of it, in rank 1, is removed.
+
+### 15.12 Where I think a reviewer is wrong
 
 - **"`Supersedes` should be deleted."** Not taken. It is genuinely needed for *ordering* —
   the coordinator sequencing its own trees, the dashboard detecting a stale snapshot. The
@@ -4115,5 +4538,5 @@ per-node threshold: `max(metrics.GoneAfter(declared), Config.SocketDetection)`, 
 
 ---
 
-*This document is FROZEN at v2.2. Amendments go through the owner, in this file, recorded in
+*This document is FROZEN at v2.3. Amendments go through the owner, in this file, recorded in
 §15. Implementers: build what is written, and report what is wrong.*
