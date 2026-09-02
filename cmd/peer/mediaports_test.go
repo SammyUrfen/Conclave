@@ -64,7 +64,7 @@ func TestMediaPortsReachTheRouterConfig(t *testing.T) {
 	if got := opts.cfg.mediaPorts; got != [2]uint16{47000, 47019} {
 		t.Fatalf("callConfig.mediaPorts = %v, want {47000 47019}", got)
 	}
-	rc := routerConfigFor(opts.cfg, nil, nil, nil, nil, nil)
+	rc := routerConfigFor(opts.cfg, nil, nil, nil, nil)
 	if rc.MediaPortRange != [2]uint16{47000, 47019} {
 		t.Errorf("RouterConfig.MediaPortRange = %v; the flag never reaches media", rc.MediaPortRange)
 	}
@@ -79,7 +79,7 @@ func TestMediaPortsDefaultsToEphemeral(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseArgs: %v", err)
 	}
-	if got := routerConfigFor(opts.cfg, nil, nil, nil, nil, nil).MediaPortRange; got != [2]uint16{} {
+	if got := routerConfigFor(opts.cfg, nil, nil, nil, nil).MediaPortRange; got != [2]uint16{} {
 		t.Errorf("MediaPortRange = %v with no flag, want the zero value", got)
 	}
 }

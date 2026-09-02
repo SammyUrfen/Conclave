@@ -561,13 +561,18 @@ func iceServersFor(cfg callConfig) []webrtc.ICEServer {
 func routerConfigFor(
 	cfg callConfig,
 	topo *overlay.Topology,
-	iceServers []webrtc.ICEServer,
 	clk clock.Clock,
 	onReparented func(metrics.Reparented),
 	onCoordinator func(payload []byte),
 ) media.RouterConfig {
 	rc := media.RouterConfig{
-		ICEServers:     iceServers,
+		// DERIVED HERE, not handed in. A caller that assembles the list itself can
+		// assemble the wrong one — reverting this to a STUN-only literal deletes the
+		// whole client half of the TURN feature, and with the list passed in as a
+		// parameter no test could see it, because the one covering iceServersFor calls
+		// it directly. Reading cfg here is what makes the wiring observable, the same
+		// reason MediaPortRange is read from cfg on the next line.
+		ICEServers:     iceServersFor(cfg),
 		MediaPortRange: cfg.mediaPorts,
 		SendMedia:      cfg.send,
 		MediaPath:      cfg.mediaPath,
@@ -1344,8 +1349,6 @@ func runCall(ctx context.Context, logger *slog.Logger, cfg callConfig) error {
 	logger.Info("connected to signaling",
 		slog.String("server", cfg.server), slog.String("room", cfg.room), slog.String("name", cfg.name))
 
-	iceServers := iceServersFor(cfg)
-
 	// callCtx bounds this call. Cancelling it — on SIGINT, or when router.Run returns
 	// on its own because the signaling stream closed — also stops the reporter, the
 	// beater and the re-parent drain, so no goroutine outlives runCall.
@@ -1372,7 +1375,7 @@ func runCall(ctx context.Context, logger *slog.Logger, cfg callConfig) error {
 	// nothing invokes a callback until Run is executing — so the assignment
 	// happens-before every read.
 	var router *media.Router
-	rcfg := routerConfigFor(cfg, topo, iceServers, clk, reparents.post, func(payload []byte) {
+	rcfg := routerConfigFor(cfg, topo, clk, reparents.post, func(payload []byte) {
 		ann, adopted, self := adoptAnnouncement(logger, router.SelfID, router.AdoptCoordinator, payload)
 		if plane != nil {
 			plane.announce(ann, adopted, self)

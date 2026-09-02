@@ -250,7 +250,7 @@ func TestTurnCredentialsReachTheRouterConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseArgs: %v", err)
 	}
-	rc := routerConfigFor(opts.cfg, nil, nil, nil, nil, nil)
+	rc := routerConfigFor(opts.cfg, nil, nil, nil, nil)
 	want := []webrtc.ICEServer{
 		{URLs: []string{"stun:stun.example:19302"}},
 		{URLs: []string{"turn:10.0.0.5:3478"}, Username: "u", Credential: "p"},

@@ -225,7 +225,7 @@ func TestRouterConfigBackupPolarity(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parseArgs(%q): %v", tt.args, err)
 			}
-			rc := routerConfigFor(opts.cfg, nil, nil, clock.System(),
+			rc := routerConfigFor(opts.cfg, nil, clock.System(),
 				func(metrics.Reparented) {}, func([]byte) {})
 			if got := backupEnabled(rc); got != tt.wantEnabled {
 				t.Errorf("backup enabled = %v, want %v", got, tt.wantEnabled)
@@ -272,7 +272,7 @@ func TestRouterConfigCoordinatorGating(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parseArgs(%q): %v", tt.args, err)
 			}
-			rc := routerConfigFor(opts.cfg, nil, nil, clock.System(),
+			rc := routerConfigFor(opts.cfg, nil, clock.System(),
 				func(metrics.Reparented) {}, func([]byte) {})
 			if got := rc.OnCoordinator != nil; got != tt.wantSet {
 				t.Errorf("OnCoordinator set = %v, want %v", got, tt.wantSet)
