@@ -35,12 +35,28 @@ participants and can *migrate***. Learning/portfolio project, not shipping.
 | 4 | Metrics plane + coordinator computes the tree | ✅ done |
 | 5 | Join/leave handover + backup parents | ✅ done |
 | 6 | Coordinator election + migration | ✅ done |
-| 7 | Simulcast/SVC, TURN, polish & demo | ⬜ **not built** |
+| 7 | Simulcast/SVC, TURN, polish & demo | 🟡 **partly built** |
 
 Phase 7's *observability* slice was pulled forward and reshaped during Phases 5–6:
 the planned `/debug` page shipped as the arbiter's `/api` surface plus a static
-GitHub Pages frontend (`web/`, `deploy/`, `.github/workflows/pages.yml`). The rest
-of Phase 7 — simulcast/SVC and TURN/coturn — was **not** built.
+GitHub Pages frontend (`web/`, `deploy/`, `.github/workflows/pages.yml`).
+
+**What of the rest is built, item by item — the honest split:**
+
+| Phase 7 item | Status |
+|---|---|
+| Quality layers: multi-rung publish + per-child selection | ✅ built. **Not** RFC 8853 simulcast — pion v4 writes no MID/RID header extension on the send path, so an origin publishes N ordinary tracks instead. Rejection recorded in `docs/DESIGN.md` §5.14. |
+| Adaptive per-edge layer selection | ✅ built (`media.selectLayer`, pure + hysteresis). Loss-driven; no bandwidth estimate. |
+| SVC | ⬜ not built. |
+| TURN relay + ICE plumbing | ✅ built (`cmd/turn`, on `pion/turn/v5` — not coturn; coturn stays in `deploy/` as the deployment story). |
+| NAT class measured, not declared | ✅ built (`media.relayedPath`). A **behavioural** classification — "this peer's media paths are relayed" — not NAT-type discovery. `-nat` survives as an override. |
+| Demo script | ⬜ not built. |
+
+**Two Phase 7 claims are NOT proven live, and the docs must keep saying so:**
+the TURN path has never carried media with the direct path blocked
+(`docs/verify-turn.md` is a *proposed* recipe), and the layer **downgrade** has
+never been observed — only the upstream half (three rungs reaching a relay, a
+clean child recording the top rung). Both recipes need root.
 
 Update this table and the `docs/` files as each phase lands — they are **living**.
 
@@ -72,16 +88,24 @@ Update this table and the `docs/` files as each phase lands — they are **livin
 ## Commands
 - `make run-server` · `make run-peer` · `make test` (race)
 - `make check` = `fmt` + `vet` + `check-determinism` + `test -race` — the gate
+  - ⚠️ **The `-race` gate is ~97% green per run, not 100%.** `internal/media`
+    trips a race **inside pion** — two pion goroutines on one SRTP stream, no
+    conclave frame on either side — in ~2 of 61 package runs on the pinned
+    v4.2.16. There is no setting that disables it and no upstream fix yet. A
+    single red `-race` run is not automatically your change; diff the stack
+    against `docs/DESIGN.md` §8.6 before you go looking. Anything with a
+    conclave frame in it **is** ours.
 - `make check-determinism` — fails if `overlay`/`simnet`/`coordinator`/`arbiter`
   reach for the wall clock instead of the injected `clock.Clock`
-- `make build` → `./bin/{server,peer}` · `make lint` (golangci-lint if installed, else vet)
+- `make build` → `./bin/{server,peer,turn}` · `make lint` (golangci-lint if installed, else vet)
 - `make cover` · `make fmt` · `make vet` · `make tidy` · `make clean`
 - Pass flags: `make run-server ARGS="-addr :9000 -log-format json"`
 
 ## Conventions (match the existing code)
 - **Package-by-feature** under `internal/` (`signaling`, `overlay`, `metrics`,
   `coordinator`, `media`, `simnet`, `clock`, `policy`, `arbiter`, `dashboard`,
-  `logging`) — not layer-by-type. Entrypoints in `cmd/`. The zero-build static
+  `meetconfig`, `logging`) — not layer-by-type. Entrypoints in `cmd/`
+  (`server`, `peer`, `turn`). The zero-build static
   frontend lives in `web/`; container/proxy files in `deploy/`; CI + Pages in
   `.github/workflows/`.
 - **No globals for dependencies.** Construct at the edge (`main`), inject the
