@@ -332,3 +332,34 @@ func natClass(measured, relayed int) overlay.NATType {
 	}
 	return overlay.NATRelayed
 }
+
+// natMemory holds the last MEASURED direct verdict, so a peer that has demonstrated a
+// direct path is not reclassified the instant the tree takes that edge away. It is not
+// goroutine-safe on its own; Router guards it with mu, exactly as it guards rttStore.
+type natMemory struct {
+	lastDirect time.Time
+	seen       bool
+}
+
+// classify folds one tick's per-edge counts into the class the telemetry frame carries,
+// applying NATDirectMemory. See that constant for why the memory is one-sided.
+func (m *natMemory) classify(measured, relayed int, now time.Time) overlay.NATType {
+	class := natClass(measured, relayed)
+	if class == overlay.NATDirect {
+		// Only a verdict backed by an actual edge is evidence. measured == 0 reaches
+		// here as natClass's fail-safe, and remembering that would let a peer with no
+		// edges refresh its memory forever.
+		if measured > 0 {
+			m.lastDirect, m.seen = now, true
+		}
+		return overlay.NATDirect
+	}
+	if m.seen && now.Sub(m.lastDirect) <= NATDirectMemory {
+		return overlay.NATDirect
+	}
+	// Past the horizon the memory is not merely ignored, it is dropped: leaving it set
+	// would make every later comparison a subtraction against a timestamp that can only
+	// get older, which is the same answer at more cost.
+	m.seen = false
+	return overlay.NATRelayed
+}

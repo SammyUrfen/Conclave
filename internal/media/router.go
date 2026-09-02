@@ -187,6 +187,10 @@ type Router struct {
 	// no longer has an edge to (see RTTMemory). Under mu because LinkStats runs on
 	// the metrics reporter's goroutine while Run mutates the peer map.
 	rtt rttStore
+	// nat remembers this peer's last MEASURED direct verdict (see NATDirectMemory).
+	// Under mu for the same reason rtt is: LinkStats runs on the metrics reporter's
+	// goroutine.
+	nat natMemory
 	// name↔id maps translate between the stable topology names and the runtime ids
 	// the server assigns. Filled from the joined roster + peer-joined/peer-left, so
 	// every tree decision is made in names and resolved to an id here.
@@ -1297,11 +1301,12 @@ func (r *Router) Realized() (parent string, parentState string, children []metri
 // one wire field serves both. That mismatch predates this sensor and is recorded in
 // docs/DESIGN.md §8.1 rather than papered over here.
 //
-// THE NAT CLASS IS NOT REMEMBERED, unlike the RTT. Its question is about the paths
-// this node holds RIGHT NOW ("can I still reach anyone directly"), so a closed edge
-// has nothing to contribute and a remembered verdict would keep a peer classified
-// against a relay it no longer uses. See relayedPath for what the class does and does
-// not claim, and natClass for what an unmeasured peer reports.
+// THE NAT CLASS IS REMEMBERED IN ONE DIRECTION ONLY. A measured DIRECT verdict stands
+// for NATDirectMemory after the edge that produced it closes, because the control
+// plane's own reaction to a relayed verdict — forced leaf, no children — destroys the
+// evidence that could clear it. A relayed verdict is never remembered. See
+// NATDirectMemory for the trajectory that forced this, relayedPath for what the class
+// does and does not claim, and natClass for what an unmeasured peer reports.
 //
 // Meaningful in tree mode only; a full-mesh Router has no overlay position to report.
 func (r *Router) LinkStats() (peerRTT []metrics.PeerRTT, lossPct float64, nat overlay.NATType) {
@@ -1381,13 +1386,14 @@ func (r *Router) linkStatsFrom(reports []edgeReport) (peerRTT []metrics.PeerRTT,
 		r.rtt.record(m.name, m.ms, now)
 	}
 	peerRTT = r.rtt.snapshot(now)
+	nat = r.nat.classify(natMeasured, natRelayed, now)
 	r.mu.Unlock()
 
 	lossPct = 0
 	if r.fwd != nil {
 		lossPct = r.fwd.loss.worstPct()
 	}
-	return peerRTT, lossPct, natClass(natMeasured, natRelayed)
+	return peerRTT, lossPct, nat
 }
 
 // Fence returns a snapshot of this peer's authority state, for the host to report to
