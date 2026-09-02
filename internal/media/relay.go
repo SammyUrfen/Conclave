@@ -219,11 +219,47 @@ func (f *forwarder) ensureSource(src string) *forwardSource {
 func (s *forwardSource) ensureLayer(id string) (l *forwardLayer, topChanged bool) {
 	l = s.layers[id]
 	if l == nil {
+		s.dropOtherShape(id)
 		l = &forwardLayer{genSSRC: make(map[uint64]uint32)}
 		s.layers[id] = l
 		topChanged = s.retop()
 	}
 	return l, topChanged
+}
+
+// dropOtherShape enforces layers.go's wire contract — a source publishes EITHER one
+// unnamed layer OR several named rungs, never a mixture — at the one place the
+// mixture can appear.
+//
+// It appears on a RE-PARENT that changes the ladder's SHAPE. A source is keyed by its
+// ORIGIN, so the same origin arrives as `video.q/.h/.f` while it is our own
+// neighbour and as ONE `fwd-<origin>` once our new parent is a relay forwarding what
+// IT selected. Without this, commitSwitch leaves the three named rungs ARMED for a
+// reader that will never appear, retop still ranks `f` above the unnamed layer, and
+// every leg goes on resolving to a rung nothing sends — a permanently black subtree
+// with no error on any path, because the source, the upstream and the reader loop
+// are all present and correct.
+//
+// Legs are returned to AUTO rather than repointed: every rung any of them could have
+// chosen has just gone, and the hysteresis state was evidence about a ladder that no
+// longer exists. The SPLICE is the caller's — retop necessarily reports a move here
+// (the two shapes' ranks are disjoint), so newUpstreamGen charges each leg exactly
+// one discontinuity. Caller holds f.mu.
+func (s *forwardSource) dropOtherShape(id string) {
+	named := layerRank(id) >= 0
+	dropped := false
+	for cur := range s.layers {
+		if (layerRank(cur) >= 0) != named {
+			delete(s.layers, cur)
+			dropped = true
+		}
+	}
+	if !dropped {
+		return
+	}
+	for _, o := range s.outs {
+		o.layer, o.sel = "", layerChoice{}
+	}
 }
 
 // retop recomputes the highest-ranked layer this source publishes and reports
