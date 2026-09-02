@@ -282,10 +282,16 @@ func relayedPath(report webrtc.StatsReport) (relayed, ok bool) {
 	// gives no guarantee the candidate was seen first. The report is a handful of
 	// entries; the expensive part is PeerConnection.GetStats, which the caller already
 	// paid for and shares with selectedPairRTTMs.
-	candidates := make(map[string]webrtc.ICECandidateType, len(report))
+	// LOCAL candidates only. ICECandidateStats carries both sides and they are
+	// distinguished by Type, not by the Go type — so indexing them together lets a
+	// REMOTE entry answer a LocalCandidateID lookup and classify this peer from its
+	// neighbour's candidate. pion's ids are agent-unique today, which makes this
+	// hardening rather than a live bug; the id space is a library detail and the
+	// failure would be silent (a healthy relay forced to a leaf, permanently).
+	local := make(map[string]webrtc.ICECandidateType, len(report))
 	for _, s := range report {
-		if c, isCand := s.(webrtc.ICECandidateStats); isCand {
-			candidates[c.ID] = c.CandidateType
+		if c, isCand := s.(webrtc.ICECandidateStats); isCand && c.Type == webrtc.StatsTypeLocalCandidate {
+			local[c.ID] = c.CandidateType
 		}
 	}
 
@@ -294,7 +300,7 @@ func relayedPath(report webrtc.StatsReport) (relayed, ok bool) {
 		if !isPair || !pair.Nominated || pair.State != webrtc.StatsICECandidatePairStateSucceeded {
 			continue
 		}
-		kind, found := candidates[pair.LocalCandidateID]
+		kind, found := local[pair.LocalCandidateID]
 		if !found {
 			continue
 		}
