@@ -42,16 +42,54 @@ The obvious rule — "drop everything from peer A's port range" — kills A's tr
 TURN server too. A then has no path at all, the call fails, and the run proves nothing
 except that dropping all of a peer's UDP breaks it.
 
-The rule must match **both** `sport` and `dport` against the two peers' ranges, so it
-describes the A↔B *pair* and leaves A↔TURN and TURN↔B untouched:
+So the rule must match **both** `sport` and `dport`, describing a *pair* of endpoints
+rather than an endpoint, and leave A↔TURN and TURN↔B untouched.
 
-| Flow | sport | dport | Matched? |
+**But naming only the two peers' MEDIA ranges is not enough, and that omission voids the
+run.** Blocking host↔host leaves `A_host ↔ B_relay` alive — a valid pair, and one that
+ICE prefers over `A_relay ↔ B_relay`. RFC 8445 §5.1.2.1 gives a host candidate priority
+`126·2²⁴ = 2 113 929 216` and a relay candidate `0·2²⁴ + 65535·2⁸ + 255 = 16 777 215`;
+§6.1.2.3 makes a pair worth `2³²·MIN(G,D) + 2·MAX(G,D) + (G>D ? 1 : 0)`:
+
+| Pair | MIN | MAX | priority |
 |---|---|---|---|
-| A → B direct | 47000-47019 | 47100-47119 | **dropped** |
-| B → A direct | 47100-47119 | 47000-47019 | **dropped** |
-| A → TURN | 47000-47019 | 3478 | passes |
-| TURN relay → B | 49160-49200 | 47100-47119 | passes |
-| B → TURN | 47100-47119 | 3478 | passes |
+| `A_host ↔ B_relay` | 16 777 215 (the relay end) | 2 113 929 216 | `2³²·1.678e7 + 4.23e9` |
+| `A_relay ↔ B_relay` | 16 777 215 | 16 777 215 | `2³²·1.678e7 + 3.36e7` |
+
+The `MIN` term ties — both pairs take their minimum from the *same* relay candidate — so
+`2·MAX` decides, and host↔relay wins by ~4.2e9. (If the two relay candidates' local
+preferences differ, relay↔relay's `MIN` can only be *lower*, never higher, so the
+conclusion does not depend on the tie.) ICE would nominate host↔relay, only ONE end
+would hold a relay-typed LOCAL candidate, and `nat: "turn"` for BOTH peers — the stated
+expectation of Phase B, and the precondition of Phase C — would be unreachable.
+
+**The mixed pairs must be dropped too.** Dropping `sport <peer range> → dport <relay
+range>` is safe in both directions, and safe for exactly one reason: **a peer never sends
+to a relay PORT when using its own allocation.** That traffic goes to the server's
+`:3478` as a Send indication or ChannelData, and the server delivers relayed data back to
+its client FROM `:3478`. The relay ports appear as a *source* on the wire (the server
+emitting an allocation's traffic outward) and as a *destination* only when someone is
+addressing the far end's allocation directly — which is precisely the pair being removed.
+
+Every flow the run produces, with nothing omitted:
+
+| # | Flow | sport | dport | Matched? |
+|---|---|---|---|---|
+| 1 | A → B direct (`A_host ↔ B_host`) | 47000-47019 | 47100-47119 | **dropped** |
+| 2 | B → A direct | 47100-47119 | 47000-47019 | **dropped** |
+| 3 | A → B's allocation (`A_host ↔ B_relay`) | 47000-47019 | 49160-49200 | **dropped** |
+| 4 | B → A's allocation (`B_host ↔ A_relay`) | 47100-47119 | 49160-49200 | **dropped** |
+| 5 | A → TURN (its own allocation) | 47000-47019 | 3478 | passes |
+| 6 | B → TURN | 47100-47119 | 3478 | passes |
+| 7 | TURN → A (relayed data to its client) | 3478 | 47000-47019 | passes |
+| 8 | TURN → B | 3478 | 47100-47119 | passes |
+| 9 | A's allocation → B's allocation — **the path under test** | 49160-49200 | 49160-49200 | passes |
+| 10 | A's allocation → B host (`A_relay ↔ B_host`) | 49160-49200 | 47100-47119 | passes out… |
+
+Flow 10 is the one that looks like a hole and is not. Rows 3 and 4 are the *return legs*
+of the two mixed pairs: A's check reaches B over flow 10, B's response is flow 4 and is
+dropped, so the pair never succeeds from either end. Killing the return leg is enough,
+and it is what keeps the rule set to four lines instead of six.
 
 ## Address and port plan
 
@@ -135,10 +173,16 @@ table inet conclave {
     udp sport 47000-47019 udp dport 47100-47119 counter drop
     # B -> A direct.
     udp sport 47100-47119 udp dport 47000-47019 counter drop
+    # A -> B's relay allocation, and B -> A's. Without these two ICE nominates
+    # host<->relay, which OUTRANKS relay<->relay (see the priority table above), and
+    # only one end ends up relay-typed. Safe because a peer addresses its OWN
+    # allocation at :3478, never at a relay port.
+    udp sport 47000-47019 udp dport 49160-49200 counter drop
+    udp sport 47100-47119 udp dport 49160-49200 counter drop
   }
 }
 EOF
-nft list table inet conclave      # confirm both rules, counters at 0
+nft list table inet conclave      # confirm all four rules, counters at 0
 
 ./bin/peer -call -managed -server http://10.99.0.1:9000 -room $MEET -name alpha \
   $TURNARGS -media-ports 47000-47019 -send -media testdata/sample.ivf \
@@ -157,7 +201,9 @@ sleep 25
 #    attempted, and the whole run is void — it would prove TURN works when nothing
 #    was blocked.
 nft list table inet conclave | grep counter
-# EXPECT: non-zero packets on both rules.
+# EXPECT: non-zero packets on the two host<->host rules AND on at least one of the
+# host<->relay rules. A zero on rows 3/4 means ICE never tried the pair that would
+# have out-prioritised the relayed one, which is worth knowing but is not a failure.
 
 # 2. The classification flipped. This is the feature.
 curl -sS http://10.99.0.1:9000/api/meets/$MEET | python3 -m json.tool | grep -E '"name"|"nat"'
