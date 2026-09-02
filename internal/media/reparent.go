@@ -344,7 +344,20 @@ func (r *Router) startReparent(ctx context.Context, oldParent, newParent string,
 		no := false
 		opts.offerer = &no
 	}
-	r.startPeerOpt(ctx, peerID, opts)
+	// A role override is silently dropped when a session to this peer is already
+	// open (startPeerOpt is idempotent per peer), and on a backup edge that means we
+	// keep whatever role the TREE gave the edge while asking the far end to offer.
+	// Under a Validate-clean tree it cannot happen — a backup is never already a
+	// neighbour — but applyTopology does not call Validate (§8.6). The move is not
+	// abandoned here: ReparentConnectTimeout and ReparentMediaTimeout still own the
+	// outcome, exactly as they do for a refused or lost promote. It is logged because
+	// a promotion that kept the wrong role fails in a completely different way from
+	// one that took, and nothing else in the log tells the two apart.
+	if !r.startPeerOpt(ctx, peerID, opts) && viaBackup {
+		r.log.Warn("promoting onto a peer we already hold a session to: no session was created, "+
+			"so the backup edge's answerer role was not applied",
+			slog.String("new_parent", newParent), slog.Bool("wanted_offerer", false))
+	}
 	if viaBackup {
 		// AFTER the session exists, so the parent's offer has an inbox to land in —
 		// deliver() would otherwise drop it as a frame for an unknown peer, and the
