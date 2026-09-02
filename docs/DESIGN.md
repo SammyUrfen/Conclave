@@ -1850,7 +1850,7 @@ populates all of them:
 |---|---|
 | `Name`, `Coordinatable` | flags |
 | `UploadKbps` | **`-upload-kbps` flag** (default 3000). No bandwidth probe exists. |
-| `NAT` | **The nominated ICE candidate pair's LOCAL candidate type** (`media.relayedPath`), folded across every live edge by `media.natClass`. `-nat direct\|turn` still FORCES a value; the default is now `auto`. |
+| `NAT` | **The nominated ICE candidate pair's LOCAL candidate type** (`media.relayedPath`), folded across every live edge by `media.natClass`, with a measured *direct* verdict remembered for `media.NATDirectMemory`. `-nat direct\|turn` still FORCES a value; the default is now `auto`. |
 | `CPUPct` | **`/proc/stat` deltas** (`metrics.CPUSampler`). Host-wide busy %, Linux only; reports nothing elsewhere. |
 | `RTTServerMs` | **WebSocket protocol ping** to the arbiter (`metrics.RTTProbe` → `signaling.Client.Ping`). |
 | `LossPct` | **RTCP receiver reports** from downstream children, worst leg (`media.lossTracker`). |
@@ -1942,6 +1942,44 @@ direct neighbour and four relayed ones stays eligible and may be given children 
 only reach over TURN. That is the conservative direction; the tree still works, it is
 merely more expensive.
 
+**A measured direct verdict is REMEMBERED for two minutes, because the verdict was
+otherwise a one-way latch that closes on its own.** This is the correction an adversarial
+review forced, and it is worth stating as a trajectory rather than as a rule, because the
+arithmetic is correct at every single step. `BuildTree` and `Validate` deny a `NATRelayed`
+node children. Take peer P, CGNAT-bound upstream but holding a child C on its own LAN:
+
+| step | P's edges | `natClass` | consequence |
+|---|---|---|---|
+| 1 | `{parent A: relayed, child C: host}` | `natClass(2,1)` → `NATDirect` | eligible, correctly |
+| 2 | a rebuild re-parents C away → `{A: relayed}` | `natClass(1,1)` → `NATRelayed` | forced leaf |
+| 3 | a forced leaf is never given a child | only edge is the relayed uplink | `NATRelayed` **forever** |
+
+P can never regain the edge that *proved* it was direct; the tree's reaction to the
+verdict destroyed the only evidence that could clear it. Both of the `TestNATClass` rows
+covering steps 1 and 2 were green, because they test the arithmetic and not the
+trajectory. `media.RTTMemory`'s doc comment argues verbatim this structure for the RTT
+sensor — "no challenger could ever win" — and the cure is the same: `NATDirectMemory`
+(2 min, the same horizon and the same justification) keeps a measured direct verdict
+alive after the edge that produced it closes.
+
+The memory is **one-sided on purpose**, and that asymmetry is what makes it safe. A
+relayed verdict is never remembered: latching toward `NATRelayed` is the harm (forced
+leaf, disqualified as coordinator, no path back), while latching toward `NATDirect`
+merely *delays* a demotion and its correction path is immediate — the first measurement
+past the horizon reclassifies the peer with no further evidence needed. An unmeasured
+tick does not refresh it either, because `natClass`'s permissive answer for a peer with
+no edges is an absence of data, not a direct path; treating it as one would restore the
+latch by another route. `TestNATVerdictSurvivesLosingItsOnlyDirectEdge` walks the three
+steps above; `TestNATDirectMemoryExpires`, `TestNATRelayedIsNeverRemembered` and
+`TestNATNoEdgesDoesNotRefreshTheMemory` pin the three ways the fix could over-reach.
+
+What the memory does **not** fix, stated because it is structural: a peer that goes
+genuinely TURN-bound stays eligible for up to two minutes and may be handed children it
+can only reach over a relay during that window. That is the conservative direction — the
+same one `NATRelayedThreshold` already chooses — but it is a real window, not zero. And
+a peer that has never had a direct edge has nothing to remember, so first attachment is
+unchanged.
+
 **It fails safe on absence, and the chicken-and-egg is the same one `RTTMemory` already
 records.** The class is only observable AFTER a PeerConnection exists, so a peer that
 has just joined is unclassified — "first attachment is RTT-blind", now also
@@ -1964,6 +2002,17 @@ pion/webrtc depends on it for the ICE *client* — and `-turn`/`-turn-user`/`-tu
 on the peer. coturn remains the deployment answer and is in `deploy/docker-compose.yml`
 behind an opt-in profile; nothing in the test path touches it. A relay nobody can start
 is a relay nobody verifies.
+
+`cmd/turn` **denies the private ranges by default** (`-denied-peers`, the same set
+compose gives coturn plus multicast), because a relay that will forward into the LAN or
+loopback it sits in is a pivot into that network and that is not a state anybody should
+reach by omission — the argument `-users` already makes about anonymous allocations. The
+tension is real and is resolved in the open rather than by weakening the default:
+`docs/verify-turn.md` runs inside a netns on `10.99.0.0/24`, which the default denies, so
+the recipe passes an explicit narrowed list and a test reads the document to prove the two
+have not drifted apart (`TestVerifyTurnDeniedPeersAdmitsTheNamespace`). A refused
+permission is logged at warn, because otherwise a safe default is indistinguishable from
+a broken server: ICE simply never completes.
 
 What is still **declared rather than measured**: `UploadKbps`, alone. Phase 7 closes
 **one** of the two declared fields, not both. A real bandwidth probe means saturating
@@ -2093,7 +2142,13 @@ boundary — it stops a confused peer, not a lying one.
   What has NOT been run is the two together: a real ICE negotiation nominating a relay
   pair with the direct path blocked, and the classification flipping as a result. The
   command sequence believed to prove it is written down in `docs/verify-turn.md` and is
-  marked as proposed, not as evidence.
+  marked as proposed, not as evidence. That recipe's own firewall rules were WRONG on
+  first writing — they blocked host↔host only, leaving the `host↔relay` pair alive, and
+  by RFC 8445 §6.1.2.3 that pair *outranks* `relay↔relay` (`2·MAX` is a host priority,
+  ~2.1e9, against a relay's ~1.7e7). ICE would have nominated it, only one end would have
+  held a relay-typed local candidate, and the run's stated expectation — `turn` for BOTH
+  peers — was unreachable. The rules and the flow table are corrected; the point worth
+  keeping is that an unexecuted recipe is not evidence about anything, including itself.
 
 ### 8.8 Naming and surface honesty
 
