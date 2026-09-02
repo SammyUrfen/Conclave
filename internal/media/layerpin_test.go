@@ -205,3 +205,117 @@ func TestRelayEdgeRecvSlots(t *testing.T) {
 		})
 	}
 }
+
+// TestRelayChildIsPinnedFromBothCallSites closes the gap between "the forwarder can
+// pin a leg" and "the Router ever asks it to".
+//
+// TestPinnedLegNeverSelects exercises addOutPinned directly, so it stays green even
+// when NOTHING calls it — which is the §7.5 shape exactly: a correct unit that was
+// never wired up, invisible to the whole suite. There are two call sites, one per
+// path a leg is born on, and each has to be asserted.
+//
+// The assertion is BEHAVIOURAL — sustained loss on the leg leaves it on the top rung
+// — rather than on forwardOut.pinned, so it also catches a pin that is recorded and
+// then ignored.
+//
+// MUTATION CAUGHT (setupRelayEdge arm): `childIsRelay := false`, i.e. the
+// before-Start path never pins. MUTATION CAUGHT (addLegLive arm): dropping the
+// topo.IsRelay branch and always calling addOutLive, i.e. the mid-call path never
+// pins. Both survive the entire suite as it stands: a congested intermediate relay
+// is walked down to `q` and its whole subtree — including peers on perfect links —
+// is capped there, because it can only forward what it receives.
+func TestRelayChildIsPinnedFromBothCallSites(t *testing.T) {
+	// leaf-b originates; relay forwards it to sub-relay (a relay) and to leaf-d.
+	topo := &overlay.Topology{Edges: []overlay.Edge{
+		{Parent: "relay", Child: "leaf-b"},
+		{Parent: "relay", Child: "sub-relay"},
+		{Parent: "sub-relay", Child: "leaf-e"},
+		{Parent: "relay", Child: "leaf-d"},
+	}}
+	if !topo.IsRelay("sub-relay") || topo.IsRelay("leaf-d") {
+		t.Fatalf("fixture is wrong: IsRelay(sub-relay)=%v IsRelay(leaf-d)=%v",
+			topo.IsRelay("sub-relay"), topo.IsRelay("leaf-d"))
+	}
+
+	newRouter := func(s *Session) *Router {
+		r := &Router{
+			log:      discardLog(),
+			selfName: "relay",
+			topo:     topo,
+			fwd:      newForwarder(discardLog(), &uploadMeter{}, func(func()) {}, newFakeClock()),
+			peers:    map[string]*peerLink{"id-sub": {session: s}, "id-d": {session: s}},
+			idByName: map[string]string{"sub-relay": "id-sub", "leaf-d": "id-d"},
+		}
+		// A three-rung source, so "pinned" and "not pinned" have different answers.
+		r.fwd.setUpstream("leaf-b", &captureRTCP{})
+		for _, id := range layerLadder {
+			r.fwd.learnSSRC("leaf-b", id, r.fwd.newUpstreamGen("leaf-b", id), ssrcQ)
+		}
+		return r
+	}
+
+	// A leg that ends up on `f` after sustained loss was pinned; one on `q` was not.
+	drive := func(t *testing.T, f *forwarder, child string) string {
+		t.Helper()
+		f.loss.observe(child, 0.9)
+		for i := 0; i < layerDownRounds*len(layerLadder)*2; i++ {
+			f.reviewLayer("leaf-b", child)
+		}
+		return f.legLayer("leaf-b", child)
+	}
+
+	t.Run("setupRelayEdge, before Start", func(t *testing.T) {
+		_, aTr := newGatedPair("b", "a")
+		offerer := true
+		s, err := NewSession(SessionConfig{
+			Log: discardLog(), SelfID: "a", PeerID: "b", Transport: aTr, Offerer: &offerer,
+		})
+		if err != nil {
+			t.Fatalf("new session: %v", err)
+		}
+		defer s.Close()
+		r := newRouter(s)
+
+		r.setupRelayEdge(s, topo, "sub-relay")
+		r.setupRelayEdge(s, topo, "leaf-d")
+
+		if got := drive(t, r.fwd, "sub-relay"); got != "f" {
+			t.Errorf("the leg toward a child RELAY fell to %q under loss, want the top rung "+
+				"%q — a relay can only forward what it receives, so walking it down caps "+
+				"its whole subtree", got, "f")
+		}
+		if got := drive(t, r.fwd, "leaf-d"); got == "f" {
+			t.Errorf("the leg toward a LEAF stayed on %q under sustained loss; the control arm "+
+				"must move, or the test above proves nothing about pinning", got)
+		}
+	})
+
+	t.Run("addLegLive, mid-call", func(t *testing.T) {
+		_, aTr := newGatedPair("b", "a")
+		offerer := true
+		s, err := NewSession(SessionConfig{
+			Log: discardLog(), SelfID: "a", PeerID: "b", Transport: aTr, Offerer: &offerer,
+		})
+		if err != nil {
+			t.Fatalf("new session: %v", err)
+		}
+		defer s.Close()
+		r := newRouter(s)
+
+		if !r.addLegLive(leg{src: "leaf-b", child: "sub-relay"}) {
+			t.Fatal("addLegLive toward sub-relay reported failure")
+		}
+		if !r.addLegLive(leg{src: "leaf-b", child: "leaf-d"}) {
+			t.Fatal("addLegLive toward leaf-d reported failure")
+		}
+
+		if got := drive(t, r.fwd, "sub-relay"); got != "f" {
+			t.Errorf("a MID-CALL leg toward a child RELAY fell to %q under loss, want %q — "+
+				"the before-Start path pins and this one must too", got, "f")
+		}
+		if got := drive(t, r.fwd, "leaf-d"); got == "f" {
+			t.Errorf("the mid-call leaf leg stayed on %q under sustained loss; the control "+
+				"arm must move", got)
+		}
+	})
+}
