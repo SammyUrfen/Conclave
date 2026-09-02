@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/SammyUrfen/conclave/internal/metrics"
+	"github.com/SammyUrfen/conclave/internal/overlay"
 	"github.com/SammyUrfen/conclave/internal/signaling"
 )
 
@@ -21,8 +22,8 @@ func measured(v float64) func() (float64, bool) { return func() (float64, bool) 
 // "the field was overwritten with the sensor's zero" indistinguishable, so a test
 // built on it passes against the exact mutation it exists to catch.
 func unmeasured() func() (float64, bool) { return func() (float64, bool) { return 999, false } }
-func links(r []metrics.PeerRTT, loss float64) func() ([]metrics.PeerRTT, float64) {
-	return func() ([]metrics.PeerRTT, float64) { return r, loss }
+func links(r []metrics.PeerRTT, loss float64, nat overlay.NATType) func() ([]metrics.PeerRTT, float64, overlay.NATType) {
+	return func() ([]metrics.PeerRTT, float64, overlay.NATType) { return r, loss, nat }
 }
 
 // TestTelemetrySampleFoldsInEverySensor pins that all four live signals reach the
@@ -34,7 +35,7 @@ func TestTelemetrySampleFoldsInEverySensor(t *testing.T) {
 		cfg:   callConfig{name: "relay", uploadKbps: 6000, coordinatable: true},
 		cpu:   measured(73.5),
 		rtt:   measured(18.25),
-		links: links([]metrics.PeerRTT{{Name: "b", RTTMs: 9}, {Name: "a", RTTMs: 3}}, 4.5),
+		links: links([]metrics.PeerRTT{{Name: "b", RTTMs: 9}, {Name: "a", RTTMs: 3}}, 4.5, overlay.NATDirect),
 	}
 	rep := tel.sample()
 
@@ -161,7 +162,7 @@ func TestTelemetryAlwaysMarshals(t *testing.T) {
 				cfg:   callConfig{name: "n"},
 				cpu:   measured(p.val),
 				rtt:   measured(p.val),
-				links: links([]metrics.PeerRTT{{Name: "a", RTTMs: p.val}}, p.val),
+				links: links([]metrics.PeerRTT{{Name: "a", RTTMs: p.val}}, p.val, overlay.NATDirect),
 			}
 			if _, err := json.Marshal(tel.sample()); err != nil {
 				t.Errorf("a %s reading made the report unmarshallable: %v", p.name, err)

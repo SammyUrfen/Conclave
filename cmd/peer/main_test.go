@@ -90,7 +90,7 @@ func wantOptions() options {
 			room:          "default",
 			heartbeat:     metrics.HeartbeatInterval,
 			uploadKbps:    3000,
-			nat:           overlay.NATDirect,
+			nat:           natMeasure,
 			backup:        true,
 			coordinatable: true,
 		},
