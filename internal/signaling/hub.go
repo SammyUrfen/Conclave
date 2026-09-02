@@ -613,7 +613,12 @@ func (h *Hub) readLoop(ctx context.Context, roomID string, c *member) {
 // relayed); every other type is server-originated and rejected if received.
 func (h *Hub) route(roomID string, sender *member, msg Message) {
 	switch msg.Type {
-	case TypeOffer, TypeAnswer, TypeCandidate, TypeTopology:
+	case TypeOffer, TypeAnswer, TypeCandidate, TypeTopology, TypeBackupPromote:
+		// TypeBackupPromote is relayed like a media frame because it IS one: a step in
+		// the offer/answer exchange for an edge the tree does not contain. The server
+		// has no opinion on it — the receiving peer authorizes it against its own
+		// Backups assignment, the same warrant that admits the offer that follows.
+		//
 		// TypeTopology is relayed like a media frame when it comes FROM a peer: that
 		// is an elected coordinator pushing a tree. The Hub deliberately does not
 		// check whether the arbiter actually named that peer coordinator — policing
