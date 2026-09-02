@@ -184,6 +184,15 @@ type Router struct {
 	// cancel to signal, WaitGroup to join, no leaks.
 	wg sync.WaitGroup
 
+	// spawnMu guards spawnClosed AND every wg.Add that spawnTracked makes, which is
+	// the whole point: the gate has to be closed and the join started under one lock,
+	// or an Add can still slip in between the two. Deliberately its own mutex and not
+	// mu — spawnTracked is called from pion callbacks and from the forwarder, and
+	// borrowing the state lock for a shutdown flag would invite a re-entrant deadlock
+	// for nothing.
+	spawnMu     sync.Mutex
+	spawnClosed bool
+
 	mu       sync.Mutex
 	selfID   string
 	selfName string
@@ -312,13 +321,50 @@ func (r *Router) isRelayNow() bool {
 }
 
 // spawnTracked runs fn as a goroutine joined by the Router's WaitGroup, so shutdown
-// waits for it to return. The forwarder uses it for its per-child RTCP drains.
+// waits for it to return. The forwarder uses it for its per-child RTCP drains, and
+// every Session gets it as its Spawn.
+//
+// It is a GATE, not just an Add: once Run has begun its teardown, fn is dropped and
+// no goroutine starts. That is load-bearing, because the callers are not all ours.
+// Session.onNegotiationNeeded runs on pion's operations goroutine, and its failure
+// path (negotiationFailed, armAnswerDeadline) spawns the retry from there —
+// while Session.Close calls pc.Close(), which by pion's own documentation does NOT
+// wait for that queue to drain. So without the gate a retry can call wg.Add(1) after
+// the counter has reached zero and while Run's terminal wg.Wait() is blocked on it:
+// sync.WaitGroup misuse, reported by -race through WaitGroup's &wg.sema annotation
+// and liable to panic outright, and a goroutine that outlives the join either way.
+//
+// (Rejected: switching Session.Close to pion's GracefulClose, which does join the
+// operations queue. It is documented as unsafe to call from inside a PeerConnection
+// callback, and closeAll runs on the Run goroutine that those callbacks feed — so it
+// trades a race for a deadlock. Rejected: a plain atomic flag. Read-then-Add is not
+// atomic against Wait; the whole fix is that the gate and the Add share a lock.)
+//
+// Dropping fn is the right answer for every current caller: each is a retry timer, a
+// renegotiation nudge, or an RTCP drain, and all three are meaningless on a Router
+// whose Run has stopped. Router.pumpOutbound Adds to wg directly rather than through
+// here, and stays correct without the gate, because it is only ever reached from the
+// Run goroutine itself — which is by definition before this gate closes.
 func (r *Router) spawnTracked(fn func()) {
+	r.spawnMu.Lock()
+	if r.spawnClosed {
+		r.spawnMu.Unlock()
+		return
+	}
 	r.wg.Add(1)
+	r.spawnMu.Unlock()
 	go func() {
 		defer r.wg.Done()
 		fn()
 	}()
+}
+
+// stopSpawning closes the spawn gate. After it returns, every wg.Add spawnTracked
+// would have made has already happened, so Run may Wait without racing one.
+func (r *Router) stopSpawning() {
+	r.spawnMu.Lock()
+	r.spawnClosed = true
+	r.spawnMu.Unlock()
 }
 
 // Run consumes the signaling stream until ctx is cancelled or the connection
@@ -336,7 +382,13 @@ func (r *Router) Run(ctx context.Context) error {
 	// its session; then cancel() stops the meter and any pump not tied to a link;
 	// finally wg.Wait() blocks until all of them have actually exited.
 	runCtx, cancel := context.WithCancel(ctx)
-	defer r.wg.Wait()
+	// Closing the spawn gate and joining are ONE defer on purpose: they must happen
+	// in this order, and two separate defers could be reordered by a later edit
+	// without anything failing until a rare shutdown interleaving.
+	defer func() {
+		r.stopSpawning()
+		r.wg.Wait()
+	}()
 	defer cancel()
 	defer r.closeAll()
 

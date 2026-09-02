@@ -312,3 +312,131 @@ func TestNegotiationAnswerTimeoutResends(t *testing.T) {
 
 	assertOneCommittedOffer(t, bTr.offerSDPs())
 }
+
+// TestPionPeeksTheFirstPacketOnItsOwnGoroutineBeforeOnTrack PINS A LIBRARY
+// BEHAVIOUR that this codebase does not control and cannot switch off, because it is
+// one half of a race INSIDE pion that `go test -race ./internal/media/` reports
+// roughly once in twenty package runs. See DESIGN.md §8.6.
+//
+// The race is `pion/srtp/v3.(*ReadStreamSRTP).Read` against itself, on
+// `ReadStreamSRTP.peekedPackets` — an ordinary slice field that `Peek` appends to and
+// `Read` pops from with no lock. pion hands the same read stream to two of its own
+// goroutines, both started by one `PeerConnection.startRTP`:
+//
+//   - `undeclaredRTPMediaProcessor` -> `handleIncomingSSRC`, which claims an SSRC that
+//     arrived before a declared receiver opened it and then probes several packets; and
+//   - `startRTPReceivers` -> `startReceiver`, which spawns the goroutine this test
+//     pins: a `TrackRemote.peek` whose only job is to learn the payload type before
+//     `OnTrack` fires.
+//
+// Neither goroutine is ours and no conclave frame appears in the report. What this
+// test pins is the *existence* of the second one, and the fact that it is what
+// populates `Codec()` — because `SetFireOnTrackBeforeFirstRTP(true)` removes exactly
+// that goroutine, and with it the codec. If a future pion stops peeking (or starts
+// locking the stream), this test fails, and whoever sees it should re-read §8.6 before
+// concluding anything: the mitigation it rules out is turning the flag on, which does
+// not remove the second reader at all, it hands our own forward loop the job instead.
+//
+// Deliberately raw pion, no Session and no Router.
+func TestPionPeeksTheFirstPacketOnItsOwnGoroutineBeforeOnTrack(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		fireEarly bool
+		wantCodec string
+	}{
+		// The shipped configuration. pion peeks first, so the codec is known by the
+		// time we are handed the track — and that peek is a reader on the SRTP stream
+		// that our OnTrack handler has not started yet and cannot see.
+		{name: "default: pion peeks, so OnTrack knows the codec", wantCodec: webrtc.MimeTypeVP8},
+		// The knob that removes the peek goroutine. It also removes the codec, which is
+		// how we know the two are the same thing.
+		{name: "fireOnTrackBeforeFirstRTP: no peek, so no codec", fireEarly: true, wantCodec: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := codecSeenByOnTrack(t, tc.fireEarly); got != tc.wantCodec {
+				t.Fatalf("OnTrack saw codec %q, want %q", got, tc.wantCodec)
+			}
+		})
+	}
+}
+
+// codecSeenByOnTrack connects two raw PeerConnections, pushes VP8 across, and reports
+// the MimeType the receiver's OnTrack handler observed.
+func codecSeenByOnTrack(t *testing.T, fireBeforeFirstRTP bool) string {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	se := webrtc.SettingEngine{}
+	se.SetFireOnTrackBeforeFirstRTP(fireBeforeFirstRTP)
+	me := &webrtc.MediaEngine{}
+	if err := me.RegisterDefaultCodecs(); err != nil {
+		t.Fatalf("register codecs: %v", err)
+	}
+	api := webrtc.NewAPI(webrtc.WithSettingEngine(se), webrtc.WithMediaEngine(me))
+
+	sender, err := api.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatalf("new sender pc: %v", err)
+	}
+	defer func() { _ = sender.Close() }()
+	receiver, err := api.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatalf("new receiver pc: %v", err)
+	}
+	defer func() { _ = receiver.Close() }()
+
+	seen := make(chan string, 1)
+	receiver.OnTrack(func(tr *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		select {
+		case seen <- tr.Codec().MimeType:
+		default:
+		}
+	})
+
+	track, err := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8}, "video", "conclave")
+	if err != nil {
+		t.Fatalf("new local track: %v", err)
+	}
+	if _, err := sender.AddTrack(track); err != nil {
+		t.Fatalf("add track: %v", err)
+	}
+
+	// Non-trickle: gather fully on each side before handing the description over, so
+	// the exchange needs no candidate plumbing and no ordering argument.
+	offer, err := sender.CreateOffer(nil)
+	if err != nil {
+		t.Fatalf("create offer: %v", err)
+	}
+	gathered := webrtc.GatheringCompletePromise(sender)
+	if err := sender.SetLocalDescription(offer); err != nil {
+		t.Fatalf("set local offer: %v", err)
+	}
+	<-gathered
+	if err := receiver.SetRemoteDescription(*sender.LocalDescription()); err != nil {
+		t.Fatalf("set remote offer: %v", err)
+	}
+	answer, err := receiver.CreateAnswer(nil)
+	if err != nil {
+		t.Fatalf("create answer: %v", err)
+	}
+	gathered = webrtc.GatheringCompletePromise(receiver)
+	if err := receiver.SetLocalDescription(answer); err != nil {
+		t.Fatalf("set local answer: %v", err)
+	}
+	<-gathered
+	if err := sender.SetRemoteDescription(*receiver.LocalDescription()); err != nil {
+		t.Fatalf("set remote answer: %v", err)
+	}
+
+	go func() { _ = SendSynthetic(ctx, track, 30) }()
+
+	select {
+	case codec := <-seen:
+		return codec
+	case <-time.After(60 * time.Second):
+		t.Fatal("OnTrack never fired, so nothing was measured")
+		return ""
+	}
+}

@@ -486,8 +486,12 @@ func (f *forwarder) registerOut(src, dst string, track rtpTrack, sender *webrtc.
 	// so its aggregate rate shows the relay uploading O(children)·(source bitrate) —
 	// exactly the cost the elected-SFU concentrates onto the relay so the leaves
 	// stay flat. The gauge drops back when the drain exits (child gone / shutdown).
-	f.meter.addPeer(1)
+	// The gauge is raised INSIDE the spawned drain, not before it. spawn is the
+	// Router's gate and drops the work outright once Run is tearing down, so a +1 out
+	// here would have no -1 to pair with and would leave the meter reading legs that
+	// never ran.
 	f.spawn(func() {
+		f.meter.addPeer(1)
 		defer f.meter.addPeer(-1)
 		f.drainRTCP(src, dst, sender)
 	})
