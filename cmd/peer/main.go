@@ -93,11 +93,17 @@ type options struct {
 // callConfig is the parsed configuration for call mode.
 type callConfig struct {
 	server, room, mediaPath, recordPath, stun string
-	name, topologyPath                        string
-	send                                      bool
-	managed                                   bool
-	uploadKbps                                int
-	nat                                       overlay.NATType
+	// turn, turnUser, turnPass are the TURN relay and its long-term credentials.
+	// All three or none: see parseArgs for why a partial set is fatal.
+	turn, turnUser, turnPass string
+	name, topologyPath       string
+	send                     bool
+	managed                  bool
+	uploadKbps               int
+	// nat is the OVERRIDE for the measured NAT class, not the class itself.
+	// natMeasure (the default) means "let media.Router.LinkStats classify this peer";
+	// NATDirect or NATRelayed pin it to a value the sensor would otherwise measure.
+	nat overlay.NATType
 	// mediaPorts is the UDP range media is confined to; the zero value means
 	// "ephemeral", which is what a peer run without -media-ports gets.
 	mediaPorts [2]uint16
@@ -146,11 +152,15 @@ func parseArgs(args []string) (options, error) {
 	mediaPath := fs.String("media", "", "VP8 IVF file to send; empty sends synthetic frames (call mode; implies -send)")
 	recordPath := fs.String("record", "", "write the first received track to this IVF file; empty just counts (call mode)")
 	stun := fs.String("stun", "", "STUN server URL, e.g. stun:stun.l.google.com:19302 (call mode; empty is fine on one host)")
+	turnURL := fs.String("turn", "", "TURN relay URL, e.g. turn:1.2.3.4:3478; requires -turn-user and -turn-pass (call mode)")
+	turnUser := fs.String("turn-user", "", "TURN username (call mode)")
+	turnPass := fs.String("turn-pass", "", "TURN password (call mode)")
 	name := fs.String("name", "", "stable topology name for this peer, e.g. relay|leaf-b (tree mode)")
 	topology := fs.String("topology", "", "path to a tree topology JSON file; enables static tree mode (empty ⇒ full mesh)")
 	managed := fs.Bool("managed", false, "join a coordinator-managed room: report telemetry and realise the pushed tree (requires -name; no static -topology)")
 	uploadKbps := fs.Int("upload-kbps", 3000, "advertised upload budget for forwarding others' media, kbit/s (managed mode)")
-	natType := fs.String("nat", "direct", "declared NAT class: direct|turn (turn ⇒ forced leaf) (managed mode)")
+	natType := fs.String("nat", "auto",
+		"NAT class: auto measures it from this peer's own ICE candidate pairs; direct|turn FORCE the value the sensor would measure (turn ⇒ forced leaf) (managed mode)")
 	heartbeat := fs.Duration("heartbeat", metrics.HeartbeatInterval,
 		"liveness beat interval; declared on the wire, and what the coordinator computes its degraded/gone thresholds from (tree mode)")
 	backup := fs.Bool("backup", true,
@@ -187,6 +197,9 @@ func parseArgs(args []string) (options, error) {
 		mediaPath:     *mediaPath,
 		recordPath:    *recordPath,
 		stun:          *stun,
+		turn:          *turnURL,
+		turnUser:      *turnUser,
+		turnPass:      *turnPass,
 		name:          *name,
 		topologyPath:  *topology,
 		send:          *send || *mediaPath != "",
@@ -239,6 +252,17 @@ func validate(cfg callConfig, timeout time.Duration) error {
 		return fmt.Errorf("invalid -heartbeat %v: the wire carries whole milliseconds, so anything under 1ms "+
 			"would be sent as 0 and read back as the %v default", cfg.heartbeat, metrics.HeartbeatInterval)
 	}
+	// A PARTIAL TURN credential set is fatal, and this is the failure worth being
+	// loud about. pion accepts a TURN URL with no credentials, fails the allocation
+	// silently, and gathers no relay candidate — so the peer starts, joins, looks
+	// healthy, and simply never connects to the one neighbour it needed the relay
+	// for. Nothing in that symptom points back at the flag. Credentials with no URL
+	// are rejected on the same principle as inertFlags, only harder: they are not
+	// merely unused, they are evidence the operator believes TURN is configured.
+	if turnFlags := boolsSet(cfg.turn != "", cfg.turnUser != "", cfg.turnPass != ""); turnFlags != 0 && turnFlags != 3 {
+		return errors.New("-turn, -turn-user and -turn-pass must be given together: " +
+			"a TURN URL without credentials gathers no relay candidate and fails silently")
+	}
 	// Tree mode has two flavours: a STATIC topology loaded from a file (Phase 3), or
 	// a MANAGED meet where the coordinator computes and pushes the tree (Phase 4+).
 	// Both need a -name so this peer can find itself; fail loud rather than silently
@@ -253,6 +277,19 @@ func validate(cfg callConfig, timeout time.Duration) error {
 		return errors.New("-managed requires -name so the coordinator can place this peer in the tree")
 	}
 	return nil
+}
+
+// boolsSet counts how many of its arguments are true. It exists so an all-or-nothing
+// flag group reads as one comparison rather than as a chain of ORs nobody can check by
+// eye.
+func boolsSet(bs ...bool) int {
+	n := 0
+	for _, b := range bs {
+		if b {
+			n++
+		}
+	}
+	return n
 }
 
 // managedOnlyFlags are the flags whose effect depends on the peer's mode, in a
@@ -299,17 +336,34 @@ func parseFormat(s string) (logging.Format, error) {
 	}
 }
 
-// parseNAT validates the -nat flag into an overlay.NATType, failing loud on an
-// unknown value rather than silently treating a typo as "direct" (which could
-// wrongly make a TURN-bound peer eligible to relay).
+// natMeasure is the -nat sentinel meaning "do not declare a class, measure one".
+//
+// It is the empty NATType because that is the one value overlay never assigns a
+// meaning to, so it cannot be confused with a real class — and because it is
+// unrepresentable on the wire, which is the point: it never travels. sampleReport
+// resolves it before the Report is built, so a peer always sends a real class.
+const natMeasure overlay.NATType = ""
+
+// parseNAT validates the -nat flag, failing loud on an unknown value rather than
+// silently treating a typo as "direct" (which could wrongly make a TURN-bound peer
+// eligible to relay).
+//
+// "auto" is the default and yields natMeasure: since Phase 7 the class is MEASURED
+// from this peer's own nominated ICE candidate pairs (media.relayedPath), so the flag
+// is an override rather than the source. direct|turn are kept, and kept meaning
+// exactly what they meant, because an operator who knows their peer is CGNAT-bound
+// must be able to pin it without waiting for the sensor to agree — and because every
+// harness and document that passes -nat turn must keep working.
 func parseNAT(s string) (overlay.NATType, error) {
 	switch s {
+	case "auto":
+		return natMeasure, nil
 	case "direct":
 		return overlay.NATDirect, nil
 	case "turn":
 		return overlay.NATRelayed, nil
 	default:
-		return "", fmt.Errorf("invalid -nat %q: must be direct or turn", s)
+		return "", fmt.Errorf("invalid -nat %q: must be auto, direct or turn", s)
 	}
 }
 
@@ -339,9 +393,9 @@ type telemetry struct {
 	// rtt reports the last measured round trip to the arbiter
 	// (metrics.RTTProbe.LastMs). nil before the probe is started.
 	rtt func() (float64, bool)
-	// links reports measured pairwise RTT and worst-leg uplink loss
-	// (media.Router.LinkStats). nil until the Router exists.
-	links func() ([]metrics.PeerRTT, float64)
+	// links reports measured pairwise RTT, worst-leg uplink loss and the measured NAT
+	// class (media.Router.LinkStats). nil until the Router exists.
+	links func() ([]metrics.PeerRTT, float64, overlay.NATType)
 }
 
 // sample builds one Report: the declared half from the flags, plus whatever the
@@ -359,7 +413,21 @@ func (t *telemetry) sample() metrics.Report {
 		}
 	}
 	if t.links != nil {
-		rep.PeerRTT, rep.LossPct = t.links()
+		var nat overlay.NATType
+		rep.PeerRTT, rep.LossPct, nat = t.links()
+		// The flag WINS when it was set. Unlike the three float sensors above there is
+		// no (value, ok) to consult — every class the sensor returns is a real one,
+		// including the permissive default it reports before it has measured anything —
+		// so the override is expressed as "only ask the sensor when nothing was
+		// declared", which is what natMeasure means.
+		//
+		// The second half of the condition is the nil-Router case: the closure that
+		// wraps LinkStats reports natMeasure when there is no Router to ask, and
+		// writing that through would blank the field sampleReport just resolved to the
+		// permissive class. Router.LinkStats itself never returns it.
+		if t.cfg.nat == natMeasure && nat != natMeasure {
+			rep.NAT = nat
+		}
 	}
 	// LAST LINE OF DEFENCE, and it is here rather than only in the sensors because
 	// this is where the value becomes a frame. A NaN or an infinity marshals to
@@ -431,15 +499,59 @@ func parseMediaPorts(s string) ([2]uint16, error) {
 }
 
 func sampleReport(cfg callConfig) metrics.Report {
+	// FAIL SAFE ON ABSENCE. A peer whose class is measured rather than declared has
+	// nothing to say until it holds a PeerConnection, and this function runs from the
+	// first telemetry tick onward — before any edge exists, and for probe-mode peers
+	// that will never have one. It must resolve to the PERMISSIVE class: reporting the
+	// empty NATType would drop the field from the frame (nat,omitempty) and reach the
+	// coordinator as neither class, and reporting NATRelayed would demote a peer to a
+	// forced leaf and disqualify it as coordinator on no evidence whatsoever.
+	// media.natClass makes the same choice for the same reason.
+	nat := cfg.nat
+	if nat == natMeasure {
+		nat = overlay.NATDirect
+	}
 	return metrics.Report{
 		Name:       cfg.name,
 		UploadKbps: cfg.uploadKbps,
-		NAT:        cfg.nat,
+		NAT:        nat,
 		// Always emitted, never omitted: absent decodes to false, and a peer that
 		// declines must look different on the wire from one whose build predates the
 		// field. metrics.Report deliberately leaves omitempty off for the same reason.
 		Coordinatable: cfg.coordinatable,
 	}
+}
+
+// natSource renders how this peer's NAT class is being decided, for the startup log.
+// "measured" and a forced class look identical in every later frame, so the one place
+// an operator can tell them apart is here.
+func natSource(declared overlay.NATType) string {
+	if declared == natMeasure {
+		return "measured"
+	}
+	return "forced:" + string(declared)
+}
+
+// iceServersFor builds the ICE server list from the reachability flags. STUN and TURN
+// are independent — a peer may have either, both or neither — and STUN comes first so
+// pion tries the cheap discovery before the expensive allocation.
+//
+// It is a function rather than an inline literal for the same reason routerConfigFor
+// is: the TURN entry is useless without its credentials attached, and that is exactly
+// the field a hand-written literal forgets.
+func iceServersFor(cfg callConfig) []webrtc.ICEServer {
+	var out []webrtc.ICEServer
+	if cfg.stun != "" {
+		out = append(out, webrtc.ICEServer{URLs: []string{cfg.stun}})
+	}
+	if cfg.turn != "" {
+		out = append(out, webrtc.ICEServer{
+			URLs:       []string{cfg.turn},
+			Username:   cfg.turnUser,
+			Credential: cfg.turnPass,
+		})
+	}
+	return out
 }
 
 // routerConfigFor builds the media policy for this peer. It is a function rather
@@ -1232,10 +1344,7 @@ func runCall(ctx context.Context, logger *slog.Logger, cfg callConfig) error {
 	logger.Info("connected to signaling",
 		slog.String("server", cfg.server), slog.String("room", cfg.room), slog.String("name", cfg.name))
 
-	var iceServers []webrtc.ICEServer
-	if cfg.stun != "" {
-		iceServers = append(iceServers, webrtc.ICEServer{URLs: []string{cfg.stun}})
-	}
+	iceServers := iceServersFor(cfg)
 
 	// callCtx bounds this call. Cancelling it — on SIGINT, or when router.Run returns
 	// on its own because the signaling stream closed — also stops the reporter, the
@@ -1279,6 +1388,7 @@ func runCall(ctx context.Context, logger *slog.Logger, cfg callConfig) error {
 	logger.Info("running call",
 		slog.Bool("send", cfg.send), slog.String("media", cfg.mediaPath),
 		slog.String("record", cfg.recordPath), slog.Bool("stun", cfg.stun != ""),
+		slog.Bool("turn", cfg.turn != ""), slog.String("nat", natSource(cfg.nat)),
 		slog.Bool("tree", topo != nil), slog.Bool("managed", cfg.managed),
 		slog.Bool("backup", cfg.backup), slog.Bool("coordinatable", cfg.coordinatable))
 
@@ -1327,9 +1437,11 @@ func runCall(ctx context.Context, logger *slog.Logger, cfg callConfig) error {
 			// Read through the variable, not captured by value: router is assigned
 			// above but LinkStats must be resolved per call anyway, and a nil check
 			// keeps a probe-mode peer from dereferencing one that was never built.
-			links: func() ([]metrics.PeerRTT, float64) {
+			links: func() ([]metrics.PeerRTT, float64, overlay.NATType) {
 				if router == nil {
-					return nil, 0
+					// Not a measurement: the caller falls back to the declared half,
+					// which resolves to the permissive class (see sampleReport).
+					return nil, 0, natMeasure
 				}
 				return router.LinkStats()
 			},

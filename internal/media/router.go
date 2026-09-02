@@ -1297,8 +1297,14 @@ func (r *Router) Realized() (parent string, parentState string, children []metri
 // one wire field serves both. That mismatch predates this sensor and is recorded in
 // docs/DESIGN.md §8.1 rather than papered over here.
 //
+// THE NAT CLASS IS NOT REMEMBERED, unlike the RTT. Its question is about the paths
+// this node holds RIGHT NOW ("can I still reach anyone directly"), so a closed edge
+// has nothing to contribute and a remembered verdict would keep a peer classified
+// against a relay it no longer uses. See relayedPath for what the class does and does
+// not claim, and natClass for what an unmeasured peer reports.
+//
 // Meaningful in tree mode only; a full-mesh Router has no overlay position to report.
-func (r *Router) LinkStats() (peerRTT []metrics.PeerRTT, lossPct float64) {
+func (r *Router) LinkStats() (peerRTT []metrics.PeerRTT, lossPct float64, nat overlay.NATType) {
 	// Snapshot names and sessions together under the one lock, exactly as Realized
 	// does: reading the peer map and the id↔name map separately could observe a peer
 	// mid-teardown and file a measurement under an empty name.
@@ -1325,9 +1331,20 @@ func (r *Router) LinkStats() (peerRTT []metrics.PeerRTT, lossPct float64) {
 		ms   float64
 	}
 	fresh := make([]measured, 0, len(edges))
+	var natMeasured, natRelayed int
 	for _, e := range edges {
-		if ms, ok := selectedPairRTTMs(e.session.stats()); ok {
+		// ONE GetStats per edge, read twice. The report is the expensive thing here —
+		// pion walks every transceiver, transport and certificate to build it — so the
+		// NAT classification rides along on the walk the RTT sensor already pays for.
+		report := e.session.stats()
+		if ms, ok := selectedPairRTTMs(report); ok {
 			fresh = append(fresh, measured{name: e.name, ms: ms})
+		}
+		if relayed, ok := relayedPath(report); ok {
+			natMeasured++
+			if relayed {
+				natRelayed++
+			}
 		}
 	}
 
@@ -1343,7 +1360,7 @@ func (r *Router) LinkStats() (peerRTT []metrics.PeerRTT, lossPct float64) {
 	if r.fwd != nil {
 		lossPct = r.fwd.loss.worstPct()
 	}
-	return peerRTT, lossPct
+	return peerRTT, lossPct, natClass(natMeasured, natRelayed)
 }
 
 // Fence returns a snapshot of this peer's authority state, for the host to report to

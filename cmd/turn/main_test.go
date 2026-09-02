@@ -1,10 +1,13 @@
 package main
 
 import (
+	"log/slog"
 	"reflect"
 	"testing"
 
 	"github.com/pion/turn/v5"
+
+	"github.com/SammyUrfen/conclave/internal/logging"
 )
 
 // wantOptions is the frozen default set for cmd/turn, spelled out in full so that
@@ -12,11 +15,11 @@ import (
 // cmd/peer's wantOptions provides.
 func wantOptions() options {
 	return options{
-		addr:     ":3478",
-		realm:    defaultRealm,
-		users:    map[string]string{},
-		logLevel: "info",
-		format:   "text",
+		addr:   ":3478",
+		realm:  defaultRealm,
+		users:  map[string]string{},
+		level:  slog.LevelInfo,
+		format: logging.FormatText,
 	}
 }
 
