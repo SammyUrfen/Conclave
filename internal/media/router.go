@@ -1008,29 +1008,20 @@ func (r *Router) remoteTrackSink(ctx context.Context, peerID string) func(*webrt
 	}
 }
 
-// deliver routes a media-signaling frame to the session for its sender.
+// deliver routes a media-signaling frame to the session for its sender. A frame for
+// a peer we hold no session to is dropped.
 //
-// One frame legitimately arrives for a peer we hold no session to: the first offer
-// from a child promoting US as its precomputed backup parent. That edge is not in
-// the tree — it exists precisely because the tree is momentarily wrong — so the
-// ordinary neighbour check would drop it and the failover could never complete.
-// Accepting it is gated on the topology naming us as that peer's backup, so it is
-// not an open door.
+// It used to conjure a session for one of them: the first offer from a child
+// promoting US as its precomputed backup parent, back when the promoter offered
+// first. Since the offerer inversion (§5.12) no peer can send that frame — the
+// promoter creates its session as the ANSWERER, and Session.onNegotiationNeeded
+// returns immediately for a non-offerer, so an offer on a backup edge has no
+// producer. The authorized way onto an edge outside the tree is TypeBackupPromote,
+// which asks rather than presents a fait accompli, and it is now the only way.
 func (r *Router) deliver(ctx context.Context, msg signaling.Message) {
 	r.mu.Lock()
 	link := r.peers[msg.From]
 	r.mu.Unlock()
-	if link == nil && msg.Type == signaling.TypeOffer && r.acceptsBackupChild(msg.From) {
-		// A child that offers rather than asking. Since the offerer inversion this is
-		// nothing the shipped promoter does — it asks with TypeBackupPromote and
-		// answers — so the path survives for the case it always covered: an offer we
-		// are authorized to accept and have no session for. Accepting as the ANSWERER
-		// is the only option; the offer is already in flight.
-		r.acceptBackupChild(ctx, msg.From, false)
-		r.mu.Lock()
-		link = r.peers[msg.From]
-		r.mu.Unlock()
-	}
 	if link == nil {
 		r.log.Debug("frame for unknown peer", slog.String("from", msg.From), slog.String("type", string(msg.Type)))
 		return
@@ -1212,7 +1203,7 @@ func (r *Router) onBackupPromote(ctx context.Context, peerID string) {
 			slog.String("peer_id", peerID), slog.String("peer_name", r.nameForID(peerID)))
 		return
 	}
-	if !r.acceptBackupChild(ctx, peerID, true) {
+	if !r.acceptBackupChild(ctx, peerID) {
 		r.log.Warn("refusing a backup promotion: no session was created for this peer, so the "+
 			"offerer role it asks for was not applied",
 			slog.String("peer_id", peerID), slog.String("peer_name", r.nameForID(peerID)),
@@ -1224,7 +1215,8 @@ func (r *Router) onBackupPromote(ctx context.Context, peerID string) {
 }
 
 // acceptBackupChild opens the session for a child that has promoted us as its backup
-// parent, in the given role, and records WHICH failure the edge answers.
+// parent — as the OFFERER, the only role that can publish the forwarded tracks it
+// was promoted to carry — and records WHICH failure the edge answers.
 //
 // That record is the whole reason this is one function rather than two call sites:
 // without it the next unrelated push sees a live neighbour the tree does not name,
@@ -1234,7 +1226,8 @@ func (r *Router) onBackupPromote(ctx context.Context, peerID string) {
 // The caller must have authorized the peer; this does not re-check. It reports
 // whether the session was created with the offerer role — see startPeerOpt for why
 // that answer may be no, and why it may not be swallowed.
-func (r *Router) acceptBackupChild(ctx context.Context, peerID string, offerer bool) bool {
+func (r *Router) acceptBackupChild(ctx context.Context, peerID string) bool {
+	offerer := true
 	created := r.startPeerOpt(ctx, peerID, peerOpts{offerer: &offerer})
 	r.mu.Lock()
 	defer r.mu.Unlock()
