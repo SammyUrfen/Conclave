@@ -552,6 +552,39 @@ func TestReviewLayerDowngradesOnSustainedLoss(t *testing.T) {
 	if got := ssrcs(bad); !equalU32(got, ssrcF, ssrcF, ssrcH) {
 		t.Errorf("the switched leg received SSRCs %#x, want [f f h]", got)
 	}
+
+	// An EMPTY reception report is not a round in EITHER direction.
+	//
+	// MUTATION CAUGHT: `reviewable = true` on any *rtcp.ReceiverReport, rather than
+	// only on one carrying reception blocks. A peer that has received no media yet
+	// sends reports with no blocks at all, so the policy would be clocked by frames
+	// that say nothing — and lossTracker.pctFor answers from the LAST real report,
+	// which for this leg is the 50% that just moved it. Five empty frames would then
+	// walk it to the floor on evidence nobody supplied.
+	empty := []rtcp.Packet{&rtcp.ReceiverReport{}}
+	for i := 0; i < layerUpRounds+layerDownRounds; i++ {
+		f.handleRTCP("S", "bad", empty)
+	}
+	if got := f.legLayer("S", "bad"); got != "h" {
+		t.Errorf("the leg moved to %q on %d EMPTY reception reports, want %q — an empty report "+
+			"carries no evidence and must not be counted as a round",
+			got, layerUpRounds+layerDownRounds, "h")
+	}
+
+	// …and the same for a leg whose child has NEVER reported, where pctFor answers a
+	// clean 0: the other half of the same mutation, and the direction that hurts —
+	// layerUpRounds empty frames would UPGRADE it onto a path nothing has measured.
+	f.addOutLive("S", "quiet", &captureTrack{}, nil)
+	if !f.selectLegLayer("S", "quiet", "q") {
+		t.Fatal("selectLegLayer reported no change moving `quiet` to the bottom rung")
+	}
+	for i := 0; i < layerUpRounds*2; i++ {
+		f.handleRTCP("S", "quiet", empty)
+	}
+	if got := f.legLayer("S", "quiet"); got != "q" {
+		t.Errorf("a leg whose child only ever sent EMPTY reports upgraded to %q, want %q — "+
+			"an upgrade is a bet, and no evidence is not a clean link", got, "q")
+	}
 }
 
 // TestPinnedLegNeverSelects pins the deferral this work item makes deliberately: a

@@ -266,6 +266,24 @@ func TestSelectLayer(t *testing.T) {
 		}
 	})
 
+	t.Run("an EMPTY ladder is not selectable", func(t *testing.T) {
+		// The `len(ladder) < 2` guard is not merely an optimisation for the
+		// single-layer case, and this subtest exists to say so in a form that fails.
+		//
+		// A source has legs from the moment the topology names it and a ladder only
+		// once its tracks arrive, so reviewLayer legitimately runs with an EMPTY one —
+		// see TestReviewLayerSurvivesASourceWithNoTracksYet for that path. With the
+		// guard deleted, indexOf returns -1 and the off-ladder clamp below indexes
+		// ladder[len(ladder)-1] — ladder[-1] — and PANICS on an RTCP-drain goroutine.
+		//
+		// MUTATION CAUGHT: deleting the guard. It panics rather than fails, which is
+		// precisely what it does in production.
+		st := selectLayer(nil, layerChoice{Layer: "f", Bad: 1, Good: 2}, layerObs{LossPct: 50})
+		if st != (layerChoice{Layer: "f", Bad: 1, Good: 2}) {
+			t.Errorf("state = %+v on an empty ladder, want it returned unchanged", st)
+		}
+	})
+
 	t.Run("a one-rung ladder never moves", func(t *testing.T) {
 		// The single-layer source. MUTATION CAUGHT: any index arithmetic that does not
 		// clamp — a single-layer peer is the no-regression case and must be inert.
