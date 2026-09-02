@@ -190,14 +190,21 @@ func TestRelayEdgeRecvSlots(t *testing.T) {
 					sending++
 				}
 			}
+			// This count is what catches "the offerer's slots were added FIRST and
+			// pc.AddTrack ate one": the first forwarded track cannibalises one of the
+			// three, leaving 2 recvonly and one fewer m-line for the neighbour's rungs.
+			// Verified by applying that mutation — it fails HERE, reading 2, want 3.
 			if recvonly != tc.wantRecv {
 				t.Errorf("recvonly video m-lines = %d, want %d", recvonly, tc.wantRecv)
 			}
-			// The forwarded leg must still have a transceiver of its own. This is what
-			// catches "the offerer's slots were added FIRST and pc.AddTrack ate one":
-			// the recvonly count above would still read 3 — two fresh slots plus the
-			// one the forwarded track did not need — while the forwarded leg quietly
-			// lost its m-line and the child received nothing.
+			// The forwarded leg must still have a transceiver of its own — a slot the
+			// answerer arm relies on being consumed, and the offerer arm on NOT being.
+			//
+			// It does NOT discriminate the slots-added-first mutation, despite an
+			// earlier comment here claiming it did: a cannibalised recvonly becomes
+			// SENDRECV, so it is still counted as sending and this reads 1 either way.
+			// The reason was wrong in exactly the way §6.5's Case C describes, which is
+			// how the next person deletes the assertion that is actually load-bearing.
 			if sending != tc.wantSending {
 				t.Errorf("sending video m-lines = %d, want %d (the forwarded leg toward leaf-b)",
 					sending, tc.wantSending)
