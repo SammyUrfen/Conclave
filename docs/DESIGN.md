@@ -2145,6 +2145,93 @@ improvement reads exactly like a fix**. The characterization test that pinned th
 Had that value not been pinned, this would have been a silent partial repair of a defect the
 project did not know it had, with a bound nobody could state.
 
+### 7.7 An eighth, found by the race detector rather than by a review
+
+`go test -race -count=1 ./internal/media/` began failing intermittently once the four Phase 7
+branches were on `main` — **3 hits in 20 package runs**. The report names two frames that have
+nothing to do with each other:
+
+```
+Write at 0x00c000164140 by goroutine 30:
+  runtime.deferreturn()  ...  media.newMeetFixture.func4()  reparent_test.go:117
+
+Previous read at 0x00c000164140 by goroutine 442:
+  media.(*Router).spawnTracked-fm()
+  media.(*Session).negotiationFailed()   session.go:616
+  media.(*Session).negotiate()           session.go:526
+  media.(*Session).onNegotiationNeeded() session.go:494
+  pion/webrtc/v4.(*PeerConnection).negotiationNeededOp()
+  pion/webrtc/v4.(*operations).start()
+```
+
+**The stacks are a red herring; the address is the finding.** Neither side reads a field the
+other writes. `spawnTracked` computes `&r.wg` as `Router+0x138` (it is right there in the
+disassembly, `ADDQ $0x138, AX` before `CALL sync.(*WaitGroup).Add`), and **every** captured
+address — nine of them, across two independent sessions — ends in `0x140`: eight bytes further
+on, at `&r.wg.sema`. That word holds no data anyone reads. It exists so `sync` can hand the
+detector a synthetic conflict: `Add` does `race.Read(&wg.sema)` on the increment that lifts the
+counter off zero, `Wait` does `race.Write(&wg.sema)` for the first waiter, and the comment in
+`waitgroup.go` says why — *"Need to model this as a write to race with the read in Add."*
+
+So the detector was not reporting a torn field. It was reporting the misuse it was purpose-built
+to report: **`r.wg.Add(1)` ran while `Run`'s terminal `r.wg.Wait()` was already blocked on the
+counter.** Same defect, every hit.
+
+**The interleaving, exactly.** A backup promotion arrives, and on the `Run` goroutine
+`onBackupPromote -> acceptBackupChild -> startPeerOpt -> setupRelayEdge -> AddForwardTrack`
+calls `pc.AddTrack`. pion fires negotiation-needed and **enqueues it onto its own operations
+goroutine**. `Run` carries on, the fixture cancels, and teardown runs `closeAll()` — which calls
+`Session.Close`, which calls `pc.Close()`. pion's `Close` is documented as *not* waiting for
+anything it started; only `GracefulClose` joins the operations queue. So that queued op is still
+live when `Run` reaches `defer r.wg.Wait()`. It runs our `onNegotiationNeeded`, `negotiate`
+fails on the closing pc, and `negotiationFailed` schedules its retry through `s.spawn` — which
+is `r.spawnTracked` — which calls `r.wg.Add(1)` on a WaitGroup whose counter has already
+drained to zero with a waiter parked on it.
+
+**It is ours, not pion's, and not new.** pion behaved exactly as documented. The defect is that
+`Router.wg` was Added to from goroutines the Router does not own and does not join, with the
+window closed by nothing but the argument that teardown would get there first. That argument
+predates Phase 7: `spawnTracked` is Phase 3, `negotiationFailed`'s `s.spawn` is Phase 5, and
+`defer r.wg.Wait()` has been in `Run` since Phase 2. Checked out at `686ed7b` — pre-Phase-7
+`main` — the same deterministic assertion fails there too. What Phase 7 added was not the bug
+but a **test that reaches it**: `TestBackupPromotionMakesTheNewParentTheOfferer` tears three
+managed Routers down immediately after a promotion has just called `AddTrack`, so a negotiation
+op is in flight at teardown almost every time.
+
+**The fix, and the two obvious ones that are wrong.** `spawnTracked` is now a gate, not just an
+`Add`: `spawnClosed` and the `wg.Add` live under one small mutex of their own, `Run` closes the
+gate and joins inside a single `defer` so the order cannot be split by a later edit, and a spawn
+that arrives after the gate is dropped. Every caller is a retry timer, a renegotiation nudge, or
+an RTCP drain — all meaningless on a Router whose `Run` has stopped. Rejected: switching
+`Session.Close` to pion's `GracefulClose`, which *does* join the queue — it is documented as
+unsafe from inside a `PeerConnection` callback, and `closeAll` runs on the very goroutine those
+callbacks feed, so it trades a race for a deadlock. Rejected: a plain atomic flag — read-then-Add
+is not atomic against `Wait`, and sharing a lock is the entire point.
+
+**Measured, on this machine, `-race -count=1`:**
+
+| | before | after |
+|---|---|---|
+| whole `internal/media` package | **3/20** hit | **0/20** |
+| `-run TestBackupPromotionMakesTheNewParentTheOfferer` | **6/200** hit | **0/200** |
+
+All nine captures — six narrow, three package-wide, plus the two the owner captured
+independently — carry the identical signature and an address ending `0x140`. This was one
+defect, not a family. It is pinned deterministically, without the detector and without a sleep,
+by `TestSpawnTrackedIsRefusedOnceRunHasReturned`.
+
+**What this did *not* fix** is the second, rarer race the 20-run sweeps also surfaced — one
+that is entirely inside pion and has no conclave frame in either stack. It is recorded in §8.6.
+
+**The lesson.** A `sync.WaitGroup` race report points at `&wg.sema`, and `&wg.sema` is never the
+bug — it is the library telling you *which rule* you broke. Reading the stacks as if they named
+the conflicting memory sends you looking for a shared field, and there isn't one; the offset is
+what identifies the invariant. The second half is plainer: **`wg.Add` and `wg.Wait` need a
+happens-before edge, and "the callback surely cannot still be running" is not one.** Any Add
+reachable from a library's dispatch goroutine needs a gate the joiner closes, because the
+library's `Close` is under no obligation to wait for it.
+
+
 ---
 
 ## 8. Limitations
@@ -2466,6 +2553,32 @@ visibly depends on it.
   orderings** — so this is reasoned-sound and unverified, and it is recorded here in the same
   terms as the entry above rather than presented as tested. (What *is* measured is the
   invariant it protects: exactly one offer per removal, 12/12 runs, with and without `-race`.)
+- **`ReadStreamSRTP.peekedPackets` is raced by two pion goroutines, and there is nothing on
+  our side to enforce.** `go test -race ./internal/media/` reports it in **2 of 61 completed
+  package runs on the pinned pion v4.2.16** (41 runs while diagnosing, plus a 20-run
+  confirmation sweep after the fix that came back clean) — call it ~3%, and no tighter than
+  that: the sample is small and the two hits were not independent of load on the machine. Both stacks
+  are 100% pion — `pion/srtp/v3.(*ReadStreamSRTP).Read`
+  against itself, one side from `PeerConnection.startReceiver -> TrackRemote.peek`, the other
+  from `undeclaredRTPMediaProcessor -> handleIncomingSSRC`. The raced state is
+  `peekedPackets`, a plain slice that `Peek` appends to and `Read` pops from with no lock, and
+  `PeerConnection.startRTP` hands the same stream to both goroutines by construction: it starts
+  `undeclaredMediaProcessor()` and then `startRTPReceivers()`, and whichever reaches the SSRC
+  first decides which of the two owns it. The trigger is early media — RTP arriving for an SSRC
+  before the first `SetRemoteDescription` has declared a receiver for it, which a relay tree
+  produces routinely. **There is no setting that disables it.** `SetFireOnTrackBeforeFirstRTP`
+  removes the `peek` goroutine but not the second reader: `OnTrack` then fires immediately and
+  the forwarder's own read loop takes its place, which converts a pion-vs-pion race into a
+  conclave-vs-pion one and loses the codec in the bargain. Upgrading does not help either —
+  `startRTP`, `undeclaredRTPMediaProcessor` and `srtp`'s `stream_srtp.go` are **byte-identical**
+  in webrtc v4.2.16 through v4.2.19 and srtp v3.0.12 through v3.0.13 (checked; a 20-run sweep on
+  v4.2.19 came back 0/20, which at that sample size is indistinguishable from 2/41 and is not
+  offered as evidence). `TestPionPeeksTheFirstPacketOnItsOwnGoroutineBeforeOnTrack` pins the
+  half of it that is observable from outside. **The consequence is honest and unwelcome: the
+  `-race` gate is ~95% green per run, not 100%,** and closing it needs either an upstream fix
+  (a mutex on `peekedPackets`, or `startRTP` opening declared read streams before starting the
+  undeclared processor) or a data-plane change here that withholds forwarded RTP until the
+  far end has answered — which is precisely what make-before-break exists not to do.
 - **`simnet` still keeps a `modelCoordinator`** for fast property sweeps. It is pinned to the
   real loop by a differential test, and a known asymmetry is documented (the model learns the
   roster at t0; the real loop learns it per `PeerJoined`), but a sweep that runs only against

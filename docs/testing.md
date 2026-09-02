@@ -90,6 +90,28 @@ reason it was not true is the single most useful testing lesson this project pro
 > **first**, which is exactly what makes it invocation-independent. `DESIGN.md` §7.2 tells
 > the whole story, including what it meant for the machinery built on the false claim.
 
+> ### What `-race` actually caught, once
+>
+> The section above is about `-race` as a *confounder*. It is also, once, the only reason a real
+> defect was ever seen: `internal/media` failed **3 times in 20 package runs** with a report whose
+> two stacks shared no field — a `deferreturn` in the fixture's goroutine against
+> `Router.spawnTracked` on pion's operations goroutine. The conflicting address was `&r.wg.sema`,
+> which is not data at all: it is the synthetic word `sync.WaitGroup` reads in `Add` and writes in
+> `Wait` so that "Add concurrent with Wait" becomes a reportable race. Nothing but `-race` reports
+> that; the plain suite was green throughout. `DESIGN.md` §7.7 has the interleaving and the fix.
+>
+> The test that now pins it, `TestSpawnTrackedIsRefusedOnceRunHasReturned`, deliberately does
+> **not** depend on the detector or on a sleep: it lets `Run` return, spawns through the gate, then
+> calls `r.wg.Wait()` — which on the broken code *joins* the goroutine that should never have
+> started, so the assertion is deterministic. A 15%-of-runs defect deserves a 100%-of-runs test.
+>
+> The same sweeps surfaced a **second** race, ~1 package run in 20, which is **not** ours and is
+> **not** fixed: two pion goroutines reading one `srtp.ReadStreamSRTP`, no conclave frame in
+> either stack. `TestPionPeeksTheFirstPacketOnItsOwnGoroutineBeforeOnTrack` pins the observable
+> half; §8.6 has the measurement and why no setting, and no available pion version, removes it.
+> **So the `-race` gate is ~95% green per run rather than 100%**, and that number belongs here
+> rather than in a comment nobody reads after the third retry.
+
 This is also, incidentally, the class of test the determinism rules exist to keep *out* of the
 control plane: `internal/media` is deliberately outside `check-determinism` because it runs
 real pion. A control-plane package with a timing window would have the same failure mode with
