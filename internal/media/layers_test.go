@@ -344,12 +344,30 @@ func TestMediaLayersFromPaths(t *testing.T) {
 
 	// More paths than rungs must be REFUSED at the flag, not silently truncated: a
 	// peer that publishes fewer layers than the operator asked for is a configuration
-	// that reports success and does something else.
-	if err := ValidateMediaPaths(make([]string, len(layerLadder)+1)); err == nil {
-		t.Errorf("validateMediaPaths accepted %d paths for a %d-rung ladder; it must fail loud",
-			len(layerLadder)+1, len(layerLadder))
+	// that reports success and does something else. (mediaLayersFor would in fact
+	// index past the ladder and panic, so this rule is load-bearing, not cosmetic.)
+	//
+	// The paths must be NON-EMPTY. A first version of this passed
+	// make([]string, n+1) — four empty strings — and was satisfied by the empty-path
+	// rule below instead of the length rule it was aimed at, so deleting the length
+	// check entirely left it green. A mutation sweep found it.
+	tooMany := make([]string, len(layerLadder)+1)
+	for i := range tooMany {
+		tooMany[i] = "layer.ivf"
+	}
+	if err := ValidateMediaPaths(tooMany); err == nil {
+		t.Errorf("ValidateMediaPaths accepted %d paths for a %d-rung ladder; it must fail loud",
+			len(tooMany), len(layerLadder))
+	}
+	// An empty entry in a MULTI-layer list is its own refusal: it would publish a
+	// synthetic-frame track as a real quality rung.
+	if err := ValidateMediaPaths([]string{"a", ""}); err == nil {
+		t.Error("ValidateMediaPaths accepted an empty path inside a multi-layer list")
 	}
 	if err := ValidateMediaPaths([]string{"a", "b"}); err != nil {
-		t.Errorf("validateMediaPaths rejected a legal 2-layer config: %v", err)
+		t.Errorf("ValidateMediaPaths rejected a legal 2-layer config: %v", err)
+	}
+	if err := ValidateMediaPaths(nil); err != nil {
+		t.Errorf("ValidateMediaPaths rejected the no-media case: %v", err)
 	}
 }

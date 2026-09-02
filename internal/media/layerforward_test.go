@@ -151,8 +151,12 @@ func TestLayerSwitchDoesNotPerturbTheOtherLeg(t *testing.T) {
 	f.fanout("S", "f", genF, layerPkt(ssrcF, 503, 99000, false))
 
 	// The sibling's series is untouched: no drop, no rebase, no gap.
+	//
+	// FATAL, not an error: the timestamp assertion below indexes this capture, and a
+	// test that PANICS aborts the whole test binary — every test after it in the file
+	// silently never runs, which is a far worse failure than the one being reported.
 	if got := seqs(still); !equalU16(got, 500, 501, 502, 503) {
-		t.Errorf("the untouched leg's sequence = %v, want 500..503 continuous — a layer switch "+
+		t.Fatalf("the untouched leg's sequence = %v, want 500..503 continuous — a layer switch "+
 			"on a sibling must not splice this leg", got)
 	}
 	if got := ssrcs(still); !equalU32(got, ssrcF, ssrcF, ssrcF, ssrcF) {
@@ -334,8 +338,17 @@ func TestPLIThrottleIsPerSourceAndLayer(t *testing.T) {
 //     commit land, and the child sees two interleaved unrelated series.
 //   - dropping the leg's layer check: the genF2 keyframe resumes the leg on f,
 //     and every subsequent q packet is discarded — a child frozen on one frame.
-//   - splicing per LAYER rather than per leg on the commit (an extra rw.Switch()
-//     that consumes a slot): the resuming sequence is 1004 rather than 1003.
+//   - splicing the WRONG legs on the commit: promoting q without splicing this leg
+//     leaves it forwarding genQ2's raw sequence numbers on top of genQ1's series.
+//
+// What it deliberately does NOT claim: that an EXTRA rw.Switch() on the commit is
+// caught. A mutation sweep proved that claim false — Switch is idempotent before a
+// leg resumes, exactly as rewrite.go documents and as TestRTPRewriter's "a second
+// switch before the first resumed keeps dropping" already pins, so splicing twice
+// costs no sequence slot. Splicing once per leg is still the right code (it is the
+// cheaper and more obviously correct statement of the invariant); it is simply not
+// the thing this test discriminates, and a comment claiming otherwise is how the
+// next person deletes the wrong line.
 func TestReparentAndLayerSwitchInterleaved(t *testing.T) {
 	f := newForwarder(discardLog(), &uploadMeter{}, func(func()) {}, newFakeClock())
 	genQ1, genF1 := twoLayerSource(t, f, &captureRTCP{})
@@ -479,12 +492,22 @@ func TestSingleLayerSourceBehavesExactlyAsBefore(t *testing.T) {
 // distinguish, which is the same argument handleRTCP was split out of drainRTCP for.
 func TestReviewLayerDowngradesOnSustainedLoss(t *testing.T) {
 	f := newForwarder(discardLog(), &uploadMeter{}, func(func()) {}, newFakeClock())
-	twoLayerSource(t, f, &captureRTCP{})
+	_, genF := twoLayerSource(t, f, &captureRTCP{})
 	// A THREE-rung source, so "shed one rung" and "drop to the floor" are different
 	// answers and this test discriminates between them too.
-	f.learnSSRC("S", "h", f.newUpstreamGen("S", "h"), ssrcH)
+	genH := f.newUpstreamGen("S", "h")
+	f.learnSSRC("S", "h", genH, ssrcH)
 	f.addOutLive("S", "bad", &captureTrack{}, nil)
 	f.addOutLive("S", "good", &captureTrack{}, nil)
+
+	f.mu.RLock()
+	s := f.sources["S"]
+	f.mu.RUnlock()
+
+	// Both legs are on the top rung and running, so a later drop is measurable as a
+	// discontinuity rather than as a leg that never started.
+	f.fanout("S", "f", genF, layerPkt(ssrcF, 500, 90000, true))
+	f.fanout("S", "f", genF, layerPkt(ssrcF, 501, 93000, false))
 
 	// A reception report is the wire form of "I lost this much of what you sent me".
 	// 128/256 = 50% loss, well past layerDownLossPct.
@@ -500,11 +523,34 @@ func TestReviewLayerDowngradesOnSustainedLoss(t *testing.T) {
 	}
 
 	if got := f.legLayer("S", "bad"); got != "h" {
-		t.Errorf("the lossy child's leg = %q, want %q — %d reception reports above "+
+		t.Fatalf("the lossy child's leg = %q, want %q — %d reception reports above "+
 			"layerDownLossPct must shed a rung", got, "h", layerDownRounds)
 	}
 	if got := f.legLayer("S", "good"); got != "f" {
 		t.Errorf("the clean child's leg = %q, want %q — one child's loss is not the other's", got, "f")
+	}
+
+	// …and the leg was actually SPLICED, not merely relabelled.
+	//
+	// MUTATION CAUGHT: reviewLayer setting o.layer without calling rw.Switch(). The
+	// label above is then perfectly correct and the child's stream is corrupt — the
+	// new encoding's raw sequence numbers are forwarded on top of the old series with
+	// no rebase and no drop-until-keyframe. Asserting the label alone let that pass;
+	// a mutation sweep is what found it.
+	bad := s.outFor("bad").track.(*captureTrack)
+	f.fanout("S", "h", genH, layerPkt(ssrcH, 900, 70000, false))
+	if got := len(bad.snapshot()); got != 2 {
+		t.Fatalf("the switched leg wrote %d packets on an interframe of its new layer, want 2 "+
+			"(the two pre-switch ones only) — a policy-driven switch must arm the same "+
+			"drop-until-keyframe latch a re-parent does", got)
+	}
+	f.fanout("S", "h", genH, layerPkt(ssrcH, 901, 73000, true))
+	if got := seqs(bad); !equalU16(got, 500, 501, 502) {
+		t.Errorf("the switched leg's sequence = %v, want [500 501 502] — continuous across the "+
+			"policy-driven layer switch", got)
+	}
+	if got := ssrcs(bad); !equalU32(got, ssrcF, ssrcF, ssrcH) {
+		t.Errorf("the switched leg received SSRCs %#x, want [f f h]", got)
 	}
 }
 
@@ -527,5 +573,53 @@ func TestPinnedLegNeverSelects(t *testing.T) {
 	}
 	if got := f.legLayer("S", "sub-relay"); got != "f" {
 		t.Errorf("a pinned leg moved to %q, want the top rung %q", got, "f")
+	}
+}
+
+// TestKeyframeForChildAsksTheLegsLayer covers the on-connect keyframe request, which
+// runs when a child's PeerConnection comes up so it gets an I-frame immediately
+// instead of waiting for a natural one.
+//
+// MUTATION CAUGHT: asking for the SOURCE's top rung rather than the LEG's layer. A
+// child that has been downgraded and then reconnects gets a keyframe request sent to
+// an encoder whose output it is not receiving — so it waits out the layer it IS on
+// until that encoder's next natural I-frame. Nothing errors; the child is just black
+// for longer than it should be, on exactly the path that exists to prevent that.
+func TestKeyframeForChildAsksTheLegsLayer(t *testing.T) {
+	f := newForwarder(discardLog(), &uploadMeter{}, func(func()) {}, newFakeClock())
+	up := &captureRTCP{}
+	twoLayerSource(t, f, up)
+	f.addOutLive("S", "C", &captureTrack{}, nil)
+
+	f.selectLegLayer("S", "C", "q") // consumes q's throttle window
+	before := up.count()
+	f.keyframeForChild("C")
+	if got := up.count() - before; got != 0 {
+		t.Fatalf("keyframeForChild emitted %d requests inside q's throttle window, want 0", got)
+	}
+
+	// A leg still on the top rung asks for the top rung. Using a second source keeps
+	// this independent of the first one's throttle state.
+	f.setUpstream("T", up)
+	genT := f.newUpstreamGen("T", "f")
+	f.learnSSRC("T", "f", genT, ssrcF)
+	f.newUpstreamGen("T", "q")
+	f.learnSSRC("T", "q", f.newUpstreamGen("T", "q"), ssrcQ)
+	f.addOutLive("T", "C", &captureTrack{}, nil)
+	f.selectLegLayer("T", "C", "q")
+
+	// The one request keyframeForChild is allowed to make must name q — the layer the
+	// leg is on — and q's window is already spent, so the observable assertion is on
+	// the SOURCE whose leg sits at the top.
+	f.setUpstream("U", up)
+	f.learnSSRC("U", "f", f.newUpstreamGen("U", "f"), ssrcF)
+	f.learnSSRC("U", "q", f.newUpstreamGen("U", "q"), ssrcQ)
+	f.addOutLive("U", "C", &captureTrack{}, nil)
+	before = up.count()
+	f.keyframeForChild("C")
+	got := up.pkts[len(up.pkts)-1].(*rtcp.PictureLossIndication)
+	if up.count() != before+1 || got.MediaSSRC != ssrcF {
+		t.Errorf("keyframeForChild sent %d requests, last MediaSSRC %#x; want 1 naming the top "+
+			"rung %#x (source U's leg was never downgraded)", up.count()-before, got.MediaSSRC, ssrcF)
 	}
 }
