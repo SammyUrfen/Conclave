@@ -423,6 +423,8 @@ func (r *Router) handle(ctx context.Context, msg signaling.Message) {
 		r.surfaceControlFrame(msg)
 	case signaling.TypeOffer, signaling.TypeAnswer, signaling.TypeCandidate:
 		r.deliver(ctx, msg)
+	case signaling.TypeBackupPromote:
+		r.onBackupPromote(ctx, msg.From)
 	case signaling.TypeTopology:
 		r.applyTopology(ctx, msg.From, msg.Payload)
 	case signaling.TypeCoordinator:
@@ -1004,19 +1006,14 @@ func (r *Router) deliver(ctx context.Context, msg signaling.Message) {
 	link := r.peers[msg.From]
 	r.mu.Unlock()
 	if link == nil && msg.Type == signaling.TypeOffer && r.acceptsBackupChild(msg.From) {
-		no := false
-		r.startPeerOpt(ctx, msg.From, peerOpts{offerer: &no})
+		// A child that offers rather than asking. Since the offerer inversion this is
+		// nothing the shipped promoter does — it asks with TypeBackupPromote and
+		// answers — so the path survives for the case it always covered: an offer we
+		// are authorized to accept and have no session for. Accepting as the ANSWERER
+		// is the only option; the offer is already in flight.
+		r.acceptBackupChild(ctx, msg.From, false)
 		r.mu.Lock()
 		link = r.peers[msg.From]
-		if link != nil {
-			// Remember WHICH failure this edge answers. Without it the next
-			// unrelated push sees a live neighbour the tree does not name, calls it
-			// a stranger, and drops the parent this child has only just failed over
-			// to — inside the window failover exists to survive.
-			if topo := r.topo; topo != nil {
-				link.backupFor = topo.ParentOf(r.nameByID[msg.From])
-			}
-		}
 		r.mu.Unlock()
 	}
 	if link == nil {
@@ -1168,6 +1165,59 @@ func (r *Router) acceptsBackupChild(peerID string) bool {
 	name := r.nameByID[peerID]
 	r.mu.Unlock()
 	return name != "" && topo.BackupOf(name) == r.selfName
+}
+
+// onBackupPromote is the other end of a self-promotion: a child whose parent died
+// is asking us, its precomputed backup, to offer.
+//
+// We OFFER because only an offer can add forwarded m-lines (§5.12), and a backup
+// parent that cannot publish the forwarded tracks is a backup parent for nothing.
+// The child has already taken the answerer role, so there is no second offer to
+// collide with — the frame is what makes the two ends agree without the tree, which
+// says nothing about an edge it does not contain.
+//
+// Authorization is acceptsBackupChild, unchanged and unwidened: the same predicate
+// that admits the first offer on this edge admits the request for one. It fails
+// closed, and a refusal is silent to the sender by design — a peer holding an older
+// Rev that lacks the assignment must not form an edge outside the tree, and the
+// promoter's ReparentConnectTimeout already owns that outcome.
+func (r *Router) onBackupPromote(ctx context.Context, peerID string) {
+	if !r.acceptsBackupChild(peerID) {
+		r.log.Warn("refusing a backup promotion: our topology does not name us as this peer's backup",
+			slog.String("peer_id", peerID), slog.String("peer_name", r.nameForID(peerID)))
+		return
+	}
+	r.log.Info("accepting a backup promotion; offering the forwarded tracks",
+		slog.String("peer_id", peerID), slog.String("peer_name", r.nameForID(peerID)))
+	r.acceptBackupChild(ctx, peerID, true)
+}
+
+// acceptBackupChild opens the session for a child that has promoted us as its backup
+// parent, in the given role, and records WHICH failure the edge answers.
+//
+// That record is the whole reason this is one function rather than two call sites:
+// without it the next unrelated push sees a live neighbour the tree does not name,
+// calls it a stranger, and drops the parent this child has only just failed over to —
+// inside the exact window failover exists to survive (§7.5a, promotionPending).
+//
+// The caller must have authorized the peer; this does not re-check.
+func (r *Router) acceptBackupChild(ctx context.Context, peerID string, offerer bool) {
+	r.startPeerOpt(ctx, peerID, peerOpts{offerer: &offerer})
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	link := r.peers[peerID]
+	if link == nil || r.topo == nil {
+		return
+	}
+	link.backupFor = r.topo.ParentOf(r.nameByID[peerID])
+}
+
+// nameForID is idForName's inverse, for log lines. Empty for a peer not in the
+// roster, which is itself worth seeing in a log.
+func (r *Router) nameForID(peerID string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.nameByID[peerID]
 }
 
 // StaleRejected reports how many pushed topologies the fence refused. A nonzero
