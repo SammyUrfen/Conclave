@@ -623,3 +623,66 @@ func TestKeyframeForChildAsksTheLegsLayer(t *testing.T) {
 			"rung %#x (source U's leg was never downgraded)", up.count()-before, got.MediaSSRC, ssrcF)
 	}
 }
+
+// TestReparentOntoAnUnlayeredUpstreamKeepsFlowing is the case where the two axes
+// stop being independent: a re-parent that changes the SHAPE of the source's ladder.
+//
+// A relay keys a source by its ORIGIN, so the same origin can arrive as three named
+// rungs (`video.q/.h/.f`, when the origin is our own neighbour) and then, after a
+// re-parent, as ONE unnamed stream (`fwd-O`, when the new parent is a relay that
+// forwards what it selected). layers.go states the contract — "a source publishes
+// either one unnamed layer or several named ones, never a mixture" — and this is the
+// path that violates it.
+//
+// MUTATION CAUGHT: letting the two kinds coexist in forwardSource.layers. The named
+// rungs survive commitSwitch as ARMED records that no reader will ever appear on;
+// `retop` still ranks `f` above the unnamed layer, so every leg keeps resolving to a
+// rung nothing is sending, and fanout drops every packet the new parent delivers.
+// The child goes black PERMANENTLY, with no error on any path — the source is
+// registered, the upstream is set, the reader loop is running and metering, and the
+// only symptom is a still frame.
+func TestReparentOntoAnUnlayeredUpstreamKeepsFlowing(t *testing.T) {
+	f := newForwarder(discardLog(), &uploadMeter{}, func(func()) {}, newFakeClock())
+	genQ, genF := twoLayerSource(t, f, &captureRTCP{})
+	genH := f.newUpstreamGen("S", "h")
+	f.learnSSRC("S", "h", genH, ssrcH)
+
+	auto, picked := &captureTrack{}, &captureTrack{}
+	f.addOutLive("S", "auto", auto, nil)
+	f.addOutLive("S", "picked", picked, nil)
+	f.selectLegLayer("S", "picked", "q") // an explicit choice the policy made earlier
+
+	f.fanout("S", "f", genF, layerPkt(ssrcF, 500, 90000, true))
+	f.fanout("S", "q", genQ, layerPkt(ssrcQ, 10, 1000, true))
+	if got := len(auto.snapshot()); got != 1 {
+		t.Fatalf("the auto leg holds %d packets before the re-parent, want 1", got)
+	}
+	if got := len(picked.snapshot()); got != 1 {
+		t.Fatalf("the picked leg holds %d packets before the re-parent, want 1", got)
+	}
+
+	// Re-parent onto a neighbour that FORWARDS this origin: one track, `fwd-S`, no
+	// layer suffix. Commit first, then the new reader appears — the ordering the
+	// Router actually produces, since the topology commits before pion's OnTrack.
+	f.rebindUpstream("S", &captureRTCP{})
+	gen := f.newUpstreamGen("S", "")
+	f.learnSSRC("S", "", gen, 0xABCDEF)
+
+	// A keyframe, then two interframes: enough for any leg that is going to resume.
+	f.fanout("S", "", gen, layerPkt(0xABCDEF, 100, 1000, true))
+	f.fanout("S", "", gen, layerPkt(0xABCDEF, 101, 4000, false))
+	f.fanout("S", "", gen, layerPkt(0xABCDEF, 102, 7000, false))
+
+	for name, c := range map[string]*captureTrack{"auto": auto, "picked": picked} {
+		if got := len(c.snapshot()); got != 4 {
+			t.Errorf("the %s leg holds %d packets after the re-parent (layer %q), want 4 — a "+
+				"leg left resolving to a rung the new upstream does not publish is black "+
+				"forever, with no error anywhere", name, got, f.legLayer("S", name))
+		}
+	}
+	// …and the relay can still ask that upstream for a keyframe, which it cannot do
+	// while the leg names a rung whose SSRC was zeroed by the commit.
+	if got := f.legLayer("S", "auto"); got != "" {
+		t.Errorf("the auto leg resolves to %q, want the unnamed layer the new upstream sends", got)
+	}
+}
