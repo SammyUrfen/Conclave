@@ -125,10 +125,21 @@ MEET=$(curl -sS -X POST http://10.99.0.1:9000/api/meets | python3 -c 'import sys
 echo "meet=$MEET"
 
 # --- 3. the relay -----------------------------------------------------------
+# -denied-peers is REQUIRED here and is the easiest line to drop. cmd/turn denies
+# 10/8 by default (same set deploy/docker-compose.yml gives coturn: a relay that will
+# forward into the LAN it sits in is a pivot), and this whole namespace is 10.99.0.0/24
+# — so with the default the relay refuses every permission and ICE just never
+# completes. The value below is the default with 10/8 removed and nothing else; it is
+# pinned by TestVerifyTurnDeniedPeersAdmitsTheNamespace so this line and that default
+# cannot drift apart.
 ./bin/turn -addr 10.99.0.1:3478 -public-ip 10.99.0.1 \
            -users conclave=hunter2 -relay-ports 49160-49200 \
+           -denied-peers '0.0.0.0/8,127.0.0.0/8,169.254.0.0/16,172.16.0.0/12,192.168.0.0/16,224.0.0.0/4' \
            -log-format json > /tmp/turn.log 2>&1 &
 # expect in /tmp/turn.log: "turn relay listening" ... relay_ports=49160-49200
+#                          denied_peer_ranges=6
+# If Phase B's allocations never appear, grep first for "refusing to relay to a denied
+# peer address" — that is this flag, and it is logged at warn for exactly that reason.
 ```
 
 ### Phase A — the control run: TURN configured, direct path open

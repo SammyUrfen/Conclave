@@ -81,8 +81,11 @@ type options struct {
 	// tell them apart. Unpinned, the verification is not merely inconvenient, it is
 	// unfalsifiable.
 	relayPorts [2]uint16
-	level      slog.Level
-	format     logging.Format
+	// deniedPeers are the peer address ranges this relay refuses to forward to; see
+	// defaultDeniedPeers. Empty means no restriction.
+	deniedPeers []*net.IPNet
+	level       slog.Level
+	format      logging.Format
 }
 
 // parseArgs parses argv into a validated options. Separated from run, and taking args
@@ -97,6 +100,17 @@ func parseArgs(args []string) (options, error) {
 	users := fs.String("users", "", "comma-separated user=password list; required (there is no anonymous mode)")
 	relayPorts := fs.String("relay-ports", "",
 		"confine relay allocations to these UDP ports, e.g. 49160-49200; empty lets the OS choose")
+	// DENY BY DEFAULT, and the default is deliberately inconvenient for this repo's own
+	// verification. A relay that will forward into the LAN or loopback it sits in is a
+	// pivot, and that is not a state anyone should reach by omission — the same argument
+	// -users already makes about anonymous allocations. docs/verify-turn.md runs inside
+	// a netns on 10.99.0.0/24 and therefore passes this flag explicitly, which is the
+	// honest arrangement: the recipe documents the range it is opening, in the recipe,
+	// instead of every operator inheriting an open relay so that one test can pass.
+	deniedPeers := fs.String("denied-peers", defaultDeniedPeers,
+		"comma-separated CIDR blocks this relay refuses to forward to; empty disables the "+
+			"restriction (a LAN-relaying TURN server is a pivot). Note the default denies "+
+			"10/8, so a run on a private network must narrow it — see docs/verify-turn.md")
 	logLevel := fs.String("log-level", "info", "log level: debug|info|warn|error")
 	logFormat := fs.String("log-format", "text", "log format: json|text")
 	if err := fs.Parse(args); err != nil {
@@ -121,6 +135,10 @@ func parseArgs(args []string) (options, error) {
 	if err != nil {
 		return options{}, err
 	}
+	denied, err := parseDeniedPeers(*deniedPeers)
+	if err != nil {
+		return options{}, err
+	}
 	level, err := logging.ParseLevel(*logLevel)
 	if err != nil {
 		return options{}, err
@@ -137,9 +155,10 @@ func parseArgs(args []string) (options, error) {
 		users:    parsedUsers,
 		// Reported to the operator at startup rather than kept private: "which ports is
 		// this relay actually using" is the first question the firewall rule needs.
-		relayPorts: ports,
-		level:      level,
-		format:     format,
+		relayPorts:  ports,
+		deniedPeers: denied,
+		level:       level,
+		format:      format,
 	}, nil
 }
 
@@ -215,16 +234,60 @@ const defaultDeniedPeers = "0.0.0.0/8,10.0.0.0/8,127.0.0.0/8,169.254.0.0/16," +
 const verifyTurnDeniedPeers = "0.0.0.0/8,127.0.0.0/8,169.254.0.0/16," +
 	"172.16.0.0/12,192.168.0.0/16,224.0.0.0/4"
 
-// parseDeniedPeers reads the -denied-peers flag: a comma-separated CIDR list.
+// parseDeniedPeers reads the -denied-peers flag: a comma-separated CIDR list, or empty
+// for no restriction at all.
+//
+// A malformed entry is FATAL rather than skipped, on the same principle as -users. The
+// failure mode of a silently-dropped entry is that exactly the range the operator meant
+// to protect is the one left open, and nothing anywhere says so.
 func parseDeniedPeers(s string) ([]*net.IPNet, error) {
-	return nil, nil
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	var out []*net.IPNet
+	for _, entry := range strings.Split(s, ",") {
+		entry = strings.TrimSpace(entry)
+		// net.ParseCIDR rejects a bare IP, which is the likeliest typo here and the
+		// one worth naming in the error: "10.0.0.0" is not "10.0.0.0/8".
+		_, network, err := net.ParseCIDR(entry)
+		if err != nil {
+			return nil, fmt.Errorf("invalid -denied-peers entry %q: want a CIDR block like 10.0.0.0/8", entry)
+		}
+		out = append(out, network)
+	}
+	return out, nil
 }
 
-// peerAllowed reports whether this relay may forward to peerIP.
+// peerAllowed reports whether this relay may forward to peerIP. An empty deny set
+// admits everything, which is what an operator who empties the flag has asked for.
 func peerAllowed(denied []*net.IPNet, peerIP net.IP) bool {
-	// TODO(finding 4b): no restriction exists yet — this is pion's
-	// DefaultPermissionHandler, which admits every peer.
+	for _, network := range denied {
+		if network.Contains(peerIP) {
+			return false
+		}
+	}
 	return true
+}
+
+// permissionHandler is the callback pion/turn consults on every CreatePermission and
+// ChannelBind, i.e. before a client can name a new peer to relay to.
+//
+// The DENIAL IS LOGGED, at warn, because this is the one place a safe default can look
+// like a broken server: a refused permission surfaces to the operator as ICE simply
+// never completing, with nothing anywhere saying why. One line naming the flag turns
+// twenty minutes of packet capture into a fix.
+func permissionHandler(log *slog.Logger, denied []*net.IPNet) turn.PermissionHandler {
+	return func(clientAddr net.Addr, peerIP net.IP) bool {
+		if peerAllowed(denied, peerIP) {
+			return true
+		}
+		log.Warn("refusing to relay to a denied peer address",
+			slog.String("client", clientAddr.String()),
+			slog.String("peer", peerIP.String()),
+			slog.String("hint", "pass -denied-peers to narrow the deny set"))
+		return false
+	}
 }
 
 // authHandler builds the long-term-credential callback pion/turn consults on every
@@ -291,6 +354,11 @@ func run(args []string) error {
 		PacketConnConfigs: []turn.PacketConnConfig{{
 			PacketConn:            conn,
 			RelayAddressGenerator: relayGenerator(opts.publicIP, opts.relayPorts),
+			// Per-listener in pion v5, not on ServerConfig. Without it pion installs
+			// DefaultPermissionHandler, which admits every peer address on earth;
+			// deploy/docker-compose.yml does not let coturn do that and there is no
+			// reason this binary should.
+			PermissionHandler: permissionHandler(log, opts.deniedPeers),
 		}},
 	})
 	if err != nil {
@@ -303,14 +371,18 @@ func run(args []string) error {
 		slog.String("public_ip", opts.publicIP),
 		slog.String("realm", opts.realm),
 		slog.Int("users", len(opts.users)),
-		slog.String("relay_ports", relayPortsString(opts.relayPorts)))
+		slog.String("relay_ports", relayPortsString(opts.relayPorts)),
+		slog.Int("denied_peer_ranges", len(opts.deniedPeers)))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	<-ctx.Done()
 
 	log.Info("shutting down")
-	return server.Close()
+	if err := server.Close(); err != nil {
+		return fmt.Errorf("close turn server: %w", err)
+	}
+	return nil
 }
 
 // relayPortsString renders the configured range for the startup log. "ephemeral" is

@@ -3,7 +3,10 @@ package main
 import (
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/pion/turn/v5"
@@ -13,14 +16,21 @@ import (
 
 // wantOptions is the frozen default set for cmd/turn, spelled out in full so that
 // adding a flag without reviewing its default fails this test — the same guard
-// cmd/peer's wantOptions provides.
-func wantOptions() options {
+// cmd/peer's wantOptions provides. It caught -denied-peers, which is exactly the kind
+// of default (deny by omission) that must not arrive unreviewed.
+func wantOptions(t *testing.T) options {
+	t.Helper()
+	denied, err := parseDeniedPeers(defaultDeniedPeers)
+	if err != nil {
+		t.Fatalf("defaultDeniedPeers does not parse: %v", err)
+	}
 	return options{
-		addr:   ":3478",
-		realm:  defaultRealm,
-		users:  map[string]string{},
-		level:  slog.LevelInfo,
-		format: logging.FormatText,
+		addr:        ":3478",
+		realm:       defaultRealm,
+		users:       map[string]string{},
+		deniedPeers: denied,
+		level:       slog.LevelInfo,
+		format:      logging.FormatText,
 	}
 }
 
@@ -29,7 +39,7 @@ func TestParseArgsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseArgs: %v", err)
 	}
-	want := wantOptions()
+	want := wantOptions(t)
 	want.publicIP = "127.0.0.1"
 	want.users = map[string]string{"conclave": "secret"}
 	if !reflect.DeepEqual(got, want) {
@@ -60,6 +70,9 @@ func TestParseArgsValidation(t *testing.T) {
 		{name: "user with no password", args: []string{"-public-ip", "10.0.0.1", "-users", "a"}, wantErr: true},
 		{name: "empty username", args: []string{"-public-ip", "10.0.0.1", "-users", "=b"}, wantErr: true},
 		{name: "empty password", args: []string{"-public-ip", "10.0.0.1", "-users", "a="}, wantErr: true},
+
+		{name: "malformed denied peers", args: []string{"-public-ip", "10.0.0.1", "-users", "a=b", "-denied-peers", "10.0.0.0"}, wantErr: true},
+		{name: "empty denied peers is allowed", args: []string{"-public-ip", "10.0.0.1", "-users", "a=b", "-denied-peers", ""}},
 
 		{name: "unknown log level", args: []string{"-public-ip", "10.0.0.1", "-users", "a=b", "-log-level", "trace"}, wantErr: true},
 		{name: "unknown log format", args: []string{"-public-ip", "10.0.0.1", "-users", "a=b", "-log-format", "yaml"}, wantErr: true},
@@ -213,6 +226,20 @@ func TestVerifyTurnDeniedPeersAdmitsTheNamespace(t *testing.T) {
 			t.Errorf("-denied-peers %q admits %s; the recipe should relax 10/8 only",
 				verifyTurnDeniedPeers, ip)
 		}
+	}
+
+	// And the recipe must actually PASS it. The constant above being correct is worth
+	// nothing if the command line in the document says something else — that is the
+	// drift this whole test exists to prevent, and it is only prevented by reading the
+	// document. The mutation this catches: editing the flag value in one place.
+	doc, err := os.ReadFile(filepath.Join("..", "..", "docs", "verify-turn.md"))
+	if err != nil {
+		t.Fatalf("read the verification recipe: %v", err)
+	}
+	if !strings.Contains(string(doc), "-denied-peers '"+verifyTurnDeniedPeers+"'") {
+		t.Errorf("docs/verify-turn.md does not pass -denied-peers %q; its relay will refuse "+
+			"every permission in the 10.99.0.0/24 namespace and the run will prove nothing",
+			verifyTurnDeniedPeers)
 	}
 }
 
