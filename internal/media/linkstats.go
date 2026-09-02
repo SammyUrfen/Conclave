@@ -218,6 +218,39 @@ func (l *lossTracker) worstPct() float64 {
 // relay from the fleet and re-parents everyone behind it.
 const NATRelayedThreshold = 1.0
 
+// NATDirectMemory is how long a MEASURED direct verdict keeps a peer classified
+// overlay.NATDirect after every edge it can still measure has become relay-typed.
+//
+// IT EXISTS BECAUSE THE VERDICT IS OTHERWISE A ONE-WAY LATCH, and the latch closes on
+// its own. overlay.BuildTree and Validate deny a NATRelayed node children, so consider
+// peer P, CGNAT-bound upstream but holding a child C on its own LAN:
+//
+//	edges {parent A: relayed, child C: host} → natClass(2,1) = NATDirect. Eligible.
+//	a rebuild re-parents C away        → edges {A: relayed} → natClass(1,1) = NATRelayed.
+//	P is now a forced leaf, so the coordinator never gives it a child again — and its
+//	only remaining edge is the relayed uplink, so it re-measures NATRelayed forever.
+//
+// P can never regain the edge that PROVED it was direct. Nothing about its reachability
+// changed; the tree's reaction to the verdict removed the only evidence that could
+// clear it. RTTMemory's doc comment argues this exact structure for the RTT sensor —
+// "no challenger could ever win" — and the cure is the same one: remember.
+//
+// ONLY THE PERMISSIVE VERDICT IS REMEMBERED. A relayed verdict is never cached, because
+// the two directions are not symmetric: latching toward NATRelayed is the harm (forced
+// leaf, disqualified as coordinator, no path back), while latching toward NATDirect
+// merely DELAYS a demotion, and its correction path is immediate — the next measurement
+// past the horizon reclassifies the peer with no further evidence needed. Nor does an
+// UNMEASURED tick refresh the memory: natClass's permissive answer for a peer with no
+// edges is an absence of data, not a direct path, and treating it as one would restore
+// the latch by another route.
+//
+// Two minutes, the same horizon and the same justification as RTTMemory: long enough
+// that a peer moved around by one churn event still remembers what it measured before
+// the move (the tree re-optimises on a scale of seconds), short enough that the value
+// is still evidence about a path that does not usually change character inside two
+// minutes — and it is what arbiter.StableUptimeSec already treats as "settled".
+const NATDirectMemory = 2 * time.Minute
+
 // relayedPath reports whether the path media actually takes over ONE PeerConnection
 // runs through a TURN relay, reading pion's stats report for that connection.
 //

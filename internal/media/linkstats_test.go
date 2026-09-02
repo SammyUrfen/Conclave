@@ -551,6 +551,24 @@ func TestNATClass(t *testing.T) {
 	}
 }
 
+// relayEdge and directEdge build one edgeReport for a neighbour whose nominated pair
+// leaves through, respectively, a TURN allocation and a host candidate. Package-level
+// rather than local to one test, because the fold and the NAT memory are two different
+// tests over the same two shapes of edge.
+func relayEdge(name string, rttSec float64) edgeReport {
+	return edgeReport{name: name, report: webrtc.StatsReport{
+		"l": localCand("l", webrtc.ICECandidateTypeRelay),
+		"p": candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "l", "r", rttSec),
+	}}
+}
+
+func directEdge(name string, rttSec float64) edgeReport {
+	return edgeReport{name: name, report: webrtc.StatsReport{
+		"l": localCand("l", webrtc.ICECandidateTypeHost),
+		"p": candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "l", "r", rttSec),
+	}}
+}
+
 // TestLinkStatsFromFoldsTheEdgeReports is the wiring test, and it exists because a
 // mutation run found the gap it fills: with only relayedPath and natClass pinned, a
 // Router that computed the class correctly and then returned a constant NATDirect
@@ -561,18 +579,6 @@ func TestNATClass(t *testing.T) {
 // per-edge accounting so every edge counts as unmeasured; filing an RTT under the
 // wrong neighbour's name.
 func TestLinkStatsFromFoldsTheEdgeReports(t *testing.T) {
-	relayEdge := func(name string, rttSec float64) edgeReport {
-		return edgeReport{name: name, report: webrtc.StatsReport{
-			"l": localCand("l", webrtc.ICECandidateTypeRelay),
-			"p": candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "l", "r", rttSec),
-		}}
-	}
-	directEdge := func(name string, rttSec float64) edgeReport {
-		return edgeReport{name: name, report: webrtc.StatsReport{
-			"l": localCand("l", webrtc.ICECandidateTypeHost),
-			"p": candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "l", "r", rttSec),
-		}}
-	}
 	tests := []struct {
 		name    string
 		reports []edgeReport
@@ -637,5 +643,126 @@ func TestLinkStatsNATFailsSafeWithNoEdges(t *testing.T) {
 	_, _, nat := r.LinkStats()
 	if nat != overlay.NATDirect {
 		t.Errorf("LinkStats nat = %q from a peer with no edges, want %q", nat, overlay.NATDirect)
+	}
+}
+
+// --- the NAT verdict must not be a one-way latch -----------------------------
+
+// TestNATVerdictSurvivesLosingItsOnlyDirectEdge WALKS THE TRAJECTORY, and it exists
+// because the arithmetic tests above cannot see the bug. natClass(2,1) = NATDirect and
+// natClass(1,1) = NATRelayed are BOTH correct in isolation and both already pinned; the
+// defect only appears when a peer moves from the first state to the second and the
+// control plane's reaction makes the move irreversible.
+//
+// Peer P is CGNAT-bound upstream but has a child C on its own LAN:
+//
+//  1. edges {parent A: relayed, child C: host} → natClass(2,1) = NATDirect. Eligible.
+//  2. any rebuild re-parents C away → edges {A: relayed} → natClass(1,1) = NATRelayed.
+//  3. overlay.BuildTree and Validate deny a NATRelayed node children, so P is now a
+//     FORCED LEAF. Its only edge is the relayed uplink. It measures NATRelayed forever
+//     and can never regain the edge that proved it was direct.
+//
+// The mutation this catches is the one that shipped: classifying from this tick's edges
+// only, with no memory of a direct verdict. media.RTTMemory's doc comment argues
+// verbatim this structure for the RTT sensor ("no challenger could ever win"); the NAT
+// sensor chose the opposite and inherited exactly that failure.
+func TestNATVerdictSurvivesLosingItsOnlyDirectEdge(t *testing.T) {
+	clk := newFakeClock()
+	r := NewRouter(discardLog(), nil, RouterConfig{SelfName: "p", Managed: true, Clock: clk})
+
+	// Step 1 — a relayed uplink and a direct LAN child. One direct path is enough.
+	if _, _, nat := r.linkStatsFrom([]edgeReport{relayEdge("a", 0.020), directEdge("c", 0.001)}); nat != overlay.NATDirect {
+		t.Fatalf("with a direct child, nat = %q, want %q", nat, overlay.NATDirect)
+	}
+
+	// Step 2 — a rebuild takes C away. Nothing about P's own reachability changed:
+	// it demonstrated a direct path one tick ago and has not been re-measured against
+	// anyone since.
+	clk.advance(10 * time.Second)
+	_, _, nat := r.linkStatsFrom([]edgeReport{relayEdge("a", 0.020)})
+	if nat != overlay.NATDirect {
+		t.Fatalf("after its only direct edge was re-parented away, nat = %q, want %q: "+
+			"P is now a forced leaf, so the coordinator will never give it a child again "+
+			"and it can never re-measure the direct path that would clear the verdict",
+			nat, overlay.NATDirect)
+	}
+}
+
+// TestNATDirectMemoryExpires is the other half, and without it the fix above is just a
+// latch pointing the other way. A peer whose direct path genuinely went away — the
+// laptop moved onto a hotel network behind CGNAT — must eventually be classified, or
+// the tree keeps handing children to a node that can only reach them over TURN.
+//
+// The mutation this catches: remembering a direct verdict forever (no horizon), which
+// passes the trajectory test above and makes NATRelayed unreachable for any peer that
+// was ever direct.
+func TestNATDirectMemoryExpires(t *testing.T) {
+	clk := newFakeClock()
+	r := NewRouter(discardLog(), nil, RouterConfig{SelfName: "p", Managed: true, Clock: clk})
+
+	if _, _, nat := r.linkStatsFrom([]edgeReport{directEdge("c", 0.001)}); nat != overlay.NATDirect {
+		t.Fatalf("nat = %q, want %q", nat, overlay.NATDirect)
+	}
+
+	// Just inside the horizon: still remembered.
+	clk.advance(NATDirectMemory - time.Second)
+	if _, _, nat := r.linkStatsFrom([]edgeReport{relayEdge("a", 0.020)}); nat != overlay.NATDirect {
+		t.Fatalf("the direct verdict expired early, at age %v: nat = %q", NATDirectMemory-time.Second, nat)
+	}
+
+	// Past it: the peer is classified on what it can measure now.
+	clk.advance(2 * time.Second)
+	if _, _, nat := r.linkStatsFrom([]edgeReport{relayEdge("a", 0.020)}); nat != overlay.NATRelayed {
+		t.Errorf("nat = %q past NATDirectMemory (%v), want %q: a genuinely TURN-bound peer "+
+			"is never demoted and keeps being given children it can only reach over TURN",
+			nat, NATDirectMemory, overlay.NATRelayed)
+	}
+}
+
+// TestNATRelayedIsNeverRemembered pins the ASYMMETRY, which is the whole reason the
+// memory is safe. Only the permissive verdict is remembered: a latch toward NATRelayed
+// is the harm (forced leaf, disqualified as coordinator, no way back), while a latch
+// toward NATDirect merely delays a demotion and is corrected by the next measurement.
+//
+// The mutation this catches: caching "the last verdict" rather than "the last DIRECT
+// verdict", which would hold a peer relayed for NATDirectMemory after it has already
+// re-measured a direct path — reintroducing the latch on a timer.
+func TestNATRelayedIsNeverRemembered(t *testing.T) {
+	clk := newFakeClock()
+	r := NewRouter(discardLog(), nil, RouterConfig{SelfName: "p", Managed: true, Clock: clk})
+
+	if _, _, nat := r.linkStatsFrom([]edgeReport{relayEdge("a", 0.020)}); nat != overlay.NATRelayed {
+		t.Fatalf("nat = %q from an all-relayed peer, want %q", nat, overlay.NATRelayed)
+	}
+	clk.advance(time.Second)
+	if _, _, nat := r.linkStatsFrom([]edgeReport{directEdge("c", 0.001)}); nat != overlay.NATDirect {
+		t.Errorf("nat = %q one tick after a direct path was measured, want %q", nat, overlay.NATDirect)
+	}
+}
+
+// TestNATNoEdgesDoesNotRefreshTheMemory pins that the FAIL-SAFE is not mistaken for
+// EVIDENCE. natClass returns NATDirect for a peer that measured nothing, because
+// demoting an unmeasured peer is the worse error — but that answer is an absence of
+// data, not a direct path, and remembering it would restore the latch by another route:
+// a peer whose edges all drop and then come back relayed would refresh its memory on
+// every empty tick and never expire.
+//
+// The mutation this catches: recording the verdict whenever it is NATDirect, without
+// checking that anything was actually measured.
+func TestNATNoEdgesDoesNotRefreshTheMemory(t *testing.T) {
+	clk := newFakeClock()
+	r := NewRouter(discardLog(), nil, RouterConfig{SelfName: "p", Managed: true, Clock: clk})
+
+	// A long stretch with no edges at all — a peer between re-parents.
+	for range 4 {
+		clk.advance(NATDirectMemory / 2)
+		if _, _, nat := r.linkStatsFrom(nil); nat != overlay.NATDirect {
+			t.Fatalf("an unmeasured peer reported %q, want the permissive %q", nat, overlay.NATDirect)
+		}
+	}
+	// Its first real measurement is relayed. Nothing before it was evidence of a
+	// direct path, so there is nothing to remember and the verdict stands.
+	if _, _, nat := r.linkStatsFrom([]edgeReport{relayEdge("a", 0.020)}); nat != overlay.NATRelayed {
+		t.Errorf("nat = %q, want %q: empty ticks were treated as direct measurements", nat, overlay.NATRelayed)
 	}
 }
