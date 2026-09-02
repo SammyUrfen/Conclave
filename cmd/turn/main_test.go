@@ -2,6 +2,7 @@ package main
 
 import (
 	"log/slog"
+	"net"
 	"reflect"
 	"testing"
 
@@ -133,5 +134,124 @@ func TestAuthHandlerKeysAreRealmScoped(t *testing.T) {
 	}
 	if _, _, ok := h(&turn.RequestAttributes{Username: "mallory", Realm: "conclave"}); ok {
 		t.Errorf("authHandler admitted an unknown user")
+	}
+}
+
+// --- the peer-address restriction ------------------------------------------
+//
+// deploy/docker-compose.yml denies coturn 10/8, 192.168/16, 172.16/12, 127/8 and
+// multicast, with the comment "a TURN server that will relay into 127.0.0.0/8 or a LAN
+// is a pivot into whatever network it sits in". cmd/turn had no equivalent and would
+// relay anywhere. These tests pin the predicate, and pin the ONE tension that makes the
+// default non-obvious: the live verification runs entirely inside 10.99.0.0/24.
+
+// TestPeerAllowedUnderTheDefaults pins that the shipped default actually denies the
+// ranges compose denies. The mutation this catches is the state this branch was in:
+// no PermissionHandler at all, so pion installs DefaultPermissionHandler and every
+// peer address on earth is relayable.
+func TestPeerAllowedUnderTheDefaults(t *testing.T) {
+	denied, err := parseDeniedPeers(defaultDeniedPeers)
+	if err != nil {
+		t.Fatalf("the shipped default does not parse: %v", err)
+	}
+	tests := []struct {
+		ip   string
+		want bool
+	}{
+		// The compose deny set, address by address.
+		{ip: "10.0.0.5"},
+		{ip: "10.99.0.1"}, // the verification's own range — see the test below
+		{ip: "192.168.1.1"},
+		{ip: "172.16.0.1"},
+		{ip: "172.31.255.254"},
+		{ip: "127.0.0.1"},
+		{ip: "169.254.1.1"},
+		{ip: "0.0.0.1"},
+		{ip: "239.255.255.250"}, // multicast, coturn's --no-multicast-peers
+
+		// Public addresses, which is the whole point of a relay.
+		{ip: "8.8.8.8", want: true},
+		{ip: "1.2.3.4", want: true},
+		// Just outside 172.16/12 — the mask is the easiest one in the set to get
+		// wrong, and writing it as /16 would quietly allow 172.17-172.31.
+		{ip: "172.32.0.1", want: true},
+		{ip: "172.15.255.255", want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.ip, func(t *testing.T) {
+			if got := peerAllowed(denied, net.ParseIP(tt.ip)); got != tt.want {
+				t.Errorf("peerAllowed(%s) = %v, want %v", tt.ip, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestVerifyTurnDeniedPeersAdmitsTheNamespace is the test that stops a defensible
+// default from silently voiding the branch's reason to exist. docs/verify-turn.md runs
+// every process inside one netns on 10.99.0.0/24, which the DEFAULT deny set covers —
+// so the recipe passes an explicit -denied-peers, and the string below is copied from
+// it. If either the default or the recipe moves without the other, this fails here
+// rather than as an unexplained allocation refusal twenty minutes into a manual run.
+//
+// The mutation this catches: relaxing the default instead of the recipe (which would
+// make this pass while TestPeerAllowedUnderTheDefaults fails), or tightening the
+// recipe's list back to the default.
+func TestVerifyTurnDeniedPeersAdmitsTheNamespace(t *testing.T) {
+	denied, err := parseDeniedPeers(verifyTurnDeniedPeers)
+	if err != nil {
+		t.Fatalf("the value docs/verify-turn.md passes does not parse: %v", err)
+	}
+	if !peerAllowed(denied, net.ParseIP("10.99.0.1")) {
+		t.Errorf("-denied-peers %q refuses 10.99.0.1: docs/verify-turn.md cannot relay at all",
+			verifyTurnDeniedPeers)
+	}
+	// It is a RELAXATION of one range, not a disabling of the filter: everything the
+	// default denies outside 10/8 must still be denied, or the recipe would be
+	// documenting an open relay.
+	for _, ip := range []string{"192.168.1.1", "172.16.0.1", "127.0.0.1", "169.254.1.1"} {
+		if peerAllowed(denied, net.ParseIP(ip)) {
+			t.Errorf("-denied-peers %q admits %s; the recipe should relax 10/8 only",
+				verifyTurnDeniedPeers, ip)
+		}
+	}
+}
+
+// TestParseDeniedPeers pins the parse. The mutations these catch: accepting a bare IP
+// (which net.ParseCIDR rejects and a hand-rolled parser would not, silently denying
+// nothing), and swallowing a malformed entry — a typo'd CIDR that parses to nothing
+// would disable exactly the range the operator meant to protect, with no error.
+func TestParseDeniedPeers(t *testing.T) {
+	tests := []struct {
+		in      string
+		wantN   int
+		wantErr bool
+	}{
+		{in: "", wantN: 0},
+		{in: "10.0.0.0/8", wantN: 1},
+		{in: " 10.0.0.0/8 , 127.0.0.0/8 ", wantN: 2},
+		{in: "10.0.0.1", wantErr: true},    // a bare IP is not a CIDR
+		{in: "10.0.0.0/33", wantErr: true}, // impossible prefix length
+		{in: "not-an-address", wantErr: true},
+		{in: "10.0.0.0/8,,127.0.0.0/8", wantErr: true}, // an empty entry is a typo
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			got, err := parseDeniedPeers(tt.in)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseDeniedPeers(%q) error = %v, wantErr %v", tt.in, err, tt.wantErr)
+			}
+			if err == nil && len(got) != tt.wantN {
+				t.Errorf("parseDeniedPeers(%q) gave %d networks, want %d", tt.in, len(got), tt.wantN)
+			}
+		})
+	}
+}
+
+// TestPeerAllowedWithNoDenySet pins the escape hatch, and pins that it is spelled as
+// an EMPTY list rather than as a separate boolean. An operator who empties the flag has
+// asked for an open relay and gets one; nobody reaches that state by omission.
+func TestPeerAllowedWithNoDenySet(t *testing.T) {
+	if !peerAllowed(nil, net.ParseIP("10.0.0.5")) {
+		t.Errorf("an empty -denied-peers still denied a peer")
 	}
 }

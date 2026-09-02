@@ -201,6 +201,32 @@ func parseRelayPorts(s string) ([2]uint16, error) {
 	return [2]uint16{min, max}, nil
 }
 
+// defaultDeniedPeers is the peer-address deny set cmd/turn ships with. It is the SAME
+// set deploy/docker-compose.yml gives coturn (0/8, 127/8, 169.254/16, 10/8, 172.16/12,
+// 192.168/16) plus 224/4 for coturn's --no-multicast-peers, because the reasoning in
+// that file applies verbatim here: a TURN server that will relay into 127.0.0.0/8 or a
+// LAN is a pivot into whatever network it sits in.
+const defaultDeniedPeers = "0.0.0.0/8,10.0.0.0/8,127.0.0.0/8,169.254.0.0/16," +
+	"172.16.0.0/12,192.168.0.0/16,224.0.0.0/4"
+
+// verifyTurnDeniedPeers is the value docs/verify-turn.md passes: the default with 10/8
+// removed, because that recipe runs every process inside one netns on 10.99.0.0/24.
+// It lives here, next to the default, so a change to either is a change to a test.
+const verifyTurnDeniedPeers = "0.0.0.0/8,127.0.0.0/8,169.254.0.0/16," +
+	"172.16.0.0/12,192.168.0.0/16,224.0.0.0/4"
+
+// parseDeniedPeers reads the -denied-peers flag: a comma-separated CIDR list.
+func parseDeniedPeers(s string) ([]*net.IPNet, error) {
+	return nil, nil
+}
+
+// peerAllowed reports whether this relay may forward to peerIP.
+func peerAllowed(denied []*net.IPNet, peerIP net.IP) bool {
+	// TODO(finding 4b): no restriction exists yet — this is pion's
+	// DefaultPermissionHandler, which admits every peer.
+	return true
+}
+
 // authHandler builds the long-term-credential callback pion/turn consults on every
 // authenticated request.
 //
