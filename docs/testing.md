@@ -407,6 +407,50 @@ The habit shows up in three smaller forms you should copy:
 
 ---
 
+### The quality-layer sweep — four holes in tests written from the spec
+
+The Phase 7 layer work was built tests-first, from a written specification rather than from
+the implementation, and then swept with 24 hand-applied mutations. **23 were killed. Four
+of the sweep's findings were defects in the TESTS, not in the code** — which is the whole
+argument for running the sweep at all, since every one of those tests was green and looked
+like coverage.
+
+**1 — a test that PANICKED, hiding every test after it.**
+`TestLayerSwitchDoesNotPerturbTheOtherLeg` reported a wrong packet count with `t.Errorf`
+and then indexed `snapshot()[3]`. Under one mutation the capture held one packet, the index
+panicked, and **the test binary aborted** — so five later tests in the file never ran and
+the mutation read as "caught by two tests" when it was caught by eight. The rule this
+produced: *an assertion whose failure invalidates a later index must be `t.Fatalf`.* A
+panicking test is worse than a failing one, because it takes the rest of the file with it.
+
+**2 — a test that asserted the LABEL instead of the behaviour.**
+`TestReviewLayerDowngradesOnSustainedLoss` checked `legLayer(...) == "h"` after sustained
+loss. Deleting `rw.Switch()` from the policy path left that assertion perfectly true and
+the child's stream corrupt: the new encoding's raw sequence numbers forwarded on top of the
+old series, no rebase, no drop-until-keyframe. The fix asserts the *packets* — an interframe
+of the new rung is dropped, the keyframe resumes at the next sequence number.
+
+**3 — an assertion satisfied by a DIFFERENT rule than the one it aimed at.**
+`TestMediaLayersFromPaths` proved over-long layer lists are refused by passing
+`make([]string, 4)` — four **empty** strings. `ValidateMediaPaths` refused it, but for the
+empty-path rule, not the length rule; deleting the length check entirely left the test
+green. Same shape as §6.5's Case A: green, and measuring nothing.
+
+**4 — a stated reason that was false.**
+`TestReparentAndLayerSwitchInterleaved` claimed it caught "an extra `rw.Switch()` on the
+commit consumes a sequence slot". The sweep proved that mutation kills nothing, and the
+reason is in `rewrite.go`'s own doc comment: `Switch` is idempotent before a leg resumes.
+Splicing once per leg is still the right code — it is the cheaper and more obviously correct
+statement of the invariant — but it is **not** what that test discriminates, and the comment
+now says so. This is §6.5's Case C exactly: *the finding is not that the code was wrong; it
+is that the stated reason was wrong, which is how the next person deletes it.*
+
+The one surviving mutation is recorded rather than hidden: splicing per layer **and** per leg
+on a re-parent commit is semantically equivalent, for the reason above. A mutation that
+changes no behaviour is not an untested line.
+
+---
+
 ## 5. Library-behaviour pins
 
 Several of this system's designs depend on facts about pion that are **not in its
@@ -501,6 +545,14 @@ file so it links into no binary and adds no production import edge.
 69 test files, **372 top-level `func Test`**, 297 `t.Run` subtests, **0 benchmarks, 0 fuzz
 targets, 0 examples**.
 
+> **This table is a snapshot taken at the end of Phase 6 and has not been re-derived since.**
+> Measured again on 2026-09-02, after the Phase 7 quality-layer work: **94 test files, 499
+> `func Test`, 379 `t.Run`, 20,874 source lines against 29,062 test lines.** `internal/media`
+> alone is now 21 test files / 77 `func Test` / 49 `t.Run` / 5,269 src / 5,576 test — so the
+> "media is the only package below 1:1" reading below is **no longer true**; it crossed over.
+> The per-package rows are left as the Phase 6 record rather than half-updated, because a
+> table with one fresh row and twelve stale ones is worse than one that says which it is.
+
 | Package | Test files | `func Test` | `t.Run` | Src / test LOC |
 |---|---:|---:|---:|---:|
 | `internal/coordinator` | 10 | 87 | 7 | 2,544 / 3,714 |
@@ -521,6 +573,37 @@ Read the **ratios**, not the totals. `overlay` — the package holding the algor
 oracles — carries **1.7× more test than source**; `simnet` carries **2.2×**; `coordinator`
 **1.5×**. `media`, the one package that cannot be tested deterministically, is the only place
 the ratio drops below 1:1.
+
+---
+
+### Where the layer tests live and what each one is for
+
+| Test | The mutation it exists to catch |
+|---|---|
+| `TestRelayForwardsDifferentLayersToTwoChildren` | fan-out ignoring the leg's layer — every child gets every rung |
+| `TestLayerSwitchDoesNotPerturbTheOtherLeg` | a layer change splicing every leg of the source instead of one |
+| `TestLayerSwitchDropsUntilKeyframeThenResumesContinuous` | a switch that does not arm `waitKey`/`rebase` |
+| `TestUpstreamPLIAfterLayerSwitchCarriesThatLayerSSRC` | one SSRC per source — a PLI the sender silently discards |
+| `TestPLIThrottleIsPerSourceAndLayer` | a per-source throttle swallowing the switched child's request |
+| `TestReparentAndLayerSwitchInterleaved` | a non-active generation writing; the wrong legs spliced on a commit |
+| `TestSingleLayerSourceBehavesExactlyAsBefore` | any change that makes a one-track sender behave differently |
+| `TestReviewLayerDowngradesOnSustainedLoss` | the policy never being called; a relabel with no splice; a two-rung drop |
+| `TestPinnedLegNeverSelects` | one child's bad link degrading a whole sub-tree |
+| `TestKeyframeForChildAsksTheLegsLayer` | on-connect keyframe asking the rung the child is *not* on |
+| `TestSelectLayer` (11 subtests) | every hysteresis constant, the ladder clamps, and purity |
+| `TestSplitTrackName` / `TestTrackSourceRecoversOriginAndLayer` | a `-` separator, which is ambiguous with `leaf-b` |
+| `TestLayerLadderIsOrderedLowToHigh` | an unknown wire id aliasing onto a real rung |
+| `TestMediaLayersFromPaths` | naming the single-layer track anything but `video` |
+| `TestPionAnswererFillsEveryOfferedRecvonlyMLine` | (library pin) pion silently dropping the layers past the first offered m-line |
+| `TestRelayEdgeRecvSlots` | all three m-line mutations §7.5 records — one slot in total, slots added before the forwarded tracks, or the full ladder given to the answerer. The pin above stays green through every one |
+
+**The one this table cannot list is the one that mattered most.** Every test above was green
+while the feature was *inert end to end*: the relay offered one recvonly m-line, so a
+three-layer sender put one rung on the wire and the receiving peer got the LOWEST quality
+from a 720p sender, with clean logs throughout. A mutation sweep asks "which line can I
+delete and keep the suite green"; it has nothing to say about a line that was never written.
+Running the actual binaries is what found it, and the two pins above exist so it cannot come
+back. See `docs/DESIGN.md` §7.5.
 
 ---
 

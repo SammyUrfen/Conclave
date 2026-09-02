@@ -560,8 +560,12 @@ encrypt. Sources are keyed by **origin**, never by the neighbour that handed the
 One SFU footgun is handled explicitly. When a child asks for a keyframe, it sends a PLI naming
 **the SSRC the relay assigned it**. Forwarding that verbatim upstream makes the original
 source ignore it as an unknown SSRC — black video, no error. `requestUpstreamKeyframe` builds
-a *fresh* PLI carrying the source's own upstream SSRC, throttled at 300 ms **per source, not
-per child** ("a keyframe is not per-subscriber"), on the injected clock.
+a *fresh* PLI carrying that stream's own upstream SSRC, throttled at 300 ms **per (source,
+layer), not per child** ("a keyframe is not per-subscriber"), on the injected clock. The key
+gained the layer when sources gained quality rungs (§5.14): the rungs are independently
+encoded streams, so a request for `q` is not answered by `f`'s next I-frame, and one shared
+window would let a child that has just been switched down wait out a request nothing
+retries.
 
 ### 4.2 A relay fails
 
@@ -1385,6 +1389,90 @@ baseline with a root chosen from a fleet of one and entrenches whoever dialled i
 A join **bypasses `RecomputeCooldown`** but is subject to the settle, so a joiner waits at
 most 1.5 s for media rather than up to 5 s of black screen.
 
+### 5.14 Quality layers: multi-track, not RID simulcast
+
+**Chosen: an origin publishes N ORDINARY tracks on N m-lines — `video.q`, `video.h`,
+`video.f` — and the relay picks one PER CHILD. Explicitly NOT RFC 8853 simulcast (one
+m-line, several RIDs).**
+
+The reason is a hard constraint of the library, in the same family as §5.12's. **pion v4
+cannot send simulcast for you.** `grep -rn SetExtension` across all of `webrtc/v4`
+non-test code returns nothing, and across `pion/interceptor` returns exactly one hit
+(TWCC's) — there is no MID/RID header-extension writer anywhere in the stack. pion's own
+simulcast-send test hand-writes `pkt.Header.SetExtension(midID, …)` and
+`SetExtension(ridID, track.RID())` **on every packet**; that is the API contract, not test
+scaffolding. And `TrackLocalStaticSample.WriteSample` packetizes internally with no
+extension hook, so a RID origin cannot use `PlayIVF` at all — it would have to be rebuilt
+around `TrackLocalStaticRTP` plus a hand-rolled packetizer plus a per-packet extension
+stamp.
+
+What separate m-lines cost, stated plainly: **no `a=simulcast`/RID wire format, and no
+browser-sender interoperability.** conclave has no browser client — every peer is this Go
+binary — so the only thing being given up is compatibility with a sender that does not
+exist here.
+
+What it does NOT cost is the part that is actually interesting. Relay-side per-child
+selection, per-leg rewriting, per-layer PLI and the adaptive policy are **identical**
+either way; only the shape of the origin's SDP differs. The novel work is fully preserved.
+
+**This is not RFC simulcast and is not described as such anywhere.** A track is named
+`<base>.<rung>` and `.` is the separator because `policy.PeerNamePattern` admits `-` and
+`_` — `fwd-leaf-b` split on `-` is ambiguous, and `.` is a character no peer name can
+contain.
+
+**And there is no encoder.** An origin plays a pre-encoded IVF file, so three layers are
+three files (`scripts/make-layers.sh`). **conclave demonstrates layer SELECTION, not layer
+PRODUCTION**; nothing here adapts an encoder's bitrate, and a real sender would.
+
+*Rejected: modelling layers in `overlay.BuildTree`.* The builder's
+`capacity = floor(effectiveUpload / StreamKbps)` assumes a uniform per-stream cost, and it
+stays uniform. The tree is therefore always computed against the **full-rate** cost, so
+actual usage is only ever ≤ the budget: simulcast can make a tree more comfortable but can
+never violate an invariant, and **`overlay.Validate` needs no change at all**. Modelling
+layers would add a dimension to the greedy search, to the stickiness comparison **and to
+the independent oracle** — three places to be wrong instead of zero — to buy a denser tree
+nobody has measured a need for. §5.13's "one algorithm, one oracle, one place to be wrong"
+is the same argument. `internal/overlay` and `internal/coordinator` are untouched by this
+work.
+
+*Rejected: routing the per-child choice through the coordinator.* It is a **data-plane**
+control loop on **data-plane** inputs — the child's own RTCP reception reports (~1 Hz) and
+the nominated ICE pair's RTT — and putting it in the control plane would be wrong by
+§2.1's own argument, not merely slower: congestion response would sit behind
+`metrics.DefaultInterval` (3 s), a tree rebuild and a WebSocket round trip, and every
+relay's downstream quality would start depending on the control plane being alive, which
+nothing in the data plane does today. `selectLayer` is a pure, clock-free function in
+`internal/media` — one function does not earn a package, and it is deliberately not in
+`internal/policy`, whose charter (§3.5) is untrusted boundary input.
+
+**The origin's upload grows, and that is the real cost.** A three-rung sender uploads all
+three streams, roughly 1.25× the top rate at these resolutions. In a system whose entire
+premise is that upload is scarce this is worth naming rather than burying: the trade is
+that a *sender* pays ~25% more so that a *relay* can stop sending its weakest child a
+stream that child cannot decode. Whether that trade pays has not been measured here.
+
+**The two-axis invariant.** `forwardSource` used to have one axis, `activeGen` — the
+re-parent generation, with "exactly one generation may write downstream". It now has two:
+generations are per **(source, layer)**, each leg carries a **current layer**, and the
+invariant is **exactly one (generation, layer) per leg may write**. `fanout` holds the
+forwarder's read lock across its whole per-leg decision — check, then `Rewrite` — rather
+than snapshotting and deciding after unlocking, because that window is where a commit
+racing a selection splices a leg onto the stream that just lost, permanently and silently.
+`Rewrite` is pure CPU, so a read lock across it costs a writer at most one packet's
+fan-out.
+
+**The relay offers one recvonly m-line PER RUNG on every edge**, not one in total. That is
+not an optimisation: §5.12 makes the relay the sole offerer, an answerer cannot create
+m-lines, and one offered m-line means a three-layer origin puts exactly one rung on the wire
+and silently drops two. §7.5 is the whole story, including the measurement, because the first
+build of this feature shipped with that bug and a green suite.
+
+**`rtpRewriter` needed no mechanism change, and this is the evidence.** A layer switch is
+the *identical* discontinuity as a re-parent — an unrelated sequence/timestamp series that
+a keyframe does not repair — so it arms the same `waitKey`, drops to the same VP8 keyframe,
+and rebases the same offsets. `TestLayerSwitchDropsUntilKeyframeThenResumesContinuous`
+asserts exactly the numbers `TestRTPRewriter` demands of a re-parent.
+
 ---
 
 ## 6. What testing this actually required
@@ -1834,6 +1922,68 @@ defence a reader can check.
 None of these change behaviour. They are recorded here because a design document that only
 reports the contract's version of events is a document that cannot be checked.
 
+### 7.5 A sixth, found by running the binaries rather than the tests
+
+The quality-layer work (§5.14) shipped with a full unit suite — 24 mutations, 23 killed — and
+was **still broken end to end**, in a way no unit test could have caught, because the bug was
+not in any unit.
+
+**An answerer cannot create m-lines.** §5.12 fixes the relay as the sole offerer on every
+relay edge, so a multi-layer origin is the ANSWERER, and an answerer can only fold its local
+tracks into m-lines the *offer* already carried. `setupRelayEdge` offered **one** recvonly
+video m-line. So a peer publishing `video.q`, `video.h` and `video.f` put exactly one of them
+on the wire — and pion picked the one added first, the **lowest** rung.
+
+Everything downstream was correct and pointless. Negotiation succeeded. Media flowed. The
+relay learned one layer, computed a one-rung ladder, and `selectLayer` correctly declined to
+choose. **Every log line was clean and the receiving peer got 320x180 from a sender that was
+publishing 720p.** The measured evidence, before and after:
+
+| | layers reaching the relay | what the clean child recorded |
+|---|---|---|
+| before | `layer=q` only | 320x180, 219 KB |
+| after | `layer=q`, `layer=h`, `layer=f` — three SSRCs, three keyframe requests | 1280x720, 2.7 MB |
+
+**And the obvious fix broke something else, which is the more useful half of the story.**
+Adding `len(layerLadder)` recvonly m-lines to *every* relay edge turned
+`TestRouterPromotesBackupParent` red: `new parent connected but carried no media`. The cause
+is a second undocumented pion behaviour, in `satisfyTypeAndDirection`:
+
+> For a remote **sendrecv** m-line, pion prefers a local **recvonly** transceiver over a
+> **sendrecv** one.
+
+On the backup-promotion edge the promoting child OFFERS and the relay ANSWERS, so a relay
+carrying a spare recvonly transceiver had that spare hijack the m-line its *forwarded* track
+needed. The relay answered `connected` and sent nothing — the same silent black-video shape,
+reached from the opposite direction. A third pion fact compounds it: `pc.AddTrack`
+**cannibalises** a spare recvonly transceiver (`isSendAllowed`) rather than creating a new
+one, so receive slots added *before* the forwarded tracks are silently spent on them.
+
+The shipped rule is therefore asymmetric, and both halves are load-bearing:
+
+| | how many receive slots | when |
+|---|---|---|
+| **offerer** | `len(layerLadder)` | **after** the forwarded tracks, so `AddTrack` cannot eat them |
+| **answerer** | exactly one, as before | **before**, so the first forwarded track consumes it and no spare is left to hijack |
+
+The cost on the offering side is paid unconditionally — two negotiated-then-inactive m-lines
+on every relay edge in every deployment — because a relay cannot know how many rungs a
+neighbour will publish until the tracks arrive, and by then the offer is gone.
+
+Two pins guard it, and they guard *different* things:
+`TestPionAnswererFillsEveryOfferedRecvonlyMLine` asserts the **library** really does fill all
+N (raw pion, deliberately bypassing our wrappers); `TestRelayEdgeRecvSlots` asserts **we** get
+both sides of the table right, because the first pin stays green through every one of the
+three mutations that break the second (single slot; slots added first; the full ladder given
+to the answerer). It also catches them in 0.00 s where the end-to-end test takes 12.
+
+**The generalisable lesson, and it is not the same one as §6.5's.** Mutation testing asks
+"which line can I delete and keep the suite green"; it cannot ask "which line was never
+written". A feature whose every unit is correct can still be inert because the units were
+never connected on a real wire. §8.7 already says every live run has been single-host — this
+is the first time that limitation *hid a defect* rather than merely bounding a claim, and the
+defect survived a spec-first test suite, a 24-mutation sweep and a green `make check`.
+
 ---
 
 ## 8. Limitations
@@ -1982,6 +2132,29 @@ boundary — it stops a confused peer, not a lying one.
 - **A handover during genuinely torn state can still cause one global re-parent.** If the
   reconstruction over the *reduced* heard-from set still fails `Validate` — a tree captured
   mid-re-parent — the new coordinator builds from `prev = nil`.
+- **Quality layers stop at the first hop, deliberately (§5.14).** A relay selects a layer
+  per child only for **leaf** children; a child that is itself a **relay** is pinned to the
+  top rung it holds. The reason is structural: *a relay can only forward a layer it
+  receives*. For an intermediate relay to select per child, the root would have to send it
+  **every** layer — 3× on that one edge, in a system whose whole premise is that upload is
+  scarce. The two alternatives are both real costs and were both deferred: (a) the
+  intermediate receives only the highest layer its subtree actually needs, which requires
+  the intermediate's parent to know the subtree — i.e. the control plane, in a loop §5.14
+  argues must stay in the data plane; (b) relay→relay edges carry all layers, which spends
+  the scarce resource to save the scarce resource. So at `-max-depth 2` layers are only ever
+  selected on the root's own leaf children, and a peer below an intermediate relay gets
+  whatever that relay is getting. Nothing about this is hidden: `forwardOut.pinned` says so
+  in the code and `TestPinnedLegNeverSelects` pins it.
+- **Layer selection is loss-driven and therefore blind until a child suffers.** There is no
+  bandwidth estimator: the only evidence a child cannot take the current rung is that it
+  has already started losing packets. `layerDownRounds = 2` at ~1 report/second means the
+  child sees roughly two seconds of degraded video before the relay reacts. A real SFU runs
+  REMB/TWCC and reacts before the loss. That is not built here.
+- **A layer switch always costs the child a keyframe wait.** The relay drops until the new
+  rung's next I-frame. It asks for one immediately (per-layer PLI), but a file source has no
+  live encoder to answer, so in practice the wait is the clip's GOP —
+  `scripts/make-layers.sh` sets `-g 30` (one second) precisely so this is not mistaken for a
+  relay bug.
 - **`deriveWorking` has a recorded gap at depth ≥ 3.** An orphan has no edge in the working
   copy, so with `MaxDepth ≥ 3` a *grandchild* can be re-parented gratuitously. The code says
   so, and says it is not fixable without changing `overlay.processingOrder`. The default
@@ -2029,9 +2202,16 @@ boundary — it stops a confused peer, not a lying one.
 - **PLI *response* is unproven.** File and synthetic sources have no live encoder, so keyframe
   request *plumbing* (including the upstream SSRC translation) is proven, but a source
   actually producing a keyframe on demand awaits a browser sender.
-- **Phase 7 is untouched.** No simulcast, no SVC, no TURN infrastructure. A relay sends one
-  quality layer to every downstream, and `overlay.NATRelayed` is a *modelled* constraint
-  declared by a flag.
+- **Phase 7 is mostly untouched.** No SVC, no TURN infrastructure, and `overlay.NATRelayed`
+  is still a *modelled* constraint declared by a flag. Its **quality-layer** item is built:
+  an origin may publish several rungs and a relay selects per leaf child (§5.14). What that
+  does *not* prove is stated in §8.5 — no encoder, leaf-only selection, loss-driven reaction
+  with no bandwidth estimate.
+- **Layer selection has been verified deterministically, not live.** The unit tests drive
+  the forwarder's two axes packet by packet and the policy as a pure function; the
+  end-to-end sequence that would prove "the impaired child received the LOW rung while its
+  sibling received the HIGH one" is written down in `docs/usage.md` and needs `tc netem`
+  (root) to manufacture the loss, because loopback has none.
 
 ### 8.8 Naming and surface honesty
 

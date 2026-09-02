@@ -15,10 +15,13 @@ coverage.html
 go.work
 go.work.sum
 
-# Media captured by later phases (save-to-disk, play-from-disk, etc.)
+# Media captured by later phases (save-to-disk, play-from-disk, etc.) and the quality
+# layers scripts/make-layers.sh generates. The SCRIPT is the artifact worth committing;
+# the encodes are megabytes and reproducible from it.
 *.ivf
 *.ogg
 *.h264
+*.mp4
 
 # Editor / OS cruft
 .DS_Store

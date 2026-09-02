@@ -94,7 +94,7 @@ Four modes, selected by flags.
 | `-call` | `false` | **Call mode.** Join a room and establish a WebRTC call instead of probing `/healthz`. |
 | `-room` | `default` | Room (meet) to join. |
 | `-send` | `false` | Add an outbound video track. Implied by `-media`. |
-| `-media` | `""` | VP8 IVF file to send (looped); empty sends synthetic frames. |
+| `-media` | `""` | VP8 IVF file(s) to send (looped); empty sends synthetic frames. **Comma-separated for QUALITY LAYERS**, lowest bitrate first (`-media q.ivf,h.ivf,f.ivf`) — up to three, refused loudly beyond that. One path is exactly the single-track behaviour. A path containing a comma cannot be expressed; that is the price of not adding a second flag. |
 | `-record` | `""` | Write the first received track to this IVF file; empty just counts packets. |
 | `-stun` | `""` | STUN server URL. Empty is fine on one host. |
 | `-name` | `""` | Stable topology name (`relay`, `leaf-b`, …). Required by `-topology` and `-managed`. Must match `^[a-z0-9][a-z0-9_-]{0,63}$`. |
@@ -326,6 +326,144 @@ and fanned it out with no re-encode. Notes:
   joiner decodes from the file's next natural keyframe; a real browser sender (Phase 7)
   would respond on demand.
 - **Depth ≤ 2, single relay** for now — no election or migration yet (Phases 4–6).
+
+### Quality layers — the relay hands different children different qualities (Phase 7)
+
+An origin may publish **several rungs of one stream** and the relay picks one **per
+child**, so a peer on a bad link gets 320x180 while its sibling on a good one gets
+1280x720 — from the same sender, over the same relay, at the same instant.
+
+Generate the three layers first (the script is committed; the `.ivf` files are gitignored
+build artifacts):
+
+```console
+$ scripts/make-layers.sh                 # synthesises a source clip, or pass your own
+$ scripts/make-layers.sh myclip.mp4 /tmp/lay
+layers written to /tmp/lay:
+-rw-r--r--. … 756817 /tmp/lay/layer-f.ivf
+-rw-r--r--. … 251857 /tmp/lay/layer-h.ivf
+-rw-r--r--. …  77078 /tmp/lay/layer-q.ivf
+```
+
+Then publish all three from one sender:
+
+```console
+$ ./bin/peer -call -room tree -name leaf-b -topology tree.json \
+      -media /tmp/lay/layer-q.ivf,/tmp/lay/layer-h.ivf,/tmp/lay/layer-f.ivf
+```
+
+**What this is and is not.** These are three ORDINARY tracks on three m-lines
+(`video.q`, `video.h`, `video.f`), **not** RFC 8853 simulcast — pion v4 has no MID/RID
+header-extension writer, and there is no browser client here to need one. And there is
+**no encoder**: three files stand in for three live encodings. conclave demonstrates layer
+**selection**, not layer **production**. See `docs/DESIGN.md` §5.14.
+
+The relay's log then shows all three arriving, each with its own SSRC and its own keyframe
+request — that is the check to run first, because a relay that receives one rung has nothing
+to choose between and the whole feature is silently inert (`docs/DESIGN.md` §7.5):
+
+```console
+$ grep 'forwarding source' relay.log
+… msg="forwarding source" source=leaf-b layer=q ssrc=2223513229 gen=1
+… msg="forwarding source" source=leaf-b layer=h ssrc=1669920939 gen=1
+… msg="forwarding source" source=leaf-b layer=f ssrc=1069006260 gen=1
+```
+
+A receiver on a clean link records the TOP rung (`decoded=1280,720`, ~2.7 MB for 15 s), not
+the first one published.
+
+Notes:
+
+- **Every leg starts on the top rung** and is only moved DOWN by evidence — a child is
+  never worse off for the source having gained a lower rung.
+- **The evidence is the child's own RTCP reception reports**, at roughly 1 Hz.
+  `layerDownRounds = 2` sustained samples above 5% loss shed one rung;
+  `layerUpRounds = 5` clean ones add one back. The asymmetry is deliberate: adding
+  bitrate is the bet that can cause the loss it was betting against.
+- **A child that is itself a RELAY is pinned to the top rung**, because it can only forward
+  what it receives. Selection is a leaf-only decision here (`docs/DESIGN.md` §8.5).
+- **`-log-level debug` shows every switch**: `msg="layer switch" source=… child=… from=f
+  to=h loss_pct=…`.
+- **A three-rung sender uploads all three streams** — about 1.25× the top rate. That cost
+  is real and is named in §5.14.
+
+#### Proving it end to end
+
+"It negotiated" is not proof. The proof is **two recordings that differ in decoded
+resolution**, and getting there needs real loss, which loopback does not have. `tc netem`
+supplies it, and `-media-ports` is what makes the filter targetable.
+
+Five terminals. `leaf-c` is the peer that will be impaired; `leaf-d` is the control.
+
+```console
+# 1 — a tree with one relay and two receiving leaves
+$ cat > tree.json <<'JSON'
+{ "edges": [ {"parent":"relay","child":"leaf-b"},
+             {"parent":"relay","child":"leaf-c"},
+             {"parent":"relay","child":"leaf-d"} ] }
+JSON
+
+# 2 — the server and the relay
+$ make run-server
+$ ./bin/peer -call -room lay -name relay -topology tree.json -log-level debug
+
+# 3 — the three-layer sender
+$ scripts/make-layers.sh "" /tmp/lay
+$ ./bin/peer -call -room lay -name leaf-b -topology tree.json \
+      -media /tmp/lay/layer-q.ivf,/tmp/lay/layer-h.ivf,/tmp/lay/layer-f.ivf
+
+# 4 — the two receivers, each on its OWN media port range so netem can tell them apart
+$ ./bin/peer -call -room lay -name leaf-c -topology tree.json \
+      -media-ports 47000-47019 -record /tmp/lay/got-c.ivf
+$ ./bin/peer -call -room lay -name leaf-d -topology tree.json \
+      -media-ports 47100-47119 -record /tmp/lay/got-d.ivf
+
+# 5 — impair ONLY leaf-c's inbound media, ~10 s after both are receiving.
+#     (root; loopback needs both an egress qdisc and the ifb trick for ingress, so the
+#      simplest reliable form is to drop on egress toward leaf-c's port range.)
+$ sudo tc qdisc add dev lo root handle 1: prio
+$ sudo tc qdisc add dev lo parent 1:3 handle 30: netem loss 12%
+$ sudo tc filter add dev lo protocol ip parent 1:0 prio 3 u32 \
+      match ip dport 47000 0xfff0 flowid 1:3
+```
+
+Watch the relay's log. Within a few seconds:
+
+```
+msg="layer switch" component=relay source=leaf-b child=leaf-c from=f to=h loss_pct=12.1
+msg="layer switch" component=relay source=leaf-b child=leaf-c from=h to=q loss_pct=13.4
+```
+
+…and `leaf-d` produces no such line at all. Let both record for ~30 s, then `Ctrl-C`
+everything, remove the qdisc, and **measure both files**:
+
+```console
+$ sudo tc qdisc del dev lo root
+
+$ for f in /tmp/lay/got-c.ivf /tmp/lay/got-d.ivf; do
+    printf "%-22s frames=%-6s bytes=%-9s decoded=%s\n" "$f" \
+      "$(ffprobe -v error -select_streams v:0 -count_frames \
+           -show_entries stream=nb_read_frames -of csv=p=0 "$f")" \
+      "$(stat -c%s "$f")" \
+      "$(ffprobe -v error -select_streams v:0 -show_entries frame=width,height \
+           -read_intervals '%+#1' -of csv=p=0 "$f")"
+  done
+/tmp/lay/got-c.ivf     frames=NNN    bytes=~small   decoded=320,180
+/tmp/lay/got-d.ivf     frames=NNN    bytes=~large   decoded=1280,720
+```
+
+**Read the `decoded=` column, not `ffprobe`'s stream-level `width`/`height`.** A recorded
+file's IVF *header* carries `ivfwriter`'s defaults (640x480) and is not the sender's frame
+size — so stream-level dimensions are the same wrong number on both files. The
+**frame-level** query above comes from the VP8 decoder and is the true coded size. That
+single distinction is the difference between this being a proof and being a coincidence.
+Frame counts should be roughly equal (both received continuously); bytes should differ by
+roughly the layers' bitrate ratio, ~10x here.
+
+`-record` needs no change for this: each leaf receives exactly ONE forwarded track per
+source (the child is never told which rung it is on), so the "first track claims the file"
+rule is not in the way. It *would* be in the way for a leaf subscribed to several sources
+at once, which is a pre-existing limitation, not one this work introduced.
 
 ### Managed room — the coordinator computes the tree (Phase 4)
 

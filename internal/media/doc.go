@@ -51,6 +51,32 @@
 // AdoptCoordinator, so this package never learns the arbiter's types — may raise a
 // peer's epoch.
 //
+// A source may publish SEVERAL QUALITY LAYERS, and the relay picks one PER CHILD.
+// They are several ORDINARY tracks on several m-lines (`video.q`, `video.h`,
+// `video.f`), not RFC 8853 simulcast: pion v4 has no MID/RID header-extension
+// writer, so a RID sender must hand-stamp every packet and cannot use
+// TrackLocalStaticSample at all. The only thing separate m-lines cost is
+// browser-sender interop, and there is no browser client here. See docs/DESIGN.md
+// §5.14 — and note that conclave demonstrates layer SELECTION, not layer
+// PRODUCTION: an origin plays pre-encoded files, there is no encoder anywhere.
+//
+// That gives the forwarder a SECOND axis, and the invariant is now: exactly one
+// (generation, layer) per leg may write. Reader generations are per (source,
+// layer); so is the upstream PLI target, because a PLI naming another rung's SSRC
+// is discarded by the sender with no error at all. Each downstream leg still
+// carries ONE track whatever the source publishes — the child is never told which
+// rung it is on, because rtpRewriter makes a layer change look like the same
+// continuous stream, exactly as it already does for a re-parent. That is what keeps
+// the m-line count, the topology diff and overlay.Validate untouched.
+//
+// The choice itself (layers.go, selectLayer) is a PURE function with hysteresis,
+// run from the child's own RTCP reception reports at roughly 1 Hz. It lives in the
+// data plane on purpose: routing a per-child congestion response through the
+// coordinator would put it behind the 3 s telemetry cadence and a WebSocket round
+// trip, and make downstream quality depend on the control plane being alive.
+// Selection is LEAF-ONLY — a child relay is pinned to the top rung, because it can
+// only forward what it receives.
+//
 // A source is identified by the peer that ORIGINATED it, never by the neighbour
 // that handed it over. One edge therefore carries as many forwarded tracks as there
 // are participants behind it — which is every edge more than one hop from a sender —
@@ -80,7 +106,8 @@
 // names — which is the ground truth a newly promoted coordinator rebuilds the
 // previous tree from, instead of inheriting its predecessor's beliefs.
 //
-// Media sources (PlayIVF, SendSynthetic) feed an outbound track; sinks
+// Media sources (PlayIVF, SendSynthetic) feed an outbound track — one per layer a
+// peer publishes; sinks
 // (RecordVP8, DrainAndCount) consume a remote track. Codecs are pinned to VP8 in
 // the MediaEngine so both ends agree without depending on default ordering.
 package media

@@ -901,9 +901,11 @@ type outboundLayer struct {
 // to reconcile (which pion could not roll back anyway).
 func (r *Router) setupRelayEdge(session *Session, topo *overlay.Topology, peerName string) {
 	// Receive whatever arrives over this edge; the reader is wired in
-	// remoteTrackSink.
-	if err := session.AddRecvOnlyVideo(); err != nil {
-		r.log.Warn("relay recvonly transceiver", slog.String("peer_name", peerName), slog.Any("error", err))
+	// remoteTrackSink. HOW MANY receive slots, and WHEN they are added, both depend
+	// on which side of the edge this is — see addRecvSlots for the two reasons.
+	offerer := session.Offerer()
+	if !offerer {
+		r.addRecvSlots(session, peerName, 1)
 	}
 	// Every source that arrives THROUGH this neighbour points its upstream here, so
 	// a downstream keyframe request is translated and forwarded to the peer that can
@@ -933,6 +935,52 @@ func (r *Router) setupRelayEdge(session *Session, topo *overlay.Topology, peerNa
 			r.fwd.addOutPinned(l.src, peerName, fwdTrack, sender)
 		} else {
 			r.fwd.addOut(l.src, peerName, fwdTrack, sender)
+		}
+	}
+
+	// The offerer's receive slots go in LAST — see addRecvSlots.
+	if offerer {
+		r.addRecvSlots(session, peerName, len(layerLadder))
+	}
+}
+
+// addRecvSlots adds n receive-only video transceivers to a relay edge. Two rules,
+// each with a different reason, and both learned from a defect rather than guessed
+// (docs/DESIGN.md §7.5).
+//
+// HOW MANY. On the OFFERER side, ONE PER POSSIBLE QUALITY LAYER. §5.12 makes the
+// relay the sole offerer on a tree edge, so a neighbour publishing layers is the
+// ANSWERER — and an answerer cannot create m-lines, it can only fold its local
+// tracks into ones the offer already carried. A three-rung origin answering a
+// one-m-line offer puts ONE rung on the wire and silently drops two: negotiation
+// succeeds, media flows, every log line is clean, and the relay has a one-rung
+// ladder to choose from. That is what the first build of this feature did.
+//
+// On the ANSWERER side, exactly ONE — unchanged from before layers existed. Extra
+// ones buy nothing (we cannot create m-lines) and actively HARM: pion's
+// satisfyTypeAndDirection prefers a RECVONLY transceiver over a SENDRECV one when
+// matching a remote sendrecv m-line, so a leftover recvonly hijacks the m-line a
+// forwarded track needed and the relay answers "connected", sending nothing. That
+// is a silent black-video failure, and it is what TestRouterPromotesBackupParent
+// caught when this was applied to both sides.
+//
+// WHEN. The offerer's slots are added AFTER its forwarded tracks, because
+// pc.AddTrack CANNIBALISES a spare recvonly transceiver rather than creating a new
+// one (its isSendAllowed check). Added first, they would be spent on the forwarded
+// m-lines and the neighbour would again have nowhere to publish its rungs. The
+// answerer's one slot is added FIRST, for the mirror-image reason: being consumed
+// by the first forwarded track is exactly what keeps no leftover recvonly around to
+// hijack the matching.
+//
+// The cost on the offering side is paid whether or not anyone publishes layers:
+// len(layerLadder)-1 extra m-lines per relay edge, negotiated and then inactive. It
+// is paid unconditionally because a relay cannot know how many rungs a neighbour
+// will publish until the tracks arrive, and by then the offer is long gone.
+func (r *Router) addRecvSlots(session *Session, peerName string, n int) {
+	for i := 0; i < n; i++ {
+		if err := session.AddRecvOnlyVideo(); err != nil {
+			r.log.Warn("relay recvonly transceiver",
+				slog.String("peer_name", peerName), slog.Int("index", i), slog.Any("error", err))
 		}
 	}
 }
