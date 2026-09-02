@@ -72,7 +72,9 @@
 // promote and exactly one end authorizes, so on any tree overlay.Validate would
 // accept — one where a backup is never already a neighbour — no second offer exists
 // to collide with. On a tree it would not accept, neither end's assigned role takes
-// (startPeerOpt will not re-role a session it already holds) and both say so at WARN.
+// (startPeerOpt will not re-role a session it already holds), both say so at WARN,
+// and the promoter does not send the frame at all: asking for an offer while still
+// holding the offerer role itself is the one glare pion cannot recover from.
 //
 // Because the Router owns the peer's one signaling stream, it is also the seam the
 // control plane reaches its host through: OnCoordinator carries the arbiter's

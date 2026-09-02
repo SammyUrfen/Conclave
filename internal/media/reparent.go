@@ -346,19 +346,26 @@ func (r *Router) startReparent(ctx context.Context, oldParent, newParent string,
 	}
 	// A role override is silently dropped when a session to this peer is already
 	// open (startPeerOpt is idempotent per peer), and on a backup edge that means we
-	// keep whatever role the TREE gave the edge while asking the far end to offer.
-	// Under a Validate-clean tree it cannot happen — a backup is never already a
-	// neighbour — but applyTopology does not call Validate (§8.3). The move is not
-	// abandoned here: ReparentConnectTimeout and ReparentMediaTimeout still own the
-	// outcome, exactly as they do for a refused or lost promote. It is logged because
-	// a promotion that kept the wrong role fails in a completely different way from
-	// one that took, and nothing else in the log tells the two apart.
-	if !r.startPeerOpt(ctx, peerID, opts) && viaBackup {
+	// keep whatever role the TREE gave the edge. Under a Validate-clean tree it
+	// cannot happen — a backup is never already a neighbour — but applyTopology does
+	// not call Validate (§8.3), and a hand-authored -topology file is a supported
+	// mode, so an operator can reach it.
+	//
+	// The frame is therefore gated on the role having ACTUALLY been applied. Asking
+	// the far end to offer while we are still the offerer ourselves is the one
+	// failure on this path that does not heal: a far end holding no session back
+	// creates one as offerer, both ends sit in have-local-offer, and pion v4 has no
+	// rollback out of it (§5.12) — no error, no timeout, a permanently wedged edge.
+	// Withholding it costs nothing, because ReparentConnectTimeout already owns the
+	// outcome of a promote that produces no offer, exactly as it does for one that is
+	// refused or lost on the wire.
+	created := r.startPeerOpt(ctx, peerID, opts)
+	if viaBackup && !created {
 		r.log.Warn("promoting onto a peer we already hold a session to: no session was created, "+
-			"so the backup edge's answerer role was not applied",
+			"so the backup edge's answerer role was not applied and the promote was not sent",
 			slog.String("new_parent", newParent), slog.Bool("wanted_offerer", false))
 	}
-	if viaBackup {
+	if viaBackup && created {
 		// AFTER the session exists, so the parent's offer has an inbox to land in —
 		// deliver() would otherwise drop it as a frame for an unknown peer, and the
 		// promotion would fail on the connect timeout for no reason at all. Both run

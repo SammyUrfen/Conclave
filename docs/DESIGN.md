@@ -1383,21 +1383,41 @@ symmetry to lose. Exactly one end can promote — the child whose parent died �
 end ever sends the frame. The other end does not get a vote: it either finds itself named as
 that child's backup in its own current topology and offers, or it drops the frame. There is no
 state in which both ends offer, and the child's session is created as the answerer *before*
-the frame goes out, so there is no window in which it could — **provided neither end already
-holds a session to the other**, which a `Validate`-clean topology guarantees, because a backup
-is never a neighbour (`B ∉ Subtree(ParentOf(node))`).
+the frame goes out, so there is no window in which it could.
 
-That proviso is load-bearing, and it is a *guarantee held upstream*, not an invariant the peer
-enforces: `Router.applyTopology` unmarshals and fences a pushed tree but never calls
-`overlay.Validate` (§8.3). On a tree where the backup already *is* a neighbour, both role
-assignments are dropped — `startPeerOpt` is idempotent per peer and returns before it reads the
-override — and each end keeps whatever role the tree gave the edge, which can be "both offer".
-The claim above is therefore conditional, and what the code enforces unconditionally is the
-next-best thing: **the drop is never silent.** `startPeerOpt` reports whether it created the
-session, the promoted parent logs its success line only when the offerer role actually took,
-and both ends log the discard at WARN with the peer and the role they wanted. The failure then
-lands where every other failure on this edge lands — `ReparentConnectTimeout` — instead of
-looking, in the log, exactly like the success it is not.
+That last clause used to carry a proviso — *provided neither end already holds a session to the
+other*, which only a `Validate`-clean topology guarantees, because a backup is never a
+neighbour (`B ∉ Subtree(ParentOf(node))`). And that guarantee is held **upstream**:
+`Router.applyTopology` unmarshals and fences a pushed tree but never calls `overlay.Validate`
+(§8.3), and a hand-authored `-topology` file is a supported mode, so an operator can put a tree
+into a peer where the backup already *is* a neighbour. `startPeerOpt` is idempotent per peer and
+returns *before* it reads the override, so on such a tree the promoter's answerer role is
+dropped and it stays whatever the tree made it — possibly the offerer. Sending the frame anyway
+asked the far end to offer as well, and a far end holding no session back would have done it:
+both in `have-local-offer`, no rollback, no error, no timeout. Every other failure on this path
+is a `ReparentConnectTimeout` that heals; that one did not.
+
+**The frame is now gated on the role having actually been applied.** `startPeerOpt` reports
+whether it created the session, and the promoter sends `TypeBackupPromote` only when it did —
+which is exactly the condition under which the promoter is provably the answerer. The receiving
+end is closed by the same guard from the other side: `onBackupPromote` mints an offerer session
+only when it held no session to that peer at all, and returns (at WARN) when it did. So on
+**any** tree, `Validate`-clean or not, *the promotion path cannot produce a second offerer* —
+no proviso. Pinned by `TestPromoteFrameIsWithheldWhenTheAnswererRoleWasDiscarded`, which asserts
+the frame's absence on the wire rather than a role in memory.
+
+What that does **not** claim, and what still rests on the coordinator being correct:
+
+* **Roles a session already holds still come from the tree.** Two ends evaluating *different*
+  trees can still derive incompatible roles for an in-tree edge, `Offers` being symmetric only
+  on identical inputs. This change removes the promotion path as a *producer* of glare; it does
+  not make the peer self-sufficient about roles in general.
+* **A promotion onto an existing session still cannot invert it, and now does not even try.**
+  On a tree `Validate` would reject, the backup edge keeps the tree's role, no offer is
+  exchanged, and the promotion fails on `ReparentConnectTimeout` — the same rung a refused or
+  lost frame lands on. Both ends log the discard at WARN with the peer and the role they wanted,
+  and the promoted parent logs its success line only when the offerer role actually took. The
+  outcome is a failure the coordinator repairs, not a wedge nothing notices.
 
 The mirror of that admission is a path that was **deleted**: `deliver` used to conjure a
 session for an unsolicited *offer* from a peer whose topology named us its backup, which is how
