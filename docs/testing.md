@@ -665,6 +665,7 @@ the ratio drops below 1:1.
 | `TestPendingGenerationDoesNotStealTheLiveSSRC` | a pending reader's SSRC pointing the upstream PLI at a stream the current parent never sent |
 | `TestRTTSensorIsWiredToTheForwarder` | the RTT input unwired or always absent — invisible, because it only gates upgrades |
 | `TestReviewLayerSurvivesASourceWithNoTracksYet` | deleting `selectLayer`'s empty-ladder guard, which panics on an RTCP-drain goroutine |
+| `TestInTreeAnswererStrandsSourcesPastTheOfferedMLines` | *(characterization, not a spec)* the recv-slot count drifting in either direction — it is what bounds an **unrelated, unfixed** `Offers` defect. See below |
 
 **The one this table cannot list is the one that mattered most.** Every test above was green
 while the feature was *inert end to end*: the relay offered one recvonly m-line, so a
@@ -679,6 +680,21 @@ suite green, reproducing the identical silent failure from the origin's end.
 `TestOriginPublishesEveryLayerEndToEnd` closes it, and it is the only test in the repository
 that does — verified by applying that mutation and running `go test ./...`, where it is the
 sole failure. See `docs/DESIGN.md` §7.5.
+
+**And one of those recv slots turned out to be load-bearing somewhere nobody aimed it.**
+`TestInTreeAnswererStrandsSourcesPastTheOfferedMLines` is a **characterization** test — it
+asserts what this build *does*, not what it should do. `overlay.Topology.Offers` can make the
+endpoint that owes forwarded tracks the *answerer* on a relay-to-relay edge, and an answerer
+cannot create m-lines, so it strands every source past
+`len(layerLadder) + len(legsToward(offerer, answerer))` — measured **4** on the shipped
+fixture, and **1** before the layer work moved those slots. The layer change raised that
+number without fixing anything, so the test has three arms: at the bound every source now
+arrives (the accident, locked in so it cannot silently regress), above the bound they still
+strand, and a control that renames the root so it wins the tiebreak and offers. Two mutations
+prove it discriminates — the offerer's slot count set back to `1` fails the at-the-bound arm,
+set to `12` fails the above-the-bound arm. **Delete it only when `Offers` itself is fixed**,
+never by editing its numbers. `docs/DESIGN.md` §7.6 has the measurement table and why the fix
+is a separate work item.
 
 ---
 

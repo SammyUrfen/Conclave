@@ -1437,6 +1437,13 @@ does not contain: there is no role to derive, so a role has to be assigned, and 
 has to be the one that lets the parent publish. `Offers(a, b)` is untouched, and no in-tree
 edge negotiates differently because of this.
 
+**`Offers` is untouched — and on an in-tree edge between two relays it is also wrong.** Its
+`self > peer` tiebreak can name the endpoint that owes *no* forwarded tracks as the offerer,
+which leaves the one that does owe them answering and unable to create the m-lines. It is not
+an inversion, so the `invert` bucket never sees it. It is bounded rather than total on this
+build, by accident, and the bound is measured in **§7.6** — which is also where the reason it
+was not fixed here is written down.
+
 The cost is honest: one more wire type, one more round trip on a failover path, and a frame
 whose loss is indistinguishable from a backup parent that refuses. Both land in the same
 place — `ReparentConnectTimeout`, `OK: false`, the coordinator repairs — which is why the
@@ -2081,6 +2088,63 @@ never connected on a real wire. §8.7 already says every live run has been singl
 is the first time that limitation *hid a defect* rather than merely bounding a claim, and the
 defect survived a spec-first test suite, a 24-mutation sweep and a green `make check`.
 
+### 7.6 A seventh, which §7.5's fix accidentally half-hid
+
+The receive slots §7.5 added for quality layers also **partially masked a defect nobody knew
+about**, in a different subsystem, without fixing it. Both halves of that sentence matter, and
+the honest version is neither "it's fixed" nor silence.
+
+**The defect is in `Offers`, and it predates all of this.** `Topology.Offers` breaks a
+relay-vs-relay tie on `self > peer`. On a three-deep tree `a -> m -> c`, both `a` and `m` are
+relays and `"a" < "m"`, so the **middle** relay offers and the **root answers** — while it is
+the root that owes `m` a forwarded track for every publisher on the root's side. §5.12's
+inversion machinery does not apply: no role *changed*, so nothing lands in the `invert`
+bucket. The root simply cannot create the m-lines it needs, and every source past the count
+it can fit is stranded **indefinitely** — no error, no log line, just participants missing
+from a whole subtree, and the loss propagates one hop further to the leaf behind `m`.
+
+**What the layer work changed.** Before it, the offering side added its one receive slot
+*first*, where `pc.AddTrack` cannibalised it (§7.5), so `m`'s offer carried exactly its own
+forwarded legs and the answering root could publish **one** source. After it, the offering
+side adds `len(layerLadder)` slots *last*, so they survive — and a slot meant for a
+neighbour's quality rung is equally a slot an answering relay can fold a forwarded track
+into. Measured on the `internal/media` fixture, six sources owed to `m` while varying how
+many forwarded legs `m` carries back up the same edge:
+
+| `m`'s legs up | sources owed | sources `m` received |
+|---|---|---|
+| 1 | 6 | **4** |
+| 2 | 6 | **5** |
+| 3 | 6 | 6 *(uncapped — owed equals the bound)* |
+
+So the bound is **`len(layerLadder) + len(legsToward(m, root))`** — exactly the m-lines `m`'s
+own offer carried that the root can send on. Not `len(layerLadder)`, not a constant, and not
+anything anyone designed: it moves with a term from a completely unrelated part of the tree.
+
+**The default deployment now hides it.** `-max-depth 2` means the root's children are leaves,
+so `Offers`'s relay-vs-relay tiebreak is never reached; and at depth 3 with a small meet the
+owed count is usually under four. That is a mask, not a fix: a nine-peer meet at depth 3 is
+enough to strand people again.
+
+The right fix is to `Offers` itself — the endpoint that owes forwarded tracks on an edge must
+be the offerer — and it was deliberately **not** taken here. It changes the tie-break every
+`internal/overlay` and `internal/media` negotiation invariant is derived from, it interacts
+with the `invert` bucket and with §5.12's backup-edge argument about who may offer, and it
+deserves its own work item and its own review rather than a ride-along on a layer change.
+What is here instead is `TestInTreeAnswererStrandsSourcesPastTheOfferedMLines`: three arms —
+at the bound the sources now *all* arrive (locking the accident in so it cannot silently
+regress), above the bound they still strand, and a control that renames the root so it wins
+the tiebreak and gets everything. Two mutations prove it discriminates: the offerer's slot
+count set back to `1` fails the at-the-bound arm, and set to `12` fails the above-the-bound
+arm.
+
+**The lesson, and it is not §7.5's either.** §7.5's was "a correct unit can still be inert".
+This one is that **a change can improve a number in a subsystem it was never aimed at, and the
+improvement reads exactly like a fix**. The characterization test that pinned the old value at
+`1` is the only reason anyone noticed: it went red on a branch that had nothing to do with it.
+Had that value not been pinned, this would have been a silent partial repair of a defect the
+project did not know it had, with a bound nobody could state.
+
 ---
 
 ## 8. Limitations
@@ -2368,6 +2432,13 @@ visibly depends on it.
   live encoder to answer, so in practice the wait is the clip's GOP —
   `scripts/make-layers.sh` sets `-g 30` (one second) precisely so this is not mistaken for a
   relay bug.
+- **A relay-vs-relay in-tree edge strands sources past a measured bound (§7.6).** `Offers`
+  can make the endpoint that owes forwarded tracks the *answerer*, and an answerer cannot
+  create m-lines, so it delivers only
+  `len(layerLadder) + len(legsToward(offerer, answerer))` of them — 4 on the shipped
+  fixture — and drops the rest silently. `-max-depth 2` keeps it unreachable, since the
+  tiebreak is only consulted when both endpoints are relays. The bound is an accident of the
+  layer work, not a fix; the underlying rule is still wrong and needs its own work item.
 - **`deriveWorking` has a recorded gap at depth ≥ 3.** An orphan has no edge in the working
   copy, so with `MaxDepth ≥ 3` a *grandchild* can be re-parented gratuitously. The code says
   so, and says it is not fixable without changing `overlay.processingOrder`. The default
