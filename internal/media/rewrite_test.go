@@ -203,15 +203,15 @@ func TestForwarderMakeBeforeBreak(t *testing.T) {
 	f.addOutLive("S", "C", child, nil)
 
 	// The original upstream is live and feeding the child.
-	genOld := f.newUpstreamGen("S")
-	f.fanout("S", genOld, vp8Pkt(1000, 90000, true))
-	f.fanout("S", genOld, vp8Pkt(1001, 93000, false))
+	genOld := f.newUpstreamGen("S", "")
+	f.fanout("S", "", genOld, vp8Pkt(1000, 90000, true))
+	f.fanout("S", "", genOld, vp8Pkt(1001, 93000, false))
 
 	// Make-before-break: the new parent connects and its forwarded track arrives
 	// while the old one is still delivering.
-	genNew := f.newUpstreamGen("S")
-	f.fanout("S", genNew, vp8Pkt(60000, 5000, true))
-	f.fanout("S", genOld, vp8Pkt(1002, 96000, false))
+	genNew := f.newUpstreamGen("S", "")
+	f.fanout("S", "", genNew, vp8Pkt(60000, 5000, true))
+	f.fanout("S", "", genOld, vp8Pkt(1002, 96000, false))
 
 	if got := len(child.snapshot()); got != 3 {
 		t.Fatalf("child received %d packets during the overlap, want 3 — the new upstream "+
@@ -223,10 +223,10 @@ func TestForwarderMakeBeforeBreak(t *testing.T) {
 	f.rebindUpstream("S", next)
 
 	// The old loop is still draining its dying track; nothing it writes may land.
-	f.fanout("S", genOld, vp8Pkt(1003, 99000, false))
-	f.fanout("S", genNew, vp8Pkt(60001, 8000, false)) // interframe: dropped by the latch
-	f.fanout("S", genNew, vp8Pkt(60002, 11000, true)) // keyframe: resumes the leg
-	f.fanout("S", genNew, vp8Pkt(60003, 14000, false))
+	f.fanout("S", "", genOld, vp8Pkt(1003, 99000, false))
+	f.fanout("S", "", genNew, vp8Pkt(60001, 8000, false)) // interframe: dropped by the latch
+	f.fanout("S", "", genNew, vp8Pkt(60002, 11000, true)) // keyframe: resumes the leg
+	f.fanout("S", "", genNew, vp8Pkt(60003, 14000, false))
 
 	got := child.snapshot()
 	if len(got) != 5 {
@@ -250,7 +250,7 @@ func TestForwarderMakeBeforeBreak(t *testing.T) {
 	// Rebinding also resets the learned SSRC, so the next upstream PLI cannot carry
 	// the OLD source's SSRC (which the new upstream would silently ignore).
 	f.mu.RLock()
-	ssrc := f.sources["S"].ssrc.Load()
+	ssrc := f.sources["S"].layers[""].ssrc.Load()
 	up := f.sources["S"].upstream
 	f.mu.RUnlock()
 	if ssrc != 0 {

@@ -44,13 +44,13 @@ func TestForwarderTranslatesPLISSRC(t *testing.T) {
 	up := &captureRTCP{}
 	f.setUpstream("src", up)
 
-	// Simulate the source's media having arrived with a known SSRC.
-	f.mu.Lock()
-	f.sources["src"].ssrc.Store(0xABCDEF)
-	f.mu.Unlock()
+	// Simulate the source's media having arrived with a known SSRC. A source with
+	// one unnamed layer is what a single-track sender publishes.
+	gen := f.newUpstreamGen("src", "")
+	f.learnSSRC("src", "", gen, 0xABCDEF)
 
-	f.requestUpstreamKeyframe("src")
-	f.requestUpstreamKeyframe("src") // immediate second call: throttled away
+	f.requestUpstreamKeyframe("src", "")
+	f.requestUpstreamKeyframe("src", "") // immediate second call: throttled away
 
 	if up.count() != 1 {
 		t.Fatalf("wrote %d upstream RTCP packets, want 1 (second throttled)", up.count())
@@ -69,7 +69,7 @@ func TestForwarderTranslatesPLISSRC(t *testing.T) {
 	// A source whose media hasn't arrived (ssrc 0) must not emit a PLI.
 	f.setUpstream("silent", &captureRTCP{})
 	before := f.PLIForwarded()
-	f.requestUpstreamKeyframe("silent")
+	f.requestUpstreamKeyframe("silent", "")
 	if f.PLIForwarded() != before {
 		t.Error("requested a keyframe for a source with no media (ssrc 0)")
 	}

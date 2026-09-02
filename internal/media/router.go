@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"os"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -27,8 +26,20 @@ type RouterConfig struct {
 	// Zero ⇒ ephemeral. See SessionConfig.MediaPortRange for why it exists.
 	MediaPortRange [2]uint16
 	SendMedia      bool   // add an outbound video track toward each peer
-	MediaPath      string // IVF file to send; empty ⇒ synthetic frames
 	RecordPath     string // write the first received track here; empty ⇒ just count
+
+	// MediaPaths are the VP8 IVF files this peer publishes, LOWEST bitrate first.
+	// Empty ⇒ synthetic frames. ONE path is exactly the shipped single-track
+	// behaviour (a track called `video`, one m-line, one source). SEVERAL publish one
+	// ordinary track per file — `video.q`, `video.h`, `video.f` — which is what lets
+	// a relay hand different children different qualities.
+	//
+	// Deliberately NOT RFC 8853 simulcast (one m-line, several RIDs): pion v4 has no
+	// MID/RID header-extension writer, so a RID sender must hand-stamp every packet
+	// and cannot use TrackLocalStaticSample at all. The only thing separate m-lines
+	// cost is browser-sender interop, and conclave has no browser client. See
+	// docs/DESIGN.md §5.14.
+	MediaPaths []string
 
 	// Topology, when non-nil, switches the Router from full mesh to tree mode: a
 	// peer opens a session only to its topology neighbours (not to every other
@@ -274,6 +285,7 @@ func NewRouter(log *slog.Logger, client *signaling.Client, cfg RouterConfig) *Ro
 	// track is gated on the live topology via isRelayNow(), not on fwd != nil.
 	if cfg.Managed || (cfg.Topology != nil && cfg.Topology.IsRelay(cfg.SelfName)) {
 		r.fwd = newForwarder(r.log, r.meter, r.spawnTracked, clk)
+		r.fwd.rtt = r.rttToPeer
 	}
 	return r
 }
@@ -667,7 +679,11 @@ func (r *Router) addLegLive(l leg) bool {
 			slog.String("source", l.src), slog.String("child", l.child))
 		return false
 	}
-	r.fwd.addOutLive(l.src, l.child, track, sender)
+	if topo := r.currentTopo(); topo != nil && topo.IsRelay(l.child) {
+		r.fwd.addOutPinned(l.src, l.child, track, sender)
+	} else {
+		r.fwd.addOutLive(l.src, l.child, track, sender)
+	}
 	return true
 }
 
@@ -845,7 +861,7 @@ func (r *Router) startPeerOpt(ctx context.Context, peerID string, opts peerOpts)
 	//   relay            → receive this neighbour's media + offer the others' forwarded tracks
 	//   leaf/mesh sender → add own camera (it folds into the answer)
 	//   offerer, no media → a recvonly transceiver so it still has something to offer
-	var track *webrtc.TrackLocalStaticSample
+	var layers []outboundLayer
 	relayEdge := r.isRelayNow()
 	peerRelay := topo != nil && topo.IsRelay(peerName)
 	r.mu.Lock()
@@ -858,9 +874,20 @@ func (r *Router) startPeerOpt(ctx context.Context, peerID string, opts peerOpts)
 	case relayEdge:
 		r.setupRelayEdge(session, topo, peerName)
 	case r.cfg.SendMedia:
-		track, err = session.AddVideoTrack("video", "conclave")
-		if err != nil {
-			r.log.Error("add outbound track", slog.String("peer_id", peerID), slog.Any("error", err))
+		// One track per layer, each on its own m-line. Added before Start, so they
+		// all ride the first offer/answer with no renegotiation.
+		for _, ml := range mediaLayersFor(r.cfg.MediaPaths) {
+			id := "video"
+			if ml.ID != "" {
+				id += layerSep + ml.ID
+			}
+			t, err := session.AddVideoTrack(id, "conclave")
+			if err != nil {
+				r.log.Error("add outbound track",
+					slog.String("peer_id", peerID), slog.String("track", id), slog.Any("error", err))
+				continue
+			}
+			layers = append(layers, outboundLayer{track: t, path: ml.Path})
 		}
 	case session.Offerer():
 		if err := session.AddRecvOnlyVideo(); err != nil {
@@ -872,10 +899,16 @@ func (r *Router) startPeerOpt(ctx context.Context, peerID string, opts peerOpts)
 	r.log.Info("session started",
 		slog.String("peer_id", peerID), slog.String("peer_name", peerName), slog.Bool("offerer", session.Offerer()))
 
-	if track != nil {
-		r.pumpOutbound(linkCtx, track, peerID)
+	for _, l := range layers {
+		r.pumpOutbound(linkCtx, l.track, l.path, peerID)
 	}
 	return true
+}
+
+// outboundLayer pairs one added local track with the file that feeds it.
+type outboundLayer struct {
+	track *webrtc.TrackLocalStaticSample
+	path  string
 }
 
 // setupRelayEdge wires the relay's side of the edge toward neighbour peerName,
@@ -889,9 +922,11 @@ func (r *Router) startPeerOpt(ctx context.Context, peerID string, opts peerOpts)
 // to reconcile (which pion could not roll back anyway).
 func (r *Router) setupRelayEdge(session *Session, topo *overlay.Topology, peerName string) {
 	// Receive whatever arrives over this edge; the reader is wired in
-	// remoteTrackSink.
-	if err := session.AddRecvOnlyVideo(); err != nil {
-		r.log.Warn("relay recvonly transceiver", slog.String("peer_name", peerName), slog.Any("error", err))
+	// remoteTrackSink. HOW MANY receive slots, and WHEN they are added, both depend
+	// on which side of the edge this is — see addRecvSlots for the two reasons.
+	offerer := session.Offerer()
+	if !offerer {
+		r.addRecvSlots(session, peerName, 1)
 	}
 	// Every source that arrives THROUGH this neighbour points its upstream here, so
 	// a downstream keyframe request is translated and forwarded to the peer that can
@@ -906,6 +941,10 @@ func (r *Router) setupRelayEdge(session *Session, topo *overlay.Topology, peerNa
 	// peerName is not always a topology neighbour: a peer that promoted us as its
 	// backup parent (§7.5a) is an edge the tree does not contain yet, and it still
 	// has to be fed.
+	//
+	// A child that is itself a RELAY is pinned to the top rung: it can only forward
+	// what it receives, so handing it a lower one would cap its whole subtree.
+	childIsRelay := topo != nil && topo.IsRelay(peerName)
 	for _, l := range legsToward(topo, r.selfName, peerName) {
 		fwdTrack, sender, err := session.AddForwardTrack(forwardTrackPrefix+l.src, "conclave")
 		if err != nil {
@@ -913,7 +952,61 @@ func (r *Router) setupRelayEdge(session *Session, topo *overlay.Topology, peerNa
 				slog.String("source", l.src), slog.String("child", peerName))
 			continue
 		}
-		r.fwd.addOut(l.src, peerName, fwdTrack, sender)
+		if childIsRelay {
+			r.fwd.addOutPinned(l.src, peerName, fwdTrack, sender)
+		} else {
+			r.fwd.addOut(l.src, peerName, fwdTrack, sender)
+		}
+	}
+
+	// The offerer's receive slots go in LAST — see addRecvSlots.
+	if offerer {
+		r.addRecvSlots(session, peerName, len(layerLadder))
+	}
+}
+
+// addRecvSlots adds n receive-only video transceivers to a relay edge. Two rules,
+// each with a different reason, and both learned from a defect rather than guessed
+// (docs/DESIGN.md §7.5).
+//
+// HOW MANY. On the OFFERER side, ONE PER POSSIBLE QUALITY LAYER. §5.12 makes the
+// relay the sole offerer on a tree edge, so a neighbour publishing layers is the
+// ANSWERER — and an answerer cannot create m-lines, it can only fold its local
+// tracks into ones the offer already carried. A three-rung origin answering a
+// one-m-line offer puts ONE rung on the wire and silently drops two: negotiation
+// succeeds, media flows, every log line is clean, and the relay has a one-rung
+// ladder to choose from. That is what the first build of this feature did.
+//
+// On the ANSWERER side, exactly ONE — unchanged from before layers existed. Extra
+// ones buy nothing (we cannot create m-lines) and actively HARM: pion's
+// satisfyTypeAndDirection prefers a RECVONLY transceiver over a SENDRECV one when
+// matching a remote sendrecv m-line, so a leftover recvonly hijacks the m-line a
+// forwarded track needed and the relay answers "connected", sending nothing. That
+// is a silent black-video failure, and it is what TestRouterPromotesBackupParent
+// caught when this was applied to both sides.
+//
+// WHEN. The offerer's slots are added AFTER its forwarded tracks, because
+// pc.AddTrack CANNIBALISES a spare recvonly transceiver rather than creating a new
+// one (its isSendAllowed check). Added first, they would be spent on the forwarded
+// m-lines and the neighbour would again have nowhere to publish its rungs. The
+// answerer's one slot is added FIRST, for the mirror-image reason: being consumed
+// by the first forwarded track is exactly what keeps no leftover recvonly around to
+// hijack the matching.
+//
+// The cost on the offering side is paid whether or not anyone publishes layers. An
+// edge that carries no forwarded leg grows by len(layerLadder)-1 m-lines; one that
+// carries at least one grows by len(layerLadder), because the slot the FIRST
+// forwarded track used to cannibalise is now a separate m-line — measured 1 → 4 on a
+// one-leg edge. Two of the three sit negotiated and inactive for a single-rung
+// neighbour. It
+// is paid unconditionally because a relay cannot know how many rungs a neighbour
+// will publish until the tracks arrive, and by then the offer is long gone.
+func (r *Router) addRecvSlots(session *Session, peerName string, n int) {
+	for i := 0; i < n; i++ {
+		if err := session.AddRecvOnlyVideo(); err != nil {
+			r.log.Warn("relay recvonly transceiver",
+				slog.String("peer_name", peerName), slog.Int("index", i), slog.Any("error", err))
+		}
 	}
 }
 
@@ -922,7 +1015,7 @@ func (r *Router) setupRelayEdge(session *Session, topo *overlay.Topology, peerNa
 // is held up for exactly the pump's lifetime, so what the meter reports as "peers"
 // is precisely the number of live outbound streams. The pump is registered with the
 // WaitGroup so a shutdown joins it.
-func (r *Router) pumpOutbound(ctx context.Context, track *webrtc.TrackLocalStaticSample, peerID string) {
+func (r *Router) pumpOutbound(ctx context.Context, track *webrtc.TrackLocalStaticSample, path, peerID string) {
 	w := meteredTrack{track: track, meter: r.meter}
 
 	r.meter.addPeer(1)
@@ -932,8 +1025,8 @@ func (r *Router) pumpOutbound(ctx context.Context, track *webrtc.TrackLocalStati
 		defer r.meter.addPeer(-1)
 
 		var err error
-		if r.cfg.MediaPath != "" {
-			err = PlayIVF(ctx, r.log, r.cfg.MediaPath, w)
+		if path != "" {
+			err = PlayIVF(ctx, r.log, path, w)
 		} else {
 			err = SendSynthetic(ctx, w, 30)
 		}
@@ -962,11 +1055,13 @@ func (r *Router) remoteTrackSink(ctx context.Context, peerID string) func(*webrt
 		// happens on every edge more than one hop from a sender. Falling back to the
 		// neighbour's name covers the other case: a peer's own camera track, which is
 		// named "video" and is by definition that peer's own media.
-		srcName := peerName
-		if id := track.ID(); strings.HasPrefix(id, forwardTrackPrefix) {
-			srcName = strings.TrimPrefix(id, forwardTrackPrefix)
-		}
+		//
+		// A track id may also carry a LAYER suffix (`video.q`), which names one of the
+		// several encodings an origin publishes. It never changes which peer the media
+		// came from, only which rung of that peer's ladder this track is.
+		srcName, layer := trackSource(track.ID(), peerName)
 		log := r.log.With(slog.String("peer_id", peerID), slog.String("source", srcName),
+			slog.String("layer", layer),
 			slog.String("codec", track.Codec().MimeType), slog.Any("ssrc", track.SSRC()))
 		log.Info("remote track arrived")
 		r.markReceived(peerID)
@@ -980,7 +1075,7 @@ func (r *Router) remoteTrackSink(ctx context.Context, peerID string) func(*webrt
 		// on the LIVE topology, not on holding a forwarder: a managed peer always
 		// holds one but is only a relay while the current tree gives it children.
 		if r.isRelayNow() {
-			r.fwd.forward(srcName, track)
+			r.fwd.forward(srcName, layer, track)
 			return
 		}
 
@@ -1471,6 +1566,28 @@ func (r *Router) linkStatsFrom(reports []edgeReport) (peerRTT []metrics.PeerRTT,
 		lossPct = r.fwd.loss.worstPct()
 	}
 	return peerRTT, lossPct, nat
+}
+
+// rttToPeer answers "what is the measured round-trip to this peer, if any" — the
+// second input to the relay's layer selection.
+//
+// It reads the SAME store LinkStats fills, rather than sampling pion itself, so the
+// layer policy and the coordinator's tree are never looking at two different
+// numbers for one link. It is therefore only as fresh as the last LinkStats call
+// (the telemetry cadence, 3 s) — which is the right freshness for a signal that
+// only gates upgrades, and is why loss, arriving at ~1 Hz, is the fast input.
+//
+// A static-tree relay never calls LinkStats, so this always returns false there.
+// selectLayer reads that as "no opinion", not as "bad".
+func (r *Router) rttToPeer(name string) (float64, bool) {
+	now := r.clk.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	sample, ok := r.rtt.byName[name]
+	if !ok || now.Sub(sample.at) > RTTMemory {
+		return 0, false
+	}
+	return sample.ms, true
 }
 
 // Fence returns a snapshot of this peer's authority state, for the host to report to

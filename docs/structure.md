@@ -133,14 +133,23 @@ conclave/
 │   │   ├── diff.go              diffTopology: a PURE diff of (self, wanted, REALITY) into
 │   │   │                         seven ordered buckets. Baseline is reality, not the last
 │   │   │                         push, so a partial state converges.
-│   │   ├── relay.go             the forwarder: per-source read → fan-out, no re-encode;
-│   │   │                         SSRC-translated upstream PLI, throttled per SOURCE.
+│   │   ├── relay.go             the forwarder: per-(source, LAYER) read → per-child
+│   │   │                         fan-out, no re-encode; SSRC-translated upstream PLI,
+│   │   │                         throttled per (SOURCE, LAYER). Two axes, one invariant:
+│   │   │                         exactly one (generation, layer) per leg may write.
+│   │   ├── layerpin_test.go     pion pins: an ANSWERER fills every offered recvonly m-line,
+│   │   │                         and the relay's receive-slot rule is right on BOTH sides
+│   │   │                         of the edge (asymmetric on purpose). See DESIGN §7.5.
+│   │   ├── layers.go            the quality ladder (q/h/f), the `<base>.<rung>` track-name
+│   │   │                         split, and selectLayer — a PURE, clock-free per-child
+│   │   │                         choice with asymmetric hysteresis. Data plane on purpose.
 │   │   ├── reparent.go          the async re-parent state machine + backup promotion +
 │   │   │                         the promotionPending exemption + ladder-exhaustion
 │   │   │                         recovery. Nothing blocks the Run goroutine.
 │   │   ├── rewrite.go           rtpRewriter: per-leg (sequence, timestamp) OFFSETS,
 │   │   │                         recomputed at Switch(); drop until a keyframe.
-│   │   ├── source.go / sink.go  outbound IVF/synthetic; inbound record/count.
+│   │   ├── source.go / sink.go  outbound IVF/synthetic, one pump per published layer;
+│   │   │                         inbound record/count.
 │   │   └── meter.go             the upload meter: lock-free atomic counter + 1s sampler.
 │   ├── dashboard/               the browser-facing surface. Read-mostly, eventually
 │   │   │                         consistent. NOT a control surface.
@@ -181,6 +190,12 @@ conclave/
 │   │                             eventLog · demoControls
 │   ├── fixtures/                meets.json · meet-standup.json · events-standup.json
 │   └── tests/                   reconnect-backoff.test.html (open it in a browser)
+│
+├── scripts/
+│   └── make-layers.sh           generates the three VP8 IVF quality layers an origin can
+│                                 publish (320x180/640x360/1280x720 @ 150/500/1500 kbit).
+│                                 The SCRIPT is committed, the .ivf files are not — they
+│                                 are megabytes of build artifact and *.ivf is gitignored.
 │
 ├── deploy/                      running the arbiter somewhere other than your shell.
 │   ├── Dockerfile               multi-stage, distroless, non-root. Build from repo ROOT.
