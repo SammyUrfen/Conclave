@@ -1160,8 +1160,8 @@ func (r *Router) stopPeerByName(name string) {
 }
 
 // acceptsBackupChild reports whether the topology in force names US as peerID's
-// backup parent — the one case where an unsolicited offer from a non-neighbour is
-// legitimate.
+// backup parent — the one case where forming an edge with a non-neighbour is
+// legitimate, and so the sole authorization for a TypeBackupPromote request.
 func (r *Router) acceptsBackupChild(peerID string) bool {
 	topo := r.currentTopo()
 	if topo == nil {
@@ -1182,9 +1182,9 @@ func (r *Router) acceptsBackupChild(peerID string) bool {
 // collide with — the frame is what makes the two ends agree without the tree, which
 // says nothing about an edge it does not contain.
 //
-// Authorization is acceptsBackupChild, unchanged and unwidened: the same predicate
-// that admits the first offer on this edge admits the request for one. It fails
-// closed, and a refusal is silent to the sender by design — a peer holding an older
+// Authorization is acceptsBackupChild, unchanged and unwidened: the predicate that
+// used to admit an unsolicited first offer on this edge now admits the request for
+// one, and is the only remaining way onto the edge. It fails closed, and a refusal is silent to the sender by design — a peer holding an older
 // Rev that lacks the assignment must not form an edge outside the tree, and the
 // promoter's ReparentConnectTimeout already owns that outcome.
 //
@@ -1193,7 +1193,7 @@ func (r *Router) acceptsBackupChild(peerID string) bool {
 // per peer, so a promote naming a peer we already hold a session to leaves that
 // session in the role the topology gave it. A Validate-clean tree never produces
 // that — a backup is never already a neighbour — but applyTopology does not call
-// Validate (§8.6), so a coordinator bug or a hand-written -topology file does. The
+// Validate (§8.3), so a coordinator bug or a hand-written -topology file does. The
 // outcome then stays exactly where a lost frame or a refusal lands, the promoter's
 // ReparentConnectTimeout ladder; what must NOT happen is this end logging that it is
 // offering the forwarded tracks when it is about to answer instead.

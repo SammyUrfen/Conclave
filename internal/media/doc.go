@@ -69,7 +69,10 @@
 // answers can never publish the tracks it was promoted to carry. The child therefore
 // ASKS, with a signaling.TypeBackupPromote frame, and answers; the parent OFFERS,
 // after checking its own topology names it that child's backup. Exactly one end can
-// promote and exactly one end authorizes, so no second offer exists to collide with.
+// promote and exactly one end authorizes, so on any tree overlay.Validate would
+// accept — one where a backup is never already a neighbour — no second offer exists
+// to collide with. On a tree it would not accept, neither end's assigned role takes
+// (startPeerOpt will not re-role a session it already holds) and both say so at WARN.
 //
 // Because the Router owns the peer's one signaling stream, it is also the seam the
 // control plane reaches its host through: OnCoordinator carries the arbiter's

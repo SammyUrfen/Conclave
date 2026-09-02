@@ -348,7 +348,7 @@ func (r *Router) startReparent(ctx context.Context, oldParent, newParent string,
 	// open (startPeerOpt is idempotent per peer), and on a backup edge that means we
 	// keep whatever role the TREE gave the edge while asking the far end to offer.
 	// Under a Validate-clean tree it cannot happen — a backup is never already a
-	// neighbour — but applyTopology does not call Validate (§8.6). The move is not
+	// neighbour — but applyTopology does not call Validate (§8.3). The move is not
 	// abandoned here: ReparentConnectTimeout and ReparentMediaTimeout still own the
 	// outcome, exactly as they do for a refused or lost promote. It is logged because
 	// a promotion that kept the wrong role fails in a completely different way from

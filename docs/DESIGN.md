@@ -1383,7 +1383,30 @@ symmetry to lose. Exactly one end can promote — the child whose parent died �
 end ever sends the frame. The other end does not get a vote: it either finds itself named as
 that child's backup in its own current topology and offers, or it drops the frame. There is no
 state in which both ends offer, and the child's session is created as the answerer *before*
-the frame goes out, so there is no window in which it could.
+the frame goes out, so there is no window in which it could — **provided neither end already
+holds a session to the other**, which a `Validate`-clean topology guarantees, because a backup
+is never a neighbour (`B ∉ Subtree(ParentOf(node))`).
+
+That proviso is load-bearing, and it is a *guarantee held upstream*, not an invariant the peer
+enforces: `Router.applyTopology` unmarshals and fences a pushed tree but never calls
+`overlay.Validate` (§8.3). On a tree where the backup already *is* a neighbour, both role
+assignments are dropped — `startPeerOpt` is idempotent per peer and returns before it reads the
+override — and each end keeps whatever role the tree gave the edge, which can be "both offer".
+The claim above is therefore conditional, and what the code enforces unconditionally is the
+next-best thing: **the drop is never silent.** `startPeerOpt` reports whether it created the
+session, the promoted parent logs its success line only when the offerer role actually took,
+and both ends log the discard at WARN with the peer and the role they wanted. The failure then
+lands where every other failure on this edge lands — `ReparentConnectTimeout` — instead of
+looking, in the log, exactly like the success it is not.
+
+The mirror of that admission is a path that was **deleted**: `deliver` used to conjure a
+session for an unsolicited *offer* from a peer whose topology named us its backup, which is how
+this edge formed before the inversion. It has no producer any more. The promoter creates its
+session as the answerer, and `Session.onNegotiationNeeded` returns immediately for a
+non-offerer, so no peer on this build can offer on a backup edge; `TypeBackupPromote` — which
+asks, and can be refused — is the only way onto an edge the tree does not contain. The dead
+branch was carried by no test at all (deleting it left the suite green), which is precisely the
+condition under which a comment claiming it "still fails closed" outlives the truth of it.
 
 What forces it is `Offers` being **meaningless**, not merely inconvenient, on an edge the tree
 does not contain: there is no role to derive, so a role has to be assigned, and the assignment
@@ -1985,6 +2008,17 @@ upload budget gets the tree position it lied for. A malicious coordinator can co
 arbitrarily bad tree within its own epoch. The backup-edge admission check
 (`topo.BackupOf(sender) == self`) is explicitly a *consistency* check, not a security
 boundary — it stops a confused peer, not a lying one.
+
+**And a peer does not check the tree it is given at all.** `Router.applyTopology` unmarshals a
+pushed topology, runs `Fence.Accept` on it (authorization: right sender, right epoch, newer
+revision) and adopts it. It never calls `overlay.Validate`, so every peer-side invariant that
+reads as structural — depth, degree, a backup that is not already a neighbour — is really a
+property of *the coordinator being correct*, enforced where the tree is built and nowhere else.
+A hand-authored `-topology` file gets the same trust. Adding the call is a design change with
+its own question attached (what should a peer *do* with a tree it has just rejected, when the
+alternative is the older tree it already knows is wrong?), so it was not made here; what is
+written down is that the guarantee lives upstream. §5.12 names the one place a peer's behaviour
+visibly depends on it.
 
 ### 8.4 The control plane is a single point of failure, and its epoch is in memory
 
