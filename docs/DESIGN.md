@@ -572,11 +572,13 @@ t≈0-3s   child C's pion PeerConnection to R reaches `failed`
          ── FAST PATH, entirely local, nobody is asked ──
          C: clearLocalBackup()          ← so a second failure fails FAST
          C: B := topo.BackupOf(C)
-         C: open a session to B, offerer forced true   } make-before-break:
-            (the backup edge is not in the tree, so       R's session is left
-             Offers() is meaningless on it)               intact and receiving
-         B: accept an offer from a topology-unknown sender IFF
-            topo.BackupOf(C) == B, against B's OWN current topology
+         C: open a session to B as the ANSWERER, then    } make-before-break:
+            send B a `backup-promote` frame                 R's session is left
+            (the backup edge is not in the tree, so         intact and receiving
+             Offers() is meaningless on it)
+         B: accept that frame from a topology-unknown sender IFF
+            topo.BackupOf(C) == B, against B's OWN current topology,
+            and OFFER — only an offer can carry the forwarded m-lines
          C: rpOpening --Connected--> rpAwaitingMedia --track--> commit
                         (5s timeout)                    (3s timeout)
          C: rebindUpstreamSession; rtpRewriter.Switch() on every downstream leg;
@@ -587,7 +589,7 @@ t≈8s     ── SLOW PATH, the backstop ──
          coordinator: ratify C's choice into `working`, then rebuild
 ```
 
-Five things in that trace are load-bearing.
+Six things in that trace are load-bearing.
 
 **Nothing blocks.** The re-parent is an asynchronous state machine over an internal 32-deep
 channel, because `applyTopology` and every pion callback run on goroutines that also *feed*
@@ -621,14 +623,27 @@ receiver and its interceptor chain — but its packets are discarded.
 
 **The backup edge is authorized, not assumed.** A backup edge is not in the tree, so `Offers`
 is meaningless on it and the far end has no topology reason to expect a connection. Two rules
-close that: the promoter forces itself offerer, and the backup parent accepts a first offer
-from a topology-unknown sender **iff its own current topology names it as that sender's
-backup**. The warrant is a fence-accepted `Backups` assignment from the coordinator. It
-**fails closed**: a backup parent holding an older `Rev` that lacks the assignment rejects,
-the promoter hits its 5 s timeout, reports `OK: false`, and a stranded peer bypasses the
-recompute cooldown so the coordinator repairs it promptly. Rejecting is correct — two ends
-disagreeing about the tree must not silently form an edge outside it. This is a *consistency*
-check, not a security boundary; nothing authenticates peers.
+close that: the promoter **asks** — one `backup-promote` frame, relayed peer-to-peer like an
+offer — and the backup parent honours it **iff its own current topology names it as that
+sender's backup**, in which case it takes the offerer role. The warrant is a fence-accepted
+`Backups` assignment from the coordinator. It **fails closed**: a backup parent holding an
+older `Rev` that lacks the assignment drops the frame, the promoter hits its 5 s timeout,
+reports `OK: false`, and a stranded peer bypasses the recompute cooldown so the coordinator
+repairs it promptly. Rejecting is correct — two ends disagreeing about the tree must not
+silently form an edge outside it. This is a *consistency* check, not a security boundary;
+nothing authenticates peers.
+
+**And the promoter is the wrong end to offer**, which the first version of this got wrong and
+§9.5 measured live. Forcing the promoter offerer is the obvious reading — it is the end that
+knows the failure happened — but only an *offer* can add forwarded m-lines (§5.12), so a
+backup parent that answers is structurally unable to publish the tracks it was promoted to
+carry. `ReparentMediaTimeout` then expired on every backup edge whose peer expects media. The
+roles are inverted: the child asks and **answers**, the authorized parent **offers**, and its
+first offer carries the whole forwarded track set (`setupRelayEdge` already computes it with
+`legsToward`, which takes any peer rather than only a tree neighbour, precisely for this
+edge). The older path — accepting an unsolicited *offer* from an authorized backup child —
+still exists and still fails closed on the same predicate; nothing the shipped promoter does
+reaches it.
 
 **And the exemption is bounded.** A late refinement (the most recent commit on the branch)
 closes the gap between promotion and ratification: the diff would otherwise see that
@@ -1356,6 +1371,74 @@ negotiation design exists because glare is unrecoverable. Re-creating the sessio
 path already exercised on every join, and it only fires when the tree's shape at that edge
 changed anyway — i.e. an interruption was already being paid.
 
+**The one place that handshake was built anyway: the backup edge.** `TypeBackupPromote`
+("please offer me", relayed peer-to-peer by the Hub, never touched by the Observer) is
+exactly the frame rejected above — and the reason it is safe here is the reason it was
+rejected there, read in the other direction.
+
+The `invert` bucket's problem is *symmetry*. Both endpoints of a tree edge see the same
+pushed tree, both compute the same inversion, and both can decide to ask; a handshake there
+manufactures the glare the whole design exists to make impossible. A backup edge has no
+symmetry to lose. Exactly one end can promote — the child whose parent died — so exactly one
+end ever sends the frame. The other end does not get a vote: it either finds itself named as
+that child's backup in its own current topology and offers, or it drops the frame. There is no
+state in which both ends offer, and the child's session is created as the answerer *before*
+the frame goes out, so there is no window in which it could.
+
+That last clause used to carry a proviso — *provided neither end already holds a session to the
+other*, which only a `Validate`-clean topology guarantees, because a backup is never a
+neighbour (`B ∉ Subtree(ParentOf(node))`). And that guarantee is held **upstream**:
+`Router.applyTopology` unmarshals and fences a pushed tree but never calls `overlay.Validate`
+(§8.3), and a hand-authored `-topology` file is a supported mode, so an operator can put a tree
+into a peer where the backup already *is* a neighbour. `startPeerOpt` is idempotent per peer and
+returns *before* it reads the override, so on such a tree the promoter's answerer role is
+dropped and it stays whatever the tree made it — possibly the offerer. Sending the frame anyway
+asked the far end to offer as well, and a far end holding no session back would have done it:
+both in `have-local-offer`, no rollback, no error, no timeout. Every other failure on this path
+is a `ReparentConnectTimeout` that heals; that one did not.
+
+**The frame is now gated on the role having actually been applied.** `startPeerOpt` reports
+whether it created the session, and the promoter sends `TypeBackupPromote` only when it did —
+which is exactly the condition under which the promoter is provably the answerer. The receiving
+end is closed by the same guard from the other side: `onBackupPromote` mints an offerer session
+only when it held no session to that peer at all, and returns (at WARN) when it did. So on
+**any** tree, `Validate`-clean or not, *the promotion path cannot produce a second offerer* —
+no proviso. Pinned by `TestPromoteFrameIsWithheldWhenTheAnswererRoleWasDiscarded`, which asserts
+the frame's absence on the wire rather than a role in memory.
+
+What that does **not** claim, and what still rests on the coordinator being correct:
+
+* **Roles a session already holds still come from the tree.** Two ends evaluating *different*
+  trees can still derive incompatible roles for an in-tree edge, `Offers` being symmetric only
+  on identical inputs. This change removes the promotion path as a *producer* of glare; it does
+  not make the peer self-sufficient about roles in general.
+* **A promotion onto an existing session still cannot invert it, and now does not even try.**
+  On a tree `Validate` would reject, the backup edge keeps the tree's role, no offer is
+  exchanged, and the promotion fails on `ReparentConnectTimeout` — the same rung a refused or
+  lost frame lands on. Both ends log the discard at WARN with the peer and the role they wanted,
+  and the promoted parent logs its success line only when the offerer role actually took. The
+  outcome is a failure the coordinator repairs, not a wedge nothing notices.
+
+The mirror of that admission is a path that was **deleted**: `deliver` used to conjure a
+session for an unsolicited *offer* from a peer whose topology named us its backup, which is how
+this edge formed before the inversion. It has no producer any more. The promoter creates its
+session as the answerer, and `Session.onNegotiationNeeded` returns immediately for a
+non-offerer, so no peer on this build can offer on a backup edge; `TypeBackupPromote` — which
+asks, and can be refused — is the only way onto an edge the tree does not contain. The dead
+branch was carried by no test at all (deleting it left the suite green), which is precisely the
+condition under which a comment claiming it "still fails closed" outlives the truth of it.
+
+What forces it is `Offers` being **meaningless**, not merely inconvenient, on an edge the tree
+does not contain: there is no role to derive, so a role has to be assigned, and the assignment
+has to be the one that lets the parent publish. `Offers(a, b)` is untouched, and no in-tree
+edge negotiates differently because of this.
+
+The cost is honest: one more wire type, one more round trip on a failover path, and a frame
+whose loss is indistinguishable from a backup parent that refuses. Both land in the same
+place — `ReparentConnectTimeout`, `OK: false`, the coordinator repairs — which is why the
+loss case needed no new machinery, only a test
+(`TestBackupPromoteThatNeverLandsFailsClosed`).
+
 ### 5.13 Two smaller decisions worth naming
 
 **No bespoke `overlay.Repair()`.** The obvious design for local repair is a function that
@@ -2051,6 +2134,17 @@ arbitrarily bad tree within its own epoch. The backup-edge admission check
 (`topo.BackupOf(sender) == self`) is explicitly a *consistency* check, not a security
 boundary — it stops a confused peer, not a lying one.
 
+**And a peer does not check the tree it is given at all.** `Router.applyTopology` unmarshals a
+pushed topology, runs `Fence.Accept` on it (authorization: right sender, right epoch, newer
+revision) and adopts it. It never calls `overlay.Validate`, so every peer-side invariant that
+reads as structural — depth, degree, a backup that is not already a neighbour — is really a
+property of *the coordinator being correct*, enforced where the tree is built and nowhere else.
+A hand-authored `-topology` file gets the same trust. Adding the call is a design change with
+its own question attached (what should a peer *do* with a tree it has just rejected, when the
+alternative is the older tree it already knows is wrong?), so it was not made here; what is
+written down is that the guarantee lives upstream. §5.12 names the one place a peer's behaviour
+visibly depends on it.
+
 ### 8.4 The control plane is a single point of failure, and its epoch is in memory
 
 - The arbiter is one process with no replication and no persistence. If it is down, nobody
@@ -2319,18 +2413,42 @@ saw the relay as healthy. Under `SIGKILL` the socket closes instantly and the
 coordinator's push arrives in 9 ms, so the peer-local path never runs — which is
 exactly why every previous attempt logged `via_backup=false`.
 
-**One thing that run also found**, and it is a real limitation rather than a harness
+**One thing that run also found**, and it was a real defect rather than a harness
 artefact: the promotion reported `ok: false, reason: "new parent connected but carried
-no media"`. The promoter forces itself offerer (§4.2, because `Offers()` is meaningless
-on an edge outside the tree), but only an *offer* can add forwarded m-lines (§5.12) —
-so the new parent answers, cannot publish the forwarded tracks in that exchange, and
-`ReparentMediaTimeout` (3 s) expires before any media arrives. The edge is still
-committed and the meet converges once the coordinator ratifies and the parent
-renegotiates as offerer, but the *fast* path's media-evidence clause is unsatisfiable
-on a backup edge for any peer that expects forwarded media. **Failover restores the
-tree peer-locally; it does not restore media within one keyframe interval.**
+no media"`. The promoter forced itself offerer (because `Offers()` is meaningless on an
+edge outside the tree), but only an *offer* can add forwarded m-lines (§5.12) — so the
+new parent answered, could not publish the forwarded tracks in that exchange, and
+`ReparentMediaTimeout` (3 s) expired before any media arrived. The edge was still
+committed and the meet converged once the coordinator ratified and the parent
+renegotiated as offerer, but the *fast* path's media-evidence clause was unsatisfiable
+on a backup edge for any peer expecting forwarded media.
+
+**That is fixed, and the diagnosis above is now history rather than a limitation.** The
+roles on a backup edge are inverted: the child asks with a `backup-promote` frame and
+**answers**, the authorized parent **offers**, so the first exchange on the promoted edge
+carries the forwarded track set (§4.2, §5.12). Three automated tests pin it — the two ends'
+roles independently, the *count* of forwarded sources arriving over the promoted edge, and
+the failure ladder a promote frame that never lands falls into. The count is the load-bearing
+one: the pre-existing `TestRouterPromotesBackupParent` had a single source behind the backup
+parent, and a single m-line is exactly what an answering parent can still reuse — so it
+passed throughout, on the shape that hides the bug.
+
+The live claim this replaces is narrower than the fix, and worth stating as such: **the fix is
+verified by test, not yet by a repeat of the `nft` media-cut A/B.** Until that run is redone,
+"failover restores the tree peer-locally in 8.2 s" is measured and "and restores media in the
+same exchange" is not.
+
+**A neighbouring defect the fix's fixture exposed, and did NOT fix.** The same m-line
+arithmetic bites an *in-tree* edge between two relays. `Offers` breaks a relay-vs-relay tie on
+`self > peer`, so in a chain `a → b → c` the middle relay `b` wins the tie and the root `a`
+answers — and with two publishers behind the root, `a` owes `b` two forwarded tracks and can
+add only the one m-line `b`'s offer already carries. Measured on a five-peer fixture: `b`
+receives **1** of the 2 sources from `a`, indefinitely; renaming the root so it wins the
+tiebreak makes both arrive. It is out of scope here (the fix is forbidden from touching the
+in-tree offerer rule) and it needs its own decision — the `invert` bucket's teardown applied
+to a *track-set* change, or a real answerer-side renegotiation trigger.
 
 ---
 
-*This is a living document. It describes the system at commit `8bacee6`; when the system
+*This is a living document. It describes the system at commit `6b959d1`; when the system
 changes, this changes with it.*

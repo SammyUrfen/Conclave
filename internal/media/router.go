@@ -427,6 +427,8 @@ func (r *Router) handle(ctx context.Context, msg signaling.Message) {
 		r.surfaceControlFrame(msg)
 	case signaling.TypeOffer, signaling.TypeAnswer, signaling.TypeCandidate:
 		r.deliver(ctx, msg)
+	case signaling.TypeBackupPromote:
+		r.onBackupPromote(ctx, msg.From)
 	case signaling.TypeTopology:
 		r.applyTopology(ctx, msg.From, msg.Payload)
 	case signaling.TypeCoordinator:
@@ -745,10 +747,10 @@ const forwardTrackPrefix = "fwd-"
 
 // peerOpts are the per-call overrides startPeer normally derives from the topology.
 type peerOpts struct {
-	// offerer overrides Topology.Offers for this edge. It is set on exactly one
-	// path: a backup-parent promotion, whose edge is NOT in the tree, so Offers says
-	// nothing meaningful about it and the far end has no reason to initiate. The
-	// peer that promotes offers; the far end answers.
+	// offerer overrides Topology.Offers for this edge. It is set on the two ends of
+	// one path: a backup-parent promotion, whose edge is NOT in the tree, so Offers
+	// says nothing meaningful about it. The promoted PARENT offers (only an offer
+	// can add forwarded m-lines, §5.12); the child that promoted it answers.
 	offerer *bool
 }
 
@@ -758,11 +760,25 @@ func (r *Router) startPeer(ctx context.Context, peerID string) {
 	r.startPeerOpt(ctx, peerID, peerOpts{})
 }
 
-func (r *Router) startPeerOpt(ctx context.Context, peerID string, opts peerOpts) {
+// startPeerOpt is startPeer with per-call overrides, and it reports whether it
+// actually CREATED the session.
+//
+// That return exists for exactly one reason: the idempotence guard below runs
+// BEFORE opts is ever read, so a caller passing a role override on a peer we
+// already hold a session to gets nothing — silently, and the session keeps the role
+// the topology gave it. A discarded override is indistinguishable from an applied
+// one at the call site, which is the §7.1 shape ("silent, and looks identical to its
+// opposite") the whole negotiation design is organised against. Every caller that
+// passes an override must therefore say so when it did not take.
+//
+// A bool rather than an error: there is exactly one decision to make from it (did
+// the role I asked for take effect?), the two ways to answer false are already
+// logged where they happen, and neither is something a caller can recover from.
+func (r *Router) startPeerOpt(ctx context.Context, peerID string, opts peerOpts) bool {
 	r.mu.Lock()
 	if _, exists := r.peers[peerID]; exists {
 		r.mu.Unlock()
-		return
+		return false
 	}
 	selfID := r.selfID
 	peerName := r.nameByID[peerID]
@@ -816,7 +832,7 @@ func (r *Router) startPeerOpt(ctx context.Context, peerID string, opts peerOpts)
 		r.mu.Lock()
 		delete(r.peers, peerID)
 		r.mu.Unlock()
-		return
+		return false
 	}
 
 	r.mu.Lock()
@@ -859,6 +875,7 @@ func (r *Router) startPeerOpt(ctx context.Context, peerID string, opts peerOpts)
 	if track != nil {
 		r.pumpOutbound(linkCtx, track, peerID)
 	}
+	return true
 }
 
 // setupRelayEdge wires the relay's side of the edge toward neighbour peerName,
@@ -995,34 +1012,20 @@ func (r *Router) remoteTrackSink(ctx context.Context, peerID string) func(*webrt
 	}
 }
 
-// deliver routes a media-signaling frame to the session for its sender.
+// deliver routes a media-signaling frame to the session for its sender. A frame for
+// a peer we hold no session to is dropped.
 //
-// One frame legitimately arrives for a peer we hold no session to: the first offer
-// from a child promoting US as its precomputed backup parent. That edge is not in
-// the tree — it exists precisely because the tree is momentarily wrong — so the
-// ordinary neighbour check would drop it and the failover could never complete.
-// Accepting it is gated on the topology naming us as that peer's backup, so it is
-// not an open door.
+// It used to conjure a session for one of them: the first offer from a child
+// promoting US as its precomputed backup parent, back when the promoter offered
+// first. Since the offerer inversion (§5.12) no peer can send that frame — the
+// promoter creates its session as the ANSWERER, and Session.onNegotiationNeeded
+// returns immediately for a non-offerer, so an offer on a backup edge has no
+// producer. The authorized way onto an edge outside the tree is TypeBackupPromote,
+// which asks rather than presents a fait accompli, and it is now the only way.
 func (r *Router) deliver(ctx context.Context, msg signaling.Message) {
 	r.mu.Lock()
 	link := r.peers[msg.From]
 	r.mu.Unlock()
-	if link == nil && msg.Type == signaling.TypeOffer && r.acceptsBackupChild(msg.From) {
-		no := false
-		r.startPeerOpt(ctx, msg.From, peerOpts{offerer: &no})
-		r.mu.Lock()
-		link = r.peers[msg.From]
-		if link != nil {
-			// Remember WHICH failure this edge answers. Without it the next
-			// unrelated push sees a live neighbour the tree does not name, calls it
-			// a stranger, and drops the parent this child has only just failed over
-			// to — inside the window failover exists to survive.
-			if topo := r.topo; topo != nil {
-				link.backupFor = topo.ParentOf(r.nameByID[msg.From])
-			}
-		}
-		r.mu.Unlock()
-	}
 	if link == nil {
 		r.log.Debug("frame for unknown peer", slog.String("from", msg.From), slog.String("type", string(msg.Type)))
 		return
@@ -1161,8 +1164,8 @@ func (r *Router) stopPeerByName(name string) {
 }
 
 // acceptsBackupChild reports whether the topology in force names US as peerID's
-// backup parent — the one case where an unsolicited offer from a non-neighbour is
-// legitimate.
+// backup parent — the one case where forming an edge with a non-neighbour is
+// legitimate, and so the sole authorization for a TypeBackupPromote request.
 func (r *Router) acceptsBackupChild(peerID string) bool {
 	topo := r.currentTopo()
 	if topo == nil {
@@ -1172,6 +1175,80 @@ func (r *Router) acceptsBackupChild(peerID string) bool {
 	name := r.nameByID[peerID]
 	r.mu.Unlock()
 	return name != "" && topo.BackupOf(name) == r.selfName
+}
+
+// onBackupPromote is the other end of a self-promotion: a child whose parent died
+// is asking us, its precomputed backup, to offer.
+//
+// We OFFER because only an offer can add forwarded m-lines (§5.12), and a backup
+// parent that cannot publish the forwarded tracks is a backup parent for nothing.
+// The child has already taken the answerer role, so there is no second offer to
+// collide with — the frame is what makes the two ends agree without the tree, which
+// says nothing about an edge it does not contain.
+//
+// Authorization is acceptsBackupChild, unchanged and unwidened: the predicate that
+// used to admit an unsolicited first offer on this edge now admits the request for
+// one, and is the only remaining way onto the edge. It fails closed, and a refusal is silent to the sender by design — a peer holding an older
+// Rev that lacks the assignment must not form an edge outside the tree, and the
+// promoter's ReparentConnectTimeout already owns that outcome.
+//
+// The success line is logged AFTER the attempt and only if the role took, because
+// this handler cannot always give us the offerer role: startPeerOpt is idempotent
+// per peer, so a promote naming a peer we already hold a session to leaves that
+// session in the role the topology gave it. A Validate-clean tree never produces
+// that — a backup is never already a neighbour — but applyTopology does not call
+// Validate (§8.3), so a coordinator bug or a hand-written -topology file does. The
+// outcome then stays exactly where a lost frame or a refusal lands, the promoter's
+// ReparentConnectTimeout ladder; what must NOT happen is this end logging that it is
+// offering the forwarded tracks when it is about to answer instead.
+func (r *Router) onBackupPromote(ctx context.Context, peerID string) {
+	if !r.acceptsBackupChild(peerID) {
+		r.log.Warn("refusing a backup promotion: our topology does not name us as this peer's backup",
+			slog.String("peer_id", peerID), slog.String("peer_name", r.nameForID(peerID)))
+		return
+	}
+	if !r.acceptBackupChild(ctx, peerID) {
+		r.log.Warn("refusing a backup promotion: no session was created for this peer, so the "+
+			"offerer role it asks for was not applied",
+			slog.String("peer_id", peerID), slog.String("peer_name", r.nameForID(peerID)),
+			slog.Bool("wanted_offerer", true))
+		return
+	}
+	r.log.Info("accepting a backup promotion; offering the forwarded tracks",
+		slog.String("peer_id", peerID), slog.String("peer_name", r.nameForID(peerID)))
+}
+
+// acceptBackupChild opens the session for a child that has promoted us as its backup
+// parent — as the OFFERER, the only role that can publish the forwarded tracks it
+// was promoted to carry — and records WHICH failure the edge answers.
+//
+// That record is the whole reason this is one function rather than two call sites:
+// without it the next unrelated push sees a live neighbour the tree does not name,
+// calls it a stranger, and drops the parent this child has only just failed over to —
+// inside the exact window failover exists to survive (§7.5a, promotionPending).
+//
+// The caller must have authorized the peer; this does not re-check. It reports
+// whether the session was created with the offerer role — see startPeerOpt for why
+// that answer may be no, and why it may not be swallowed.
+func (r *Router) acceptBackupChild(ctx context.Context, peerID string) bool {
+	offerer := true
+	created := r.startPeerOpt(ctx, peerID, peerOpts{offerer: &offerer})
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	link := r.peers[peerID]
+	if link == nil || r.topo == nil {
+		return created
+	}
+	link.backupFor = r.topo.ParentOf(r.nameByID[peerID])
+	return created
+}
+
+// nameForID is idForName's inverse, for log lines. Empty for a peer not in the
+// roster, which is itself worth seeing in a log.
+func (r *Router) nameForID(peerID string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.nameByID[peerID]
 }
 
 // StaleRejected reports how many pushed topologies the fence refused. A nonzero

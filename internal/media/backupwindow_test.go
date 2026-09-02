@@ -34,9 +34,15 @@ func TestDiffTopologyKeepsAPromotedBackupChild(t *testing.T) {
 	}
 	// What a's Router holds: real edges to b and d, plus the unmodelled edge to c,
 	// recorded with the parent c was failing over FROM.
+	//
+	// roles["c"] is TRUE because a is the OFFERER on a promoted backup edge: the
+	// child asks with TypeBackupPromote and answers, and only an offer can carry the
+	// forwarded m-lines. Modelling it as the answerer — the role this edge had before
+	// the inversion — describes a state acceptBackupChild can no longer produce, and
+	// it silently changes the ratification row's answer below.
 	live := func(backupFrom string) liveState {
 		st := liveState{
-			roles:     map[string]bool{"b": false, "d": true, "c": false},
+			roles:     map[string]bool{"b": false, "d": true, "c": true},
 			relayEdge: map[string]bool{"b": true, "d": true, "c": true},
 			peerRelay: map[string]bool{"b": true, "d": false, "c": false},
 			legs:      []leg{{src: "c", child: "d"}, {src: "d", child: "b"}, {src: "d", child: "c"}},
@@ -82,14 +88,17 @@ func TestDiffTopologyKeepsAPromotedBackupChild(t *testing.T) {
 		{
 			// Exit 1 — the coordinator ratified: the edge is now a real tree edge,
 			// so the exemption is not consulted at all and the ordinary machinery
-			// takes over. It re-creates, because the session was built as the
-			// answerer side of an unmodelled edge and a is the offerer on a real one.
+			// takes over. c is NOT re-created, and that is the offerer inversion
+			// paying for itself: a already offers on the promoted edge and a offers
+			// on a real one too, so ratification costs no interruption at all. Before
+			// the inversion this row re-created c, because the edge had been built as
+			// the answerer side of something the tree did not name.
 			name: "ratification hands the edge to the normal machinery",
 			next: ratified, live: live("b"),
-			// b also appears because moving c off it made b a leaf, and that
-			// genuinely changes the track set b publishes on its edge to a. It is
-			// collateral of the tree change, not of the exemption.
-			wantRemove: nil, wantRecreate: []string{"b", "c"},
+			// b appears because moving c off it made b a leaf, and that genuinely
+			// changes the track set b publishes on its edge to a. It is collateral of
+			// the tree change, not of the exemption.
+			wantRemove: nil, wantRecreate: []string{"b"},
 		},
 		{
 			// Exit 2 — the coordinator placed c somewhere else. It has acted on the

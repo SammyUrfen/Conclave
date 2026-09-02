@@ -18,6 +18,18 @@ const (
 	TypeAnswer Type = "answer"
 	// TypeCandidate carries one trickled ICE candidate in Message.Candidate.
 	TypeCandidate Type = "candidate"
+	// TypeBackupPromote asks the addressed peer to OFFER on a backup edge: the
+	// sender has lost its parent and is promoting the addressee, which its own
+	// topology names as its precomputed backup parent.
+	//
+	// It exists because the two ends of a backup edge cannot derive their roles from
+	// the tree — the edge is not in it — and the promoter is the wrong end to offer.
+	// Only an offer can add forwarded m-lines, so a parent that answers structurally
+	// cannot publish the very tracks it was promoted to carry. The child therefore
+	// asks and answers; the parent offers. The frame carries nothing but its From
+	// and To: the receiver authorizes it against its OWN current Backups assignment,
+	// so anything the sender could say about itself would be worthless.
+	TypeBackupPromote Type = "backup-promote"
 
 	// --- server → peer: control frames the Hub originates. ---
 

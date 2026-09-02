@@ -9,6 +9,7 @@ import (
 
 	"github.com/SammyUrfen/conclave/internal/metrics"
 	"github.com/SammyUrfen/conclave/internal/overlay"
+	"github.com/SammyUrfen/conclave/internal/signaling"
 )
 
 // ReparentConnectTimeout bounds how long a peer waits for a new parent's session to
@@ -322,14 +323,72 @@ func (r *Router) startReparent(ctx context.Context, oldParent, newParent string,
 	r.hookReparent("opening", r.rp.oldParent)
 
 	// A backup edge is not in the tree, so Topology.Offers says nothing useful about
-	// it and the far end has no reason to offer. The peer that promotes is the one
-	// that initiates; the far end answers (see acceptBackupChild).
+	// it and the far end has no reason to expect a connection at all. The roles are
+	// therefore assigned by this path rather than derived: WE ANSWER, and we ask the
+	// backup parent to offer.
+	//
+	// Making the promoter the offerer is the obvious reading — it is the end that
+	// knows the failure happened — and it is wrong, because only an OFFER can add
+	// forwarded m-lines (§5.12). A backup parent that answers cannot publish the
+	// tracks it was promoted to carry, so ReparentMediaTimeout expires on every
+	// backup edge whose peer expects media: the failure §9.5 measured live.
+	//
+	// This is NOT the "please offer me" handshake §5.12 rejected for the invert
+	// bucket. That one was rejected for creating a new glare surface, because BOTH
+	// ends of an inverting tree edge could decide to ask. Here exactly one end can:
+	// only the child that lost its parent promotes, only it sends this frame, and the
+	// parent's response is gated on its own topology naming it that child's backup.
+	// One asker, one authorizer, no second offer to collide with.
 	opts := peerOpts{}
 	if viaBackup {
-		yes := true
-		opts.offerer = &yes
+		no := false
+		opts.offerer = &no
 	}
-	r.startPeerOpt(ctx, peerID, opts)
+	// A role override is silently dropped when a session to this peer is already
+	// open (startPeerOpt is idempotent per peer), and on a backup edge that means we
+	// keep whatever role the TREE gave the edge. Under a Validate-clean tree it
+	// cannot happen — a backup is never already a neighbour — but applyTopology does
+	// not call Validate (§8.3), and a hand-authored -topology file is a supported
+	// mode, so an operator can reach it.
+	//
+	// The frame is therefore gated on the role having ACTUALLY been applied. Asking
+	// the far end to offer while we are still the offerer ourselves is the one
+	// failure on this path that does not heal: a far end holding no session back
+	// creates one as offerer, both ends sit in have-local-offer, and pion v4 has no
+	// rollback out of it (§5.12) — no error, no timeout, a permanently wedged edge.
+	// Withholding it costs nothing, because ReparentConnectTimeout already owns the
+	// outcome of a promote that produces no offer, exactly as it does for one that is
+	// refused or lost on the wire.
+	created := r.startPeerOpt(ctx, peerID, opts)
+	if viaBackup && !created {
+		r.log.Warn("promoting onto a peer we already hold a session to: no session was created, "+
+			"so the backup edge's answerer role was not applied and the promote was not sent",
+			slog.String("new_parent", newParent), slog.Bool("wanted_offerer", false))
+	}
+	if viaBackup && created {
+		// AFTER the session exists, so the parent's offer has an inbox to land in —
+		// deliver() would otherwise drop it as a frame for an unknown peer, and the
+		// promotion would fail on the connect timeout for no reason at all. Both run
+		// on the Run goroutine, so this ordering is a guarantee, not a race we win.
+		//
+		// A send failure is not fatal and not retried here: the promotion is already
+		// bounded by ReparentConnectTimeout, which is the same ladder a frame lost on
+		// the wire lands in.
+		//
+		// The nil check is for the state-machine tests, which drive this Router
+		// entirely by events and hold no signaling client. It cannot mask a
+		// production bug: Run reads r.client.Incoming() on its first line, so a
+		// clientless Router never gets as far as losing a parent.
+		if r.client == nil {
+			r.log.Debug("no signaling client; not asking the backup parent to offer",
+				slog.String("new_parent", newParent))
+		} else if err := r.client.Send(signaling.Message{
+			Type: signaling.TypeBackupPromote, To: peerID,
+		}); err != nil {
+			r.log.Warn("could not ask the backup parent to offer",
+				slog.String("new_parent", newParent), slog.Any("error", err))
+		}
+	}
 	r.armDeadline(rpCtx, ReparentConnectTimeout, routerEvent{kind: evReparentConnect, gen: r.rp.gen})
 
 	// A former child can become our parent after a re-root, in which case the
