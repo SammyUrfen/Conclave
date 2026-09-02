@@ -226,3 +226,36 @@ func TestLinksSensorShapeIsWiredThrough(t *testing.T) {
 		t.Errorf("got %+v, want all three link signals folded in", rep)
 	}
 }
+
+// TestTurnCredentialsReachTheRouterConfig pins the WIRING, in exactly the sense
+// TestMediaPortsReachTheRouterConfig pins it for -media-ports: iceServersFor being
+// correct proves a struct is built, not that anything ever builds it.
+//
+// It is here because a mutation proved the gap. Reverting runCall's
+// `iceServers := iceServersFor(cfg)` to the pre-branch STUN-only literal — deleting
+// the entire client half of this branch's TURN feature — left `go test ./...` green.
+// TestICEServersFor still passed, because it calls the helper itself.
+//
+// That failure is silent in the worst way: the peer starts, joins, gathers no relay
+// candidate, and simply never connects to the neighbour it needed the relay for. It
+// is the same symptom validate() refuses to allow for a partial credential set, and
+// nothing else in the repository would catch it — docs/verify-turn.md, the only
+// end-to-end exercise of this path, has not been run.
+func TestTurnCredentialsReachTheRouterConfig(t *testing.T) {
+	opts, err := parseArgs([]string{
+		"-call", "-managed", "-name", "relay", "-server", "http://127.0.0.1:1", "-room", "r",
+		"-stun", "stun:stun.example:19302",
+		"-turn", "turn:10.0.0.5:3478", "-turn-user", "u", "-turn-pass", "p",
+	})
+	if err != nil {
+		t.Fatalf("parseArgs: %v", err)
+	}
+	rc := routerConfigFor(opts.cfg, nil, nil, nil, nil, nil)
+	want := []webrtc.ICEServer{
+		{URLs: []string{"stun:stun.example:19302"}},
+		{URLs: []string{"turn:10.0.0.5:3478"}, Username: "u", Credential: "p"},
+	}
+	if !reflect.DeepEqual(rc.ICEServers, want) {
+		t.Errorf("RouterConfig.ICEServers = %#v;\nthe TURN credentials never reach media, want %#v", rc.ICEServers, want)
+	}
+}
