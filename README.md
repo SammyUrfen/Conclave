@@ -77,12 +77,14 @@ load-bearing trade-off with its rejected alternative, and an honest Limitations 
 | 4 | Metrics plane + coordinator computes the tree | ✅ **done** |
 | 5 | Join/leave handover with backup parents | ✅ **done** |
 | 6 | Coordinator election + migration | ✅ **done** |
-| 7 | Simulcast/SVC, TURN fallback, polish & demo | ⬜ **not built** |
+| 7 | Simulcast/SVC, TURN fallback, polish & demo | 🟨 **partly** — TURN + measured NAT class shipped; simulcast/SVC not started |
 
 Phase 7's **observability** slice was pulled forward into Phases 5–6 and reshaped: the planned
 `/debug` page shipped instead as the arbiter's `/api` REST + WebSocket surface plus a separate
-zero-build static dashboard on GitHub Pages. **The rest of Phase 7 — simulcast/SVC and
-TURN/coturn — was not built.**
+zero-build static dashboard on GitHub Pages. Its **TURN** slice has since landed too — a pure-Go
+`cmd/turn` relay, TURN credentials on the peer, and a NAT class that is now **measured** from
+the nominated ICE candidate pair rather than declared by a flag — though the end-to-end TURN
+path has not been exercised live yet. **Simulcast/SVC was not built.**
 
 **40,256 lines of Go** (17,505 non-test, 22,751 test), 372 test functions, 13 packages, 5 direct
 third-party dependencies. `make check` — `fmt` + `vet` + `check-determinism` + `go test -race
@@ -140,7 +142,7 @@ a `-race` coordinator test (async fan-in, root election, anti-thrash, leave-reco
 and a **live managed-room demo** whose leaf recorded **33 decodable VP8 frames**
 forwarded through a relay the *coordinator elected from telemetry* — the Phase-3
 topology, now computed. Honest limits: apply is **additive** (a new peer attaches; mid-call
-re-parent/teardown is Phase 5); upload/NAT are *declared* (real probing is Phase 7);
+re-parent/teardown is Phase 5); upload/NAT are *declared* (NAT is measured from Phase 7, upload never);
 recompute fires only on membership change (full hysteresis is Phase 5).
 
 **Phase 5 delivers:** the tree survives churn. The coordinator precomputes a **warm backup
@@ -253,7 +255,8 @@ go run ./cmd/peer -call -managed -name leaf-d -upload-kbps 0 -record out.ivf   -
 No `-topology` file: each peer reports telemetry, the server elects the highest-upload
 peer as the root relay, computes `relay → {leaf-b, leaf-d}`, and pushes it. `leaf-d`
 records media forwarded *through the computed relay* (`ffprobe out.ivf` → `vp8`). A
-TURN-bound peer (`-nat turn`) is forced to a leaf.
+TURN-bound peer is forced to a leaf — measured from its own ICE candidate pairs, or forced
+with `-nat turn`.
 
 **Watch it happen (the dashboard):**
 
@@ -313,6 +316,7 @@ Why `internal/` and `cmd/`, and where each package's boundary is:
 | [`deploy/README.md`](deploy/README.md) | Running the arbiter somewhere other than your shell; the `ws://` vs `wss://` decision |
 | [`docs/structure.md`](docs/structure.md) | File tree → responsibility, package boundaries |
 | [`docs/tech-stack.md`](docs/tech-stack.md) | Libraries & stdlib pieces, why each was chosen |
+| [`docs/verify-turn.md`](docs/verify-turn.md) | The proposed live proof that media flows over TURN when the direct path is blocked — **not yet run** |
 | [`docs/setup.md`](docs/setup.md) | Prerequisites, tooling install, editor setup |
 | [`docs/usage.md`](docs/usage.md) | Running the binaries, every flag, make targets |
 | [`docs/testing.md`](docs/testing.md) | The strategy: virtual clock, independent oracles, `check-determinism`, the mutation discipline |
@@ -332,10 +336,15 @@ Why `internal/` and `cmd/`, and where each package's boundary is:
   any non-test file. What exists instead: server-stamped identity, the epoch fence, an origin
   allow-list on both the upgrade and CORS, unguessable `crypto/rand` meet ids, and bounded
   state. The destructive demo routes are **not registered at all** unless `-demo` is passed.
-- **The telemetry is mostly declared, not measured.** Upload budget and NAT class are operator
-  claims; CPU, loss and server RTT are never populated. See the Phase 6 box above for what
-  that costs.
-- **No simulcast, no SVC, no TURN.** Phase 7 was not built.
+- **One telemetry field is still declared.** The upload budget is an operator claim, and there
+  is no bandwidth probe: measuring the uplink means saturating it, in a system whose thesis is
+  that the uplink is the scarce resource. CPU, loss, server RTT, pairwise RTT and the NAT class
+  are all measured.
+- **The NAT class is behavioural, not a NAT type.** `turn` means "every one of this peer's media
+  paths is relayed", not "this peer is behind a symmetric NAT" — and a peer that has connected to
+  nobody has measured nothing and reports `direct`.
+- **No simulcast and no SVC.** A relay sends one quality layer to every downstream. TURN exists
+  but **its end-to-end path has not been run live** — see [`docs/verify-turn.md`](docs/verify-turn.md).
 - **Every live run so far has been single-host.** Multiple processes on one machine over
   loopback — no cross-machine result, no real NAT traversal, no real congestion control. The
   "≈6 Mbit/s at 5 peers" ceiling is arithmetic on a *measured* per-stream bitrate, not an

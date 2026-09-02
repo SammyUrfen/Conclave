@@ -36,7 +36,16 @@ conclave/
 │   └── peer/                    the PARTICIPANT binary.
 │       ├── main.go              modes: probe /healthz · -call (mesh) · -topology (static
 │       │                         tree) · -managed (telemetry + pushed tree + failover).
+│       │                         Also iceServersFor (STUN + TURN creds) and the -nat
+│       │                         OVERRIDE (default auto ⇒ the class is measured).
+│       ├── nat_test.go          the -nat override, the fail-safe class, TURN flag gating.
 │       └── main_test.go         URL normalization, flag gating, inert-flag warnings.
+│   └── turn/                    the TURN RELAY binary (Phase 7).
+│       ├── main.go              thin main → run(); ~50 lines over pion/turn/v5, which
+│       │                         pion/webrtc already pulls in for the ICE client. Static
+│       │                         long-term credentials, a PINNED relay port range (so a
+│       │                         firewall rule can name it), fail-loud config.
+│       └── main_test.go         flag validation, the port range, realm-scoped auth keys.
 │
 ├── internal/                    ← ALL library code. Import-fenced by the compiler.
 │   │                              package-by-FEATURE, not by-layer.
@@ -116,6 +125,11 @@ conclave/
 │   │   ├── router.go            Router: demux into per-peer Sessions; mesh / static tree
 │   │   │                         / MANAGED; applyTopology (Fence.Accept is its first act
 │   │   │                         and the fence's ONLY call site); name↔id; Stats().
+│   │   ├── linkstats.go         the peer-side sensors, all PURE readers: rttStore (RTT with
+│   │   │                         RTTMemory), lossTracker (worst downstream leg), and
+│   │   │                         relayedPath + natClass — the MEASURED NAT class, a
+│   │   │                         behavioural "my media goes through a relay", not NAT-type
+│   │   │                         detection. NATRelayedThreshold = 1.0 is the hysteresis.
 │   │   ├── diff.go              diffTopology: a PURE diff of (self, wanted, REALITY) into
 │   │   │                         seven ordered buckets. Baseline is reality, not the last
 │   │   │                         push, so a partial state converges.
@@ -170,7 +184,9 @@ conclave/
 │
 ├── deploy/                      running the arbiter somewhere other than your shell.
 │   ├── Dockerfile               multi-stage, distroless, non-root. Build from repo ROOT.
-│   ├── docker-compose.yml       + Caddyfile: a locally-trusted wss:// rehearsal.
+│   ├── docker-compose.yml       + Caddyfile: a locally-trusted wss:// rehearsal. Also an
+│   │                             opt-in `coturn` profile — the DEPLOYMENT answer for TURN,
+│   │                             an alternative to cmd/turn; no test path touches it.
 │   ├── Caddyfile
 │   └── README.md                the ws:// vs wss:// decision, platform notes, and the
 │                                 three flags a hosted deployment cannot omit.
@@ -199,7 +215,7 @@ conclave/
 
 `internal/` is one of the very few directory names the **Go toolchain treats specially**. The rule: a package under `.../internal/` may be imported **only** by code rooted in the parent of that `internal/` directory. For this repo, the parent is the module root, so:
 
-- ✅ `cmd/server` and `cmd/peer` may import `github.com/SammyUrfen/conclave/internal/...`
+- ✅ `cmd/server`, `cmd/peer` and `cmd/turn` may import `github.com/SammyUrfen/conclave/internal/...`
 - ✅ any `internal/*` package may import any other `internal/*` package (subject to the direction rules below)
 - ❌ **anyone outside this module cannot import our `internal/...` at all** — the build fails, it's not a lint warning
 
@@ -209,7 +225,7 @@ Coming from C++/Java: this is the *enforced* version of "these headers are priva
 
 ## Why entrypoints live in `cmd/`
 
-`cmd/<name>/` is the Go community convention for "this directory is `package main` and compiles to the binary `<name>`." `go build ./cmd/server` → `server`; the Makefile emits `./bin/server` and `./bin/peer`.
+`cmd/<name>/` is the Go community convention for "this directory is `package main` and compiles to the binary `<name>`." `go build ./cmd/server` → `server`; the Makefile emits `./bin/server`, `./bin/peer` and `./bin/turn`.
 
 The discipline that matters more than the directory name: **`main()` is thin.** Each binary's `main()` parses flags into a `FlagSet`, builds the logger, calls a testable `run(args) error`, and translates the error into `os.Exit(1)` + a stderr line. That's the whole `main`. Everything worth testing lives either in `run` or — as it grows — down in `internal/`. Two consequences:
 
@@ -254,6 +270,7 @@ you check a new import against.
 | `simnet` | the deterministic media-free harness: virtual clock, event queue, failure injection, the `Settle` barrier | 1,240 / 2,700 | `overlay`, `coordinator`, `metrics`, `clock` — **test-only** |
 | `cmd/server` | the arbiter binary; wires every seam | 1,252 / 1,139 | anything under `internal/` |
 | `cmd/peer` | the participant binary: probe / call / static-tree / managed modes | 870 / 1,157 | anything under `internal/` |
+| `cmd/turn` | the TURN relay binary: pion/turn/v5, static long-term credentials, a pinned relay port range | — | `internal/logging` only |
 
 Rendered as a DAG:
 
@@ -373,7 +390,7 @@ Go **forbids import cycles at compile time** — two packages that import each o
 
 - **Leaves at the bottom:** `logging`, `clock`, `policy`, `overlay` import no other `internal` package. Anyone can depend on them; they depend on nobody, so they can't be *in* a cycle. (`metrics` was a leaf through Phase 4 and no longer is — it imports `overlay`, `clock` and `logging`.)
 - **One layer up:** `metrics` above the leaves; `signaling`, `coordinator` and `arbiter` above that; `media` and `dashboard` above those. Downward-only edges can't cycle.
-- **Binaries at the top:** `cmd/*` may import anything in `internal/`; nothing imports `cmd/*`. Top of the DAG.
+- **Binaries at the top:** `cmd/*` may import anything in `internal/`; nothing imports `cmd/*`. Top of the DAG. `cmd/turn` is the extreme case and deliberately so — it imports `internal/logging` and nothing else, because a media relay has no business knowing about meets, trees or epochs.
 - **Cross-plane calls go through interfaces the caller owns**, so the concrete data-plane (`media`) and test harness (`simnet`) point *up* at `coordinator`'s interfaces rather than creating a back-edge.
 - **`simnet` is test-only and one-directional:** it imports the real logic; production never imports it.
 

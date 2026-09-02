@@ -39,7 +39,18 @@ type Report struct {
 	// probe a real deployment would run); it is the primary tree-shaping input.
 	UploadKbps int `json:"upload_kbps"`
 	// NAT is the node's reachability class; NATRelayed (TURN-bound) forces it to a
-	// leaf. Declared via a flag in Phase 4; real detection is Phase 7's TURN work.
+	// leaf and disqualifies it as coordinator.
+	//
+	// MEASURED since Phase 7, and the claim is narrow: it says "this peer's media
+	// paths are going through a relay", NOT what kind of NAT it is behind. The sender
+	// reads the type of the local candidate in its nominated ICE candidate pairs
+	// (media.relayedPath) and reports NATRelayed only when EVERY such path is
+	// relay-typed. cmd/peer's -nat still FORCES a value when an operator sets it.
+	//
+	// A peer that has not connected to anybody has measured nothing and reports
+	// NATDirect — the permissive class. Absence of evidence must not read as evidence
+	// of constraint here, because the alternative demotes every freshly-joined peer to
+	// a forced leaf and leaves a new meet's first tree unbuildable.
 	NAT overlay.NATType `json:"nat,omitempty"`
 	// RTTServerMs is the node's round-trip to the server, a cheap proxy for its
 	// network quality. Unpopulated in Phase 4 (BuildTree tolerates missing RTT);
