@@ -1445,8 +1445,17 @@ nothing in the data plane does today. `selectLayer` is a pure, clock-free functi
 `internal/media` — one function does not earn a package, and it is deliberately not in
 `internal/policy`, whose charter (§3.5) is untrusted boundary input.
 
+**What has actually been observed live, and what has not.** The *upstream* half is
+measured: a three-rung origin reaches the relay as three streams and a clean child records
+1280x720 (the table in §7.5). The *downgrade* half — a lossy child walked down a rung while
+its sibling stays on top — has **not** been demonstrated live; it rests on `selectLayer`'s
+unit tests and on `TestReviewLayerDowngradesOnSustainedLoss` wiring the policy to the real
+RTCP path. `docs/usage.md` carries the recipe and says the same thing.
+
 **The origin's upload grows, and that is the real cost.** A three-rung sender uploads all
-three streams, roughly 1.25× the top rate at these resolutions. In a system whose entire
+three streams. `scripts/make-layers.sh`'s ladder is 150 + 500 + 1500 kbit/s, so that is
+**1.43×** the top rate, not the ~1.25× a 1:¼:¹⁄₁₆ ladder would give — and the sizes §7.5's
+own table reports (77 KB + 252 KB + 757 KB) agree at 1.435×. In a system whose entire
 premise is that upload is scarce this is worth naming rather than burying: the trade is
 that a *sender* pays ~25% more so that a *relay* can stop sending its weakest child a
 stream that child cannot decode. Whether that trade pays has not been measured here.
@@ -1458,8 +1467,11 @@ invariant is **exactly one (generation, layer) per leg may write**. `fanout` hol
 forwarder's read lock across its whole per-leg decision — check, then `Rewrite` — rather
 than snapshotting and deciding after unlocking, because that window is where a commit
 racing a selection splices a leg onto the stream that just lost, permanently and silently.
-`Rewrite` is pure CPU, so a read lock across it costs a writer at most one packet's
-fan-out.
+`Rewrite` is pure CPU, so the *decision* costs a writer nothing. The `WriteRTP` calls are
+under the same lock, though, and those are SRTP plus a socket write per child — so the
+honest cost is one packet's fan-out across every leg, and because `sync.RWMutex` queues
+readers behind a waiting writer, a child slow to drain stalls every other source's
+fan-out too, not just the commit. Bounded on loopback; not free.
 
 **The relay offers one recvonly m-line PER RUNG on every edge**, not one in total. That is
 not an optimisation: §5.12 makes the relay the sole offerer, an answerer cannot create
@@ -1967,7 +1979,9 @@ The shipped rule is therefore asymmetric, and both halves are load-bearing:
 | **answerer** | exactly one, as before | **before**, so the first forwarded track consumes it and no spare is left to hijack |
 
 The cost on the offering side is paid unconditionally — two negotiated-then-inactive m-lines
-on every relay edge in every deployment — because a relay cannot know how many rungs a
+on every relay edge in every deployment, and **three** more m-lines than before on any edge
+that also carries a forwarded leg (measured 1 → 4 on a one-leg edge: the slot the first
+forwarded track used to cannibalise now needs its own) — because a relay cannot know how many rungs a
 neighbour will publish until the tracks arrive, and by then the offer is gone.
 
 Two pins guard it, and they guard *different* things:

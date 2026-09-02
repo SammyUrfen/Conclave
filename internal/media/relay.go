@@ -683,9 +683,12 @@ func (f *forwarder) learnSSRC(src, layer string, gen uint64, ssrc uint32) {
 // and then deciding after unlocking leaves a window where a commit or a selection
 // lands between the check and the Rewrite, and the leg rebases onto the stream that
 // just lost — permanently, and silently, because a rebased leg looks perfectly
-// healthy. Rewrite is pure CPU (a mutex and a header copy) so holding a READ lock
-// across it costs a control-plane writer at most one packet's fan-out, which is the
-// cheap side of that trade. The lock is also why forwardOut.layer can be a plain
+// healthy. Rewrite itself is pure CPU (a mutex and a header copy); the WriteRTP calls
+// under the same lock are not — each is an SRTP encrypt plus a socket write — so the
+// cost is one packet's fan-out across EVERY leg, and sync.RWMutex queues readers
+// behind a waiting writer, so a child slow to drain stalls the other sources' fan-out
+// as well as the commit. Judged the cheap side of the trade against a leg silently
+// rebasing onto a dead stream. The lock is also why forwardOut.layer can be a plain
 // field rather than an atomic.
 func (f *forwarder) fanout(src, layer string, gen uint64, pkt *rtp.Packet) {
 	f.mu.RLock()
@@ -1015,7 +1018,8 @@ func (f *forwarder) keyframeForChild(child string) {
 // join/leave churn. The child's RTCP-drain goroutine exits on its own (its sender
 // closes with the child's session), which is what drops the meter gauge — this only
 // trims the slices. A fresh slice is allocated rather than mutated in place so a
-// concurrent fanout holding an older snapshot is unaffected.
+// concurrent fanout that captured the slice header before this call is unaffected —
+// belt and braces, since fanout now holds the read lock for its whole loop.
 func (f *forwarder) removeChild(child string) {
 	f.mu.Lock()
 	for _, s := range f.sources {

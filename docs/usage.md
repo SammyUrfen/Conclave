@@ -384,14 +384,24 @@ Notes:
   what it receives. Selection is a leaf-only decision here (`docs/DESIGN.md` §8.5).
 - **`-log-level debug` shows every switch**: `msg="layer switch" source=… child=… from=f
   to=h loss_pct=…`.
-- **A three-rung sender uploads all three streams** — about 1.25× the top rate. That cost
+- **A three-rung sender uploads all three streams** — 150 + 500 + 1500 kbit/s, i.e. **1.43×**
+  the top rate on this ladder (the encoded files agree: 77 + 252 + 757 KB). That cost
   is real and is named in §5.14.
 
 #### Proving it end to end
 
 "It negotiated" is not proof. The proof is **two recordings that differ in decoded
-resolution**, and getting there needs real loss, which loopback does not have. `tc netem`
-supplies it, and `-media-ports` is what makes the filter targetable.
+resolution**, and getting there needs real loss, which loopback does not have.
+`-media-ports` is what makes one peer's media targetable.
+
+**Loss, not delay, is what this needs — so `nft` alone is enough, and `tc` is not
+required.** `selectLayer` sheds a rung on `LossPct >= layerDownLossPct` only; RTT gates
+*upgrades* and never forces a downgrade, so nothing in the downgrade path needs `netem`'s
+delay. `nft`'s `numgen random mod 100` is a per-packet probabilistic drop — exactly
+`netem loss` for this purpose — and it ships with `nftables`, whereas `tc` lives in the
+separate `iproute-tc` package that a Fedora install does not necessarily have. (If you do
+have `tc`, `tc qdisc add dev lo root netem loss 25%` plus a `u32` port filter works too and
+additionally lets you add delay; that is the only thing `nft` cannot do here.)
 
 Five terminals. `leaf-c` is the peer that will be impaired; `leaf-d` is the control.
 
@@ -412,22 +422,35 @@ $ scripts/make-layers.sh "" /tmp/lay
 $ ./bin/peer -call -room lay -name leaf-b -topology tree.json \
       -media /tmp/lay/layer-q.ivf,/tmp/lay/layer-h.ivf,/tmp/lay/layer-f.ivf
 
-# 4 — the two receivers, each on its OWN media port range so netem can tell them apart
+# 4 — the two receivers, each on its OWN media port range so the filter can tell them apart
 $ ./bin/peer -call -room lay -name leaf-c -topology tree.json \
       -media-ports 47000-47019 -record /tmp/lay/got-c.ivf
 $ ./bin/peer -call -room lay -name leaf-d -topology tree.json \
       -media-ports 47100-47119 -record /tmp/lay/got-d.ivf
 
-# 5 — impair ONLY leaf-c's inbound media, ~10 s after both are receiving.
-#     (root; loopback needs both an egress qdisc and the ifb trick for ingress, so the
-#      simplest reliable form is to drop on egress toward leaf-c's port range.)
-$ sudo tc qdisc add dev lo root handle 1: prio
-$ sudo tc qdisc add dev lo parent 1:3 handle 30: netem loss 12%
-$ sudo tc filter add dev lo protocol ip parent 1:0 prio 3 u32 \
-      match ip dport 47000 0xfff0 flowid 1:3
+# 5 — impair ONLY leaf-c's inbound media, ~10 s after both are receiving. Dropping on the
+#     OUTPUT hook toward leaf-c's port range hits the relay->leaf-c RTP and nothing else:
+#     leaf-c's RTCP goes to the relay's own ports, so the reception reports the policy
+#     reads still get through, and the WebSocket control plane is TCP.
+$ sudo nft add table inet lay
+$ sudo nft 'add chain inet lay out { type filter hook output priority filter; }'
+$ sudo nft 'add rule inet lay out ip daddr 127.0.0.1 udp dport 47000-47019 \
+      numgen random mod 100 < 25 counter drop'
 ```
 
-Watch the relay's log. Within a few seconds:
+**25%, not 12%.** pion registers the default interceptors, so the receiver NACKs what it
+misses and the relay retransmits; on loopback most retransmissions land, and the
+fraction-lost the child ends up reporting is well below the drop rate. Read the
+`loss_pct=` field on the relay's own `layer switch` line and raise the percentage until it
+clears `layerDownLossPct` (5). `sudo nft list table inet lay` shows the counter, which
+tells you the rule is matching at all.
+
+**This recipe has NOT been run.** What has been demonstrated live is the *upstream* half:
+a three-rung sender reaching the relay as three sources with three SSRCs, and a clean child
+recording the TOP rung (§7.5's table). The downgrade below is what the code and the unit
+tests say will happen; the log lines are illustrative, not a transcript.
+
+Watch the relay's log. Within a few seconds you should see:
 
 ```
 msg="layer switch" component=relay source=leaf-b child=leaf-c from=f to=h loss_pct=12.1
@@ -435,10 +458,10 @@ msg="layer switch" component=relay source=leaf-b child=leaf-c from=h to=q loss_p
 ```
 
 …and `leaf-d` produces no such line at all. Let both record for ~30 s, then `Ctrl-C`
-everything, remove the qdisc, and **measure both files**:
+everything, remove the rule, and **measure both files**:
 
 ```console
-$ sudo tc qdisc del dev lo root
+$ sudo nft delete table inet lay
 
 $ for f in /tmp/lay/got-c.ivf /tmp/lay/got-d.ivf; do
     printf "%-22s frames=%-6s bytes=%-9s decoded=%s\n" "$f" \

@@ -972,8 +972,12 @@ func (r *Router) setupRelayEdge(session *Session, topo *overlay.Topology, peerNa
 // by the first forwarded track is exactly what keeps no leftover recvonly around to
 // hijack the matching.
 //
-// The cost on the offering side is paid whether or not anyone publishes layers:
-// len(layerLadder)-1 extra m-lines per relay edge, negotiated and then inactive. It
+// The cost on the offering side is paid whether or not anyone publishes layers. An
+// edge that carries no forwarded leg grows by len(layerLadder)-1 m-lines; one that
+// carries at least one grows by len(layerLadder), because the slot the FIRST
+// forwarded track used to cannibalise is now a separate m-line — measured 1 → 4 on a
+// one-leg edge. Two of the three sit negotiated and inactive for a single-rung
+// neighbour. It
 // is paid unconditionally because a relay cannot know how many rungs a neighbour
 // will publish until the tracks arrive, and by then the offer is long gone.
 func (r *Router) addRecvSlots(session *Session, peerName string, n int) {
