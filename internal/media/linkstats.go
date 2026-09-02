@@ -10,6 +10,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"github.com/SammyUrfen/conclave/internal/metrics"
+	"github.com/SammyUrfen/conclave/internal/overlay"
 )
 
 // RTTMemory is how long a measured pairwise RTT stays usable after the
@@ -195,4 +196,176 @@ func (l *lossTracker) worstPct() float64 {
 		}
 	}
 	return worst * 100
+}
+
+// NATRelayedThreshold is the fraction of a peer's MEASURED media paths that must be
+// relay-typed before the peer is classified overlay.NATRelayed.
+//
+// It is 1.0 — every path, no exceptions — and that is the hysteresis, not pedantry.
+// The bit this feeds is brutal: overlay.BuildTree and Validate force a NATRelayed node
+// to be a LEAF, and arbiter.Fitness disqualifies it as coordinator outright. So
+// flipping on the FIRST relayed edge would tear a working subtree apart on the
+// weakest possible evidence — one peer that happened to need a relay to reach this
+// one says nothing about the paths to its other children, which are demonstrably
+// direct and are carrying media right now. Requiring every path inverts the burden:
+// the peer is only demoted once it has shown it has no direct path to ANYONE, which
+// is the actual condition "TURN-bound" is meant to name.
+//
+// The cost of the choice, stated rather than hidden: a peer with one stubborn direct
+// neighbour and four relayed ones stays eligible and may be given children it can
+// only reach over TURN. That is the conservative direction here — the tree still
+// works, it is merely more expensive — whereas the opposite error removes a healthy
+// relay from the fleet and re-parents everyone behind it.
+const NATRelayedThreshold = 1.0
+
+// NATDirectMemory is how long a MEASURED direct verdict keeps a peer classified
+// overlay.NATDirect after every edge it can still measure has become relay-typed.
+//
+// IT EXISTS BECAUSE THE VERDICT IS OTHERWISE A ONE-WAY LATCH, and the latch closes on
+// its own. overlay.BuildTree and Validate deny a NATRelayed node children, so consider
+// peer P, CGNAT-bound upstream but holding a child C on its own LAN:
+//
+//	edges {parent A: relayed, child C: host} → natClass(2,1) = NATDirect. Eligible.
+//	a rebuild re-parents C away        → edges {A: relayed} → natClass(1,1) = NATRelayed.
+//	P is now a forced leaf, so the coordinator never gives it a child again — and its
+//	only remaining edge is the relayed uplink, so it re-measures NATRelayed forever.
+//
+// P can never regain the edge that PROVED it was direct. Nothing about its reachability
+// changed; the tree's reaction to the verdict removed the only evidence that could
+// clear it. RTTMemory's doc comment argues this exact structure for the RTT sensor —
+// "no challenger could ever win" — and the cure is the same one: remember.
+//
+// ONLY THE PERMISSIVE VERDICT IS REMEMBERED. A relayed verdict is never cached, because
+// the two directions are not symmetric: latching toward NATRelayed is the harm (forced
+// leaf, disqualified as coordinator, no path back), while latching toward NATDirect
+// merely DELAYS a demotion, and its correction path is immediate — the next measurement
+// past the horizon reclassifies the peer with no further evidence needed. Nor does an
+// UNMEASURED tick refresh the memory: natClass's permissive answer for a peer with no
+// edges is an absence of data, not a direct path, and treating it as one would restore
+// the latch by another route.
+//
+// Two minutes, the same horizon and the same justification as RTTMemory: long enough
+// that a peer moved around by one churn event still remembers what it measured before
+// the move (the tree re-optimises on a scale of seconds), short enough that the value
+// is still evidence about a path that does not usually change character inside two
+// minutes — and it is what arbiter.StableUptimeSec already treats as "settled".
+const NATDirectMemory = 2 * time.Minute
+
+// relayedPath reports whether the path media actually takes over ONE PeerConnection
+// runs through a TURN relay, reading pion's stats report for that connection.
+//
+// THIS IS NOT NAT-TYPE DETECTION. It does not discover mapping or filtering behaviour,
+// it does not implement RFC 5780, and it cannot tell symmetric NAT from a firewall
+// that happens to block the direct path. It answers exactly one behavioural question —
+// "is this peer's media going through a relay?" — which is the only thing conclave
+// consumes NAT for: may this node be a parent.
+//
+// The evidence is the NOMINATED, SUCCEEDED candidate pair's LOCAL candidate. That pair
+// is the path media takes; a local candidate of type relay means the packets leave via
+// a TURN allocation. Three things this deliberately does NOT do:
+//
+//   - It does not scan the report for any relay-typed candidate. Every peer configured
+//     with -turn GATHERS a relay candidate whether or not it ends up using one, so a
+//     scan would classify an entire TURN-configured fleet as forced leaves.
+//   - It does not look at the REMOTE candidate. The far end being relay-bound is the
+//     far end's constraint; it says nothing about whether this node can serve children.
+//   - It does not filter on RTT. selectedPairRTTMs skips a zero round-trip because 0 ms
+//     reads as a perfect link downstream; which candidate the path leaves through is
+//     known the moment the pair is nominated, long before the first STUN response is
+//     timed.
+//
+// ok is false when this connection has nothing to say — no nominated succeeded pair
+// yet, or one whose local candidate is missing from the report. An unclassified edge
+// is not a verdict; natClass decides what an absence of verdicts means.
+func relayedPath(report webrtc.StatsReport) (relayed, ok bool) {
+	// Two passes, because a pair references its local candidate by id and map order
+	// gives no guarantee the candidate was seen first. The report is a handful of
+	// entries; the expensive part is PeerConnection.GetStats, which the caller already
+	// paid for and shares with selectedPairRTTMs.
+	// LOCAL candidates only. ICECandidateStats carries both sides and they are
+	// distinguished by Type, not by the Go type — so indexing them together lets a
+	// REMOTE entry answer a LocalCandidateID lookup and classify this peer from its
+	// neighbour's candidate. pion's ids are agent-unique today, which makes this
+	// hardening rather than a live bug; the id space is a library detail and the
+	// failure would be silent (a healthy relay forced to a leaf, permanently).
+	local := make(map[string]webrtc.ICECandidateType, len(report))
+	for _, s := range report {
+		if c, isCand := s.(webrtc.ICECandidateStats); isCand && c.Type == webrtc.StatsTypeLocalCandidate {
+			local[c.ID] = c.CandidateType
+		}
+	}
+
+	for _, s := range report {
+		pair, isPair := s.(webrtc.ICECandidatePairStats)
+		if !isPair || !pair.Nominated || pair.State != webrtc.StatsICECandidatePairStateSucceeded {
+			continue
+		}
+		kind, found := local[pair.LocalCandidateID]
+		if !found {
+			continue
+		}
+		ok = true
+		// One direct nominated pair is enough for this edge to count as direct, the
+		// same all-paths rule NATRelayedThreshold applies across edges. An ICE restart
+		// can leave two nominated pairs on one connection; if either is direct, this
+		// peer demonstrably has a direct path to this neighbour.
+		if kind != webrtc.ICECandidateTypeRelay {
+			return false, true
+		}
+		relayed = true
+	}
+	return relayed, ok
+}
+
+// natClass folds the per-edge verdicts into the single overlay.NATType the control
+// plane consumes. measured is how many edges yielded a verdict at all; relayed is how
+// many of those were relay-typed.
+//
+// FAILING SAFE ON ABSENCE IS THE LOAD-BEARING RULE. The classification is only
+// observable AFTER a PeerConnection exists, so a peer that has just joined has
+// measured nothing — the same structural limitation RTTMemory records for pairwise RTT
+// ("first attachment is RTT-blind"), for the same reason: WebRTC offers no way to
+// characterise a path without forming it. A peer that has not measured anything must
+// therefore report the PERMISSIVE class, not be silently demoted to a forced leaf on
+// no evidence. NATDirect is exactly what such a peer reported when the class was a
+// flag, so the unmeasured case is unchanged from the declared build.
+func natClass(measured, relayed int) overlay.NATType {
+	if measured == 0 {
+		return overlay.NATDirect
+	}
+	if float64(relayed)/float64(measured) < NATRelayedThreshold {
+		return overlay.NATDirect
+	}
+	return overlay.NATRelayed
+}
+
+// natMemory holds the last MEASURED direct verdict, so a peer that has demonstrated a
+// direct path is not reclassified the instant the tree takes that edge away. It is not
+// goroutine-safe on its own; Router guards it with mu, exactly as it guards rttStore.
+type natMemory struct {
+	lastDirect time.Time
+	seen       bool
+}
+
+// classify folds one tick's per-edge counts into the class the telemetry frame carries,
+// applying NATDirectMemory. See that constant for why the memory is one-sided.
+func (m *natMemory) classify(measured, relayed int, now time.Time) overlay.NATType {
+	class := natClass(measured, relayed)
+	if class == overlay.NATDirect {
+		// Only a verdict backed by an actual edge is evidence. measured == 0 reaches
+		// here as natClass's fail-safe, and remembering that would let a peer with no
+		// edges refresh its memory forever.
+		if measured > 0 {
+			m.lastDirect, m.seen = now, true
+		}
+		return overlay.NATDirect
+	}
+	if m.seen && now.Sub(m.lastDirect) <= NATDirectMemory {
+		return overlay.NATDirect
+	}
+	// Past the horizon the memory is not merely ignored, it is dropped: leaving it set
+	// would make every later comparison a subtraction against a timestamp that can only
+	// get older, which is the same answer at more cost.
+	m.seen = false
+	return overlay.NATRelayed
 }

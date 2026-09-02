@@ -12,6 +12,7 @@ GO ?= go
 PKGS := ./...
 SERVER_PKG := ./cmd/server
 PEER_PKG := ./cmd/peer
+TURN_PKG := ./cmd/turn
 BIN_DIR := bin
 
 .DEFAULT_GOAL := help
@@ -23,9 +24,10 @@ help: ## Show this help.
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: build
-build: ## Compile both binaries into ./bin.
+build: ## Compile all three binaries into ./bin.
 	$(GO) build -o $(BIN_DIR)/server $(SERVER_PKG)
 	$(GO) build -o $(BIN_DIR)/peer $(PEER_PKG)
+	$(GO) build -o $(BIN_DIR)/turn $(TURN_PKG)
 
 .PHONY: run-server
 run-server: ## Run the central server. Pass flags via ARGS="-addr :9000".
@@ -34,6 +36,10 @@ run-server: ## Run the central server. Pass flags via ARGS="-addr :9000".
 .PHONY: run-peer
 run-peer: ## Run a peer health probe. Pass flags via ARGS="-server http://...".
 	$(GO) run $(PEER_PKG) $(ARGS)
+
+.PHONY: run-turn
+run-turn: ## Run the TURN relay. Needs -public-ip and -users; pin -relay-ports for firewall work.
+	$(GO) run $(TURN_PKG) $(ARGS)
 
 .PHONY: test
 test: ## Run all tests with the race detector.
@@ -101,6 +107,9 @@ INJECTED_CLOCK_PKGS := internal/dashboard internal/signaling internal/metrics in
 #                      revisiting: if their owners want the guarantee, move them into
 #                      INJECTED_CLOCK_PKGS — it costs nothing at present.
 #   internal/logging — no temporal behaviour at all; nothing to guarantee.
+#   cmd/turn         — no temporal behaviour either: it parses flags, opens one UDP
+#                      socket, and blocks on a signal. Every deadline in a TURN
+#                      allocation lives inside pion/turn, which we do not drive.
 #   web/             — not Go.
 
 # WALL_CLOCK_CALLS is every entry point into package time that reads or waits on real

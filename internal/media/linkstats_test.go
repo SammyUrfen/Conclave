@@ -2,11 +2,14 @@ package media
 
 import (
 	"math"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
+
+	"github.com/SammyUrfen/conclave/internal/overlay"
 )
 
 // --- rttStore: the memory that makes a challenger measurable -----------------
@@ -297,5 +300,503 @@ func TestFractionLostFromReceptionReport(t *testing.T) {
 				t.Errorf("got %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// --- relayedPath: is the path media actually takes a TURN relay? -------------
+//
+// The one bit conclave consumes from "NAT" is: MAY THIS NODE BE A PARENT? That bit is
+// directly observable — the nominated ICE candidate pair names the local candidate
+// media is leaving through, and a relay-typed local candidate means the allocation is
+// on a TURN server. This is a BEHAVIOURAL classification of the paths this peer holds,
+// not RFC 5780 NAT-type discovery, and the tests below are written against that claim.
+
+// candidate builds one ICECandidateStats entry as pion reports it. Local and remote
+// candidates share the type; only the stat type and the ID distinguish them.
+func candidate(id string, kind webrtc.ICECandidateType, statsType webrtc.StatsType) webrtc.ICECandidateStats {
+	return webrtc.ICECandidateStats{Type: statsType, ID: id, CandidateType: kind}
+}
+
+func localCand(id string, kind webrtc.ICECandidateType) webrtc.ICECandidateStats {
+	return candidate(id, kind, webrtc.StatsTypeLocalCandidate)
+}
+
+func remoteCand(id string, kind webrtc.ICECandidateType) webrtc.ICECandidateStats {
+	return candidate(id, kind, webrtc.StatsTypeRemoteCandidate)
+}
+
+// candPair builds one ICECandidatePairStats. rttSec is separate from the rest because
+// one case exists purely to prove the RTT filter does not gate the classification.
+func candPair(state webrtc.StatsICECandidatePairState, nominated bool, local, remote string, rttSec float64) webrtc.ICECandidatePairStats {
+	return webrtc.ICECandidatePairStats{
+		Type: webrtc.StatsTypeCandidatePair, State: state, Nominated: nominated,
+		LocalCandidateID: local, RemoteCandidateID: remote, CurrentRoundTripTime: rttSec,
+	}
+}
+
+func TestRelayedPath(t *testing.T) {
+	tests := []struct {
+		name        string
+		report      webrtc.StatsReport
+		wantRelayed bool
+		wantOK      bool
+	}{
+		{
+			// Mutation caught: ignoring CandidateType entirely and always reporting a
+			// direct path — which is what "declared, not measured" already does, so the
+			// sensor would look wired and change nothing.
+			name: "a nominated pair on a relay local candidate is relayed",
+			report: webrtc.StatsReport{
+				"l": localCand("l", webrtc.ICECandidateTypeRelay),
+				"r": remoteCand("r", webrtc.ICECandidateTypeHost),
+				"p": candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "l", "r", 0.02),
+			},
+			wantRelayed: true, wantOK: true,
+		},
+		{
+			// Mutation caught: returning NATRelayed unconditionally, which would force
+			// every peer in a meet to a leaf and make the tree unbuildable.
+			name: "a nominated pair on a host local candidate is not relayed",
+			report: webrtc.StatsReport{
+				"l": localCand("l", webrtc.ICECandidateTypeHost),
+				"p": candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "l", "r", 0.02),
+			},
+			wantRelayed: false, wantOK: true,
+		},
+		{
+			// Mutation caught: treating anything that is not a host candidate as
+			// relayed. A server-reflexive candidate is a DIRECT path discovered via
+			// STUN — the ordinary case for every peer behind a cone NAT, and the one
+			// that must stay eligible to relay.
+			name: "a server-reflexive local candidate is a direct path",
+			report: webrtc.StatsReport{
+				"l": localCand("l", webrtc.ICECandidateTypeSrflx),
+				"p": candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "l", "r", 0.02),
+			},
+			wantRelayed: false, wantOK: true,
+		},
+		{
+			// Mutation caught: scanning the report for ANY relay-typed candidate
+			// instead of following the nominated pair's LocalCandidateID. Every peer
+			// configured with -turn gathers a relay candidate whether or not it uses
+			// one, so that mutation classifies the entire fleet as forced leaves the
+			// moment TURN is configured at all.
+			name: "an unused gathered relay candidate does not classify the peer",
+			report: webrtc.StatsReport{
+				"host":  localCand("host", webrtc.ICECandidateTypeHost),
+				"spare": localCand("spare", webrtc.ICECandidateTypeRelay),
+				"p":     candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "host", "r", 0.02),
+			},
+			wantRelayed: false, wantOK: true,
+		},
+		{
+			// Mutation caught: following RemoteCandidateID. The far end being TURN-bound
+			// is the far end's problem; it says nothing about whether THIS node can
+			// serve children, which is the only question the bit answers.
+			name: "the remote end being relay-typed does not classify this peer",
+			report: webrtc.StatsReport{
+				"l": localCand("l", webrtc.ICECandidateTypeHost),
+				"r": remoteCand("r", webrtc.ICECandidateTypeRelay),
+				"p": candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "l", "r", 0.02),
+			},
+			wantRelayed: false, wantOK: true,
+		},
+		{
+			// Mutation caught: ignoring the Nominated flag. A PeerConnection accumulates
+			// a pair per candidate combination during checking, including relay ones it
+			// then rejects in favour of a direct path — reading those would classify a
+			// perfectly direct peer as TURN-bound.
+			name: "a succeeded but un-nominated relay pair is not the path media takes",
+			report: webrtc.StatsReport{
+				"l": localCand("l", webrtc.ICECandidateTypeRelay),
+				"p": candPair(webrtc.StatsICECandidatePairStateSucceeded, false, "l", "r", 0.02),
+			},
+			wantOK: false,
+		},
+		{
+			// Mutation caught: ignoring State, which admits pairs that were nominated
+			// and then failed.
+			name: "a nominated pair that failed is not consulted",
+			report: webrtc.StatsReport{
+				"l": localCand("l", webrtc.ICECandidateTypeRelay),
+				"p": candPair(webrtc.StatsICECandidatePairStateFailed, true, "l", "r", 0.02),
+			},
+			wantOK: false,
+		},
+		{
+			// Mutation caught: dropping the "nothing measured" signal, i.e. returning
+			// ok=true with a fabricated verdict for a session that has not connected.
+			name: "no pairs at all is unclassified, not a verdict",
+			report: webrtc.StatsReport{
+				"l": localCand("l", webrtc.ICECandidateTypeRelay),
+			},
+			wantOK: false,
+		},
+		{
+			// Mutation caught: treating a dangling LocalCandidateID as relay-typed
+			// (webrtc.ICECandidateTypeUnknown is the zero value, so a missing lookup
+			// that is not checked yields SOME type and would silently become a verdict).
+			name: "a nominated pair whose local candidate is absent is unclassified",
+			report: webrtc.StatsReport{
+				"p": candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "gone", "r", 0.02),
+			},
+			wantOK: false,
+		},
+		{
+			// Mutation caught: reusing selectedPairRTTMs's `ms <= 0 continue` guard.
+			// That guard exists because 0 ms reads as a perfect link downstream; it has
+			// nothing to do with which candidate the path leaves through. A relay pair
+			// whose first STUN response has not been timed yet is still a relay pair,
+			// and skipping it would leave a genuinely TURN-bound peer classified direct
+			// for as long as pion has not filled the field in.
+			name: "an unmeasured RTT does not block the classification",
+			report: webrtc.StatsReport{
+				"l": localCand("l", webrtc.ICECandidateTypeRelay),
+				"p": candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "l", "r", 0),
+			},
+			wantRelayed: true, wantOK: true,
+		},
+		{
+			// Mutation caught: returning on the FIRST relayed pair found. Within one
+			// PeerConnection an ICE restart can leave two nominated pairs; if either is
+			// direct the peer demonstrably has a direct path over this edge, and
+			// NATRelayedThreshold says that is enough to stay eligible.
+			name: "one direct nominated pair beats a relayed one in the same report",
+			report: webrtc.StatsReport{
+				"lr": localCand("lr", webrtc.ICECandidateTypeRelay),
+				"lh": localCand("lh", webrtc.ICECandidateTypeHost),
+				"p1": candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "lr", "r", 0.02),
+				"p2": candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "lh", "r", 0.02),
+			},
+			wantRelayed: false, wantOK: true,
+		},
+		{
+			// Mutation caught: indexing local and remote candidates into ONE map with
+			// no type filter. relayedPath must resolve LocalCandidateID against a
+			// LOCAL candidate; here the only entry carrying that id is a REMOTE one,
+			// so an unfiltered map classifies this peer from the FAR END's candidate
+			// and reports a relayed path it does not have. pion's ids are agent-unique
+			// today, so this is hardening rather than a live bug — but the id space is
+			// a library detail, and the failure it would cause (a healthy relay forced
+			// to a leaf by its neighbour's TURN binding) is silent and permanent.
+			//
+			// The id is resolved against the wrong side or not at all; "not at all" is
+			// the right answer, because an id that names no local candidate is the
+			// dangling case the row below already calls unclassified.
+			name: "an id that is only a REMOTE candidate does not classify the peer",
+			report: webrtc.StatsReport{
+				"remote": remoteCand("shared", webrtc.ICECandidateTypeRelay),
+				"p":      candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "shared", "shared", 0.02),
+			},
+			wantOK: false,
+		},
+		{
+			// The collision the row above isolates, now with BOTH sides present: the
+			// local candidate must win regardless of the order pion emitted them in.
+			// Without the type filter this case is decided by Go's map iteration order
+			// and is green about a quarter of the time, which is why it is the
+			// companion assertion and not the discriminator.
+			name: "a local and a remote candidate sharing an id resolve to the local one",
+			report: webrtc.StatsReport{
+				"local":  localCand("shared", webrtc.ICECandidateTypeHost),
+				"remote": remoteCand("shared", webrtc.ICECandidateTypeRelay),
+				"p":      candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "shared", "shared", 0.02),
+			},
+			wantRelayed: false, wantOK: true,
+		},
+		{
+			// Mutation caught: mis-casting non-pair stats, the same hazard
+			// TestSelectedPairRTTMs pins for the RTT walk.
+			name: "non-pair, non-candidate stats are skipped",
+			report: webrtc.StatsReport{
+				"t": webrtc.TransportStats{Type: webrtc.StatsTypeTransport},
+				"l": localCand("l", webrtc.ICECandidateTypeRelay),
+				"p": candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "l", "r", 0.02),
+			},
+			wantRelayed: true, wantOK: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			relayed, ok := relayedPath(tt.report)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v (relayed = %v)", ok, tt.wantOK, relayed)
+			}
+			if ok && relayed != tt.wantRelayed {
+				t.Errorf("relayed = %v, want %v", relayed, tt.wantRelayed)
+			}
+		})
+	}
+}
+
+// TestNATClass pins the fold from per-edge verdicts to the one bit overlay.BuildTree
+// and arbiter.Fitness consume. Two rules live here and both are load-bearing:
+// the fail-safe on absence, and NATRelayedThreshold.
+func TestNATClass(t *testing.T) {
+	tests := []struct {
+		name              string
+		measured, relayed int
+		want              overlay.NATType
+	}{
+		{
+			// THE FAIL-SAFE, and the most important case in this file. A peer that has
+			// not connected to anybody has measured nothing. Classifying it relayed
+			// would demote a fresh peer to a forced leaf and disqualify it as
+			// coordinator on no evidence at all — the permissive default is the only
+			// honest answer for an unmeasured peer, and it is what the -nat flag
+			// defaulted to before this sensor existed.
+			//
+			// Mutation caught: making NATRelayed the zero-evidence answer, or returning
+			// the empty NATType (which travels as omitempty and decodes to "" at the
+			// coordinator, not to "direct").
+			name: "a peer that has measured nothing is direct",
+			want: overlay.NATDirect,
+		},
+		{
+			// Mutation caught: never returning NATRelayed at all, i.e. wiring a sensor
+			// whose output is constant.
+			name: "every path relayed is relayed", measured: 3, relayed: 3, want: overlay.NATRelayed,
+		},
+		{
+			// THE HYSTERESIS RULE. One relayed edge is not evidence that this peer
+			// cannot serve children — it demonstrably serves the ones it reaches
+			// directly. Flipping the whole peer to a forced leaf on a single relayed
+			// edge would tear down a working subtree on the worst possible evidence.
+			//
+			// Mutation caught: `relayed > 0` instead of the all-paths threshold.
+			name: "one direct path among relayed ones keeps the peer eligible", measured: 3, relayed: 2, want: overlay.NATDirect,
+		},
+		{
+			name: "all direct is direct", measured: 2, relayed: 0, want: overlay.NATDirect,
+		},
+		{
+			// A leaf holds exactly one edge. If a single measured edge could not yield
+			// a verdict, the classification would be unreachable for precisely the
+			// peers it is meant to describe.
+			name: "a single relayed edge is enough to classify", measured: 1, relayed: 1, want: overlay.NATRelayed,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := natClass(tt.measured, tt.relayed); got != tt.want {
+				t.Errorf("natClass(%d, %d) = %q, want %q", tt.measured, tt.relayed, got, tt.want)
+			}
+		})
+	}
+}
+
+// relayEdge and directEdge build one edgeReport for a neighbour whose nominated pair
+// leaves through, respectively, a TURN allocation and a host candidate. Package-level
+// rather than local to one test, because the fold and the NAT memory are two different
+// tests over the same two shapes of edge.
+func relayEdge(name string, rttSec float64) edgeReport {
+	return edgeReport{name: name, report: webrtc.StatsReport{
+		"l": localCand("l", webrtc.ICECandidateTypeRelay),
+		"p": candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "l", "r", rttSec),
+	}}
+}
+
+func directEdge(name string, rttSec float64) edgeReport {
+	return edgeReport{name: name, report: webrtc.StatsReport{
+		"l": localCand("l", webrtc.ICECandidateTypeHost),
+		"p": candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "l", "r", rttSec),
+	}}
+}
+
+// TestLinkStatsFromFoldsTheEdgeReports is the wiring test, and it exists because a
+// mutation run found the gap it fills: with only relayedPath and natClass pinned, a
+// Router that computed the class correctly and then returned a constant NATDirect
+// passed the entire suite. The classification was measured and thrown away, which is
+// indistinguishable from the declared build it replaces.
+//
+// The mutations this catches: returning a constant class from the fold; dropping the
+// per-edge accounting so every edge counts as unmeasured; filing an RTT under the
+// wrong neighbour's name.
+func TestLinkStatsFromFoldsTheEdgeReports(t *testing.T) {
+	tests := []struct {
+		name    string
+		reports []edgeReport
+		wantNAT overlay.NATType
+		wantRTT map[string]float64
+	}{
+		{
+			name:    "every edge relayed classifies the peer TURN-bound",
+			reports: []edgeReport{relayEdge("a", 0.020), relayEdge("b", 0.030)},
+			wantNAT: overlay.NATRelayed,
+			wantRTT: map[string]float64{"a": 20, "b": 30},
+		},
+		{
+			name:    "one direct edge keeps the peer eligible to relay",
+			reports: []edgeReport{relayEdge("a", 0.020), directEdge("b", 0.030)},
+			wantNAT: overlay.NATDirect,
+			wantRTT: map[string]float64{"a": 20, "b": 30},
+		},
+		{
+			// An edge that has not connected contributes no verdict and no RTT, and
+			// must not be counted as a direct path either — that would let one
+			// unconnected edge hold a genuinely TURN-bound peer at NATDirect forever.
+			name: "an unconnected edge contributes nothing",
+			reports: []edgeReport{
+				relayEdge("a", 0.020),
+				{name: "b", report: webrtc.StatsReport{}},
+			},
+			wantNAT: overlay.NATRelayed,
+			wantRTT: map[string]float64{"a": 20},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := NewRouter(discardLog(), nil, RouterConfig{SelfName: "self", Managed: true})
+			rtt, _, nat := r.linkStatsFrom(tt.reports)
+			if nat != tt.wantNAT {
+				t.Errorf("nat = %q, want %q", nat, tt.wantNAT)
+			}
+			got := map[string]float64{}
+			for _, e := range rtt {
+				got[e.Name] = e.RTTMs
+			}
+			if !reflect.DeepEqual(got, tt.wantRTT) {
+				t.Errorf("peerRTT = %v, want %v", got, tt.wantRTT)
+			}
+		})
+	}
+}
+
+// TestLinkStatsNATFailsSafeWithNoEdges pins the fail-safe through the Router surface
+// rather than only through the fold, because that is where a fresh peer actually hits
+// it: cmd/peer samples telemetry on a timer from the moment it joins, and the first
+// several reports are taken before any PeerConnection exists.
+//
+// The mutation this catches: a zero-value overlay.NATType leaking out of LinkStats.
+// It is not NATRelayed, so the fold test would still pass, but it travels as an absent
+// JSON field and reaches the coordinator as "" — which is neither class, and which
+// overlay's `n.NAT == NATRelayed` checks happen to read as eligible today by accident
+// rather than by decision.
+func TestLinkStatsNATFailsSafeWithNoEdges(t *testing.T) {
+	r := NewRouter(discardLog(), nil, RouterConfig{SelfName: "fresh", Managed: true})
+	_, _, nat := r.LinkStats()
+	if nat != overlay.NATDirect {
+		t.Errorf("LinkStats nat = %q from a peer with no edges, want %q", nat, overlay.NATDirect)
+	}
+}
+
+// --- the NAT verdict must not be a one-way latch -----------------------------
+
+// TestNATVerdictSurvivesLosingItsOnlyDirectEdge WALKS THE TRAJECTORY, and it exists
+// because the arithmetic tests above cannot see the bug. natClass(2,1) = NATDirect and
+// natClass(1,1) = NATRelayed are BOTH correct in isolation and both already pinned; the
+// defect only appears when a peer moves from the first state to the second and the
+// control plane's reaction makes the move irreversible.
+//
+// Peer P is CGNAT-bound upstream but has a child C on its own LAN:
+//
+//  1. edges {parent A: relayed, child C: host} → natClass(2,1) = NATDirect. Eligible.
+//  2. any rebuild re-parents C away → edges {A: relayed} → natClass(1,1) = NATRelayed.
+//  3. overlay.BuildTree and Validate deny a NATRelayed node children, so P is now a
+//     FORCED LEAF. Its only edge is the relayed uplink. It measures NATRelayed forever
+//     and can never regain the edge that proved it was direct.
+//
+// The mutation this catches is the one that shipped: classifying from this tick's edges
+// only, with no memory of a direct verdict. media.RTTMemory's doc comment argues
+// verbatim this structure for the RTT sensor ("no challenger could ever win"); the NAT
+// sensor chose the opposite and inherited exactly that failure.
+func TestNATVerdictSurvivesLosingItsOnlyDirectEdge(t *testing.T) {
+	clk := newFakeClock()
+	r := NewRouter(discardLog(), nil, RouterConfig{SelfName: "p", Managed: true, Clock: clk})
+
+	// Step 1 — a relayed uplink and a direct LAN child. One direct path is enough.
+	if _, _, nat := r.linkStatsFrom([]edgeReport{relayEdge("a", 0.020), directEdge("c", 0.001)}); nat != overlay.NATDirect {
+		t.Fatalf("with a direct child, nat = %q, want %q", nat, overlay.NATDirect)
+	}
+
+	// Step 2 — a rebuild takes C away. Nothing about P's own reachability changed:
+	// it demonstrated a direct path one tick ago and has not been re-measured against
+	// anyone since.
+	clk.advance(10 * time.Second)
+	_, _, nat := r.linkStatsFrom([]edgeReport{relayEdge("a", 0.020)})
+	if nat != overlay.NATDirect {
+		t.Fatalf("after its only direct edge was re-parented away, nat = %q, want %q: "+
+			"P is now a forced leaf, so the coordinator will never give it a child again "+
+			"and it can never re-measure the direct path that would clear the verdict",
+			nat, overlay.NATDirect)
+	}
+}
+
+// TestNATDirectMemoryExpires is the other half, and without it the fix above is just a
+// latch pointing the other way. A peer whose direct path genuinely went away — the
+// laptop moved onto a hotel network behind CGNAT — must eventually be classified, or
+// the tree keeps handing children to a node that can only reach them over TURN.
+//
+// The mutation this catches: remembering a direct verdict forever (no horizon), which
+// passes the trajectory test above and makes NATRelayed unreachable for any peer that
+// was ever direct.
+func TestNATDirectMemoryExpires(t *testing.T) {
+	clk := newFakeClock()
+	r := NewRouter(discardLog(), nil, RouterConfig{SelfName: "p", Managed: true, Clock: clk})
+
+	if _, _, nat := r.linkStatsFrom([]edgeReport{directEdge("c", 0.001)}); nat != overlay.NATDirect {
+		t.Fatalf("nat = %q, want %q", nat, overlay.NATDirect)
+	}
+
+	// Just inside the horizon: still remembered.
+	clk.advance(NATDirectMemory - time.Second)
+	if _, _, nat := r.linkStatsFrom([]edgeReport{relayEdge("a", 0.020)}); nat != overlay.NATDirect {
+		t.Fatalf("the direct verdict expired early, at age %v: nat = %q", NATDirectMemory-time.Second, nat)
+	}
+
+	// Past it: the peer is classified on what it can measure now.
+	clk.advance(2 * time.Second)
+	if _, _, nat := r.linkStatsFrom([]edgeReport{relayEdge("a", 0.020)}); nat != overlay.NATRelayed {
+		t.Errorf("nat = %q past NATDirectMemory (%v), want %q: a genuinely TURN-bound peer "+
+			"is never demoted and keeps being given children it can only reach over TURN",
+			nat, NATDirectMemory, overlay.NATRelayed)
+	}
+}
+
+// TestNATRelayedIsNeverRemembered pins the ASYMMETRY, which is the whole reason the
+// memory is safe. Only the permissive verdict is remembered: a latch toward NATRelayed
+// is the harm (forced leaf, disqualified as coordinator, no way back), while a latch
+// toward NATDirect merely delays a demotion and is corrected by the next measurement.
+//
+// The mutation this catches: caching "the last verdict" rather than "the last DIRECT
+// verdict", which would hold a peer relayed for NATDirectMemory after it has already
+// re-measured a direct path — reintroducing the latch on a timer.
+func TestNATRelayedIsNeverRemembered(t *testing.T) {
+	clk := newFakeClock()
+	r := NewRouter(discardLog(), nil, RouterConfig{SelfName: "p", Managed: true, Clock: clk})
+
+	if _, _, nat := r.linkStatsFrom([]edgeReport{relayEdge("a", 0.020)}); nat != overlay.NATRelayed {
+		t.Fatalf("nat = %q from an all-relayed peer, want %q", nat, overlay.NATRelayed)
+	}
+	clk.advance(time.Second)
+	if _, _, nat := r.linkStatsFrom([]edgeReport{directEdge("c", 0.001)}); nat != overlay.NATDirect {
+		t.Errorf("nat = %q one tick after a direct path was measured, want %q", nat, overlay.NATDirect)
+	}
+}
+
+// TestNATNoEdgesDoesNotRefreshTheMemory pins that the FAIL-SAFE is not mistaken for
+// EVIDENCE. natClass returns NATDirect for a peer that measured nothing, because
+// demoting an unmeasured peer is the worse error — but that answer is an absence of
+// data, not a direct path, and remembering it would restore the latch by another route:
+// a peer whose edges all drop and then come back relayed would refresh its memory on
+// every empty tick and never expire.
+//
+// The mutation this catches: recording the verdict whenever it is NATDirect, without
+// checking that anything was actually measured.
+func TestNATNoEdgesDoesNotRefreshTheMemory(t *testing.T) {
+	clk := newFakeClock()
+	r := NewRouter(discardLog(), nil, RouterConfig{SelfName: "p", Managed: true, Clock: clk})
+
+	// A long stretch with no edges at all — a peer between re-parents.
+	for range 4 {
+		clk.advance(NATDirectMemory / 2)
+		if _, _, nat := r.linkStatsFrom(nil); nat != overlay.NATDirect {
+			t.Fatalf("an unmeasured peer reported %q, want the permissive %q", nat, overlay.NATDirect)
+		}
+	}
+	// Its first real measurement is relayed. Nothing before it was evidence of a
+	// direct path, so there is nothing to remember and the verdict stands.
+	if _, _, nat := r.linkStatsFrom([]edgeReport{relayEdge("a", 0.020)}); nat != overlay.NATRelayed {
+		t.Errorf("nat = %q, want %q: empty ticks were treated as direct measurements", nat, overlay.NATRelayed)
 	}
 }

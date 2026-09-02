@@ -1850,7 +1850,7 @@ populates all of them:
 |---|---|
 | `Name`, `Coordinatable` | flags |
 | `UploadKbps` | **`-upload-kbps` flag** (default 3000). No bandwidth probe exists. |
-| `NAT` | **`-nat` flag** (`direct`\|`turn`). No NAT detection exists. |
+| `NAT` | **The nominated ICE candidate pair's LOCAL candidate type** (`media.relayedPath`), folded across every live edge by `media.natClass`, with a measured *direct* verdict remembered for `media.NATDirectMemory`. `-nat direct\|turn` still FORCES a value; the default is now `auto`. |
 | `CPUPct` | **`/proc/stat` deltas** (`metrics.CPUSampler`). Host-wide busy %, Linux only; reports nothing elsewhere. |
 | `RTTServerMs` | **WebSocket protocol ping** to the arbiter (`metrics.RTTProbe` → `signaling.Client.Ping`). |
 | `LossPct` | **RTCP receiver reports** from downstream children, worst leg (`media.lossTracker`). |
@@ -1911,9 +1911,114 @@ the sensors cannot support cannot reorder anybody. A residual remains and is mea
 rather than assumed: a pair whose drifting scores straddle a bucket boundary still
 trade places while crossing it, which *delays* a handover without preventing one.
 
-What is still **declared rather than measured**: `UploadKbps` and `NAT`, both flags.
-There is no bandwidth probe and no NAT detection; `overlay.NATRelayed` remains a
-modelled constraint.
+**The NAT class is measured now too, and it is a BEHAVIOURAL classification.** It is
+not NAT-type discovery: RFC 5780 needs a STUN server with two addresses, `pion/stun`
+does not implement it, and it answers a taxonomic question conclave never asks.
+conclave consumes exactly one bit — *may this node be a parent?* — and that bit is
+directly observable from machinery already in the tree. `selectedPairRTTMs` walks the
+stats report for the nominated, succeeded `ICECandidatePairStats`; that pair carries a
+`LocalCandidateID`, and the report also holds the `ICECandidateStats` it names. A local
+candidate of type **relay** means the packets leave through a TURN allocation. So the
+claim the code makes, and the only one it makes, is *"this peer's media paths are going
+through a relay"* — stated in exactly those words in `relayedPath`'s doc comment and in
+`metrics.Report.NAT`'s.
+
+Three things shape it, and each was a decision rather than a default.
+
+**It follows the pair, not the report.** Scanning for any relay-typed candidate would
+be simpler and would be wrong: every peer configured with `-turn` *gathers* a relay
+candidate whether or not it uses one, so a scan classifies an entire TURN-configured
+fleet as forced leaves. The remote candidate is ignored for the same reason in mirror
+image — the far end being relay-bound says nothing about whether **this** node can
+serve children.
+
+**`NATRelayedThreshold` is 1.0, and that is the hysteresis.** A peer is classified
+relayed only when EVERY nominated pair it holds is relay-typed. One relayed edge is not
+evidence that a node cannot relay — it is demonstrably relaying to the neighbours it
+reaches directly — and the bit is brutal enough (forced leaf, disqualified as
+coordinator) that flipping on it would tear a working subtree apart on the weakest
+available evidence. The cost is recorded rather than hidden: a peer with one stubborn
+direct neighbour and four relayed ones stays eligible and may be given children it can
+only reach over TURN. That is the conservative direction; the tree still works, it is
+merely more expensive.
+
+**A measured direct verdict is REMEMBERED for two minutes, because the verdict was
+otherwise a one-way latch that closes on its own.** This is the correction an adversarial
+review forced, and it is worth stating as a trajectory rather than as a rule, because the
+arithmetic is correct at every single step. `BuildTree` and `Validate` deny a `NATRelayed`
+node children. Take peer P, CGNAT-bound upstream but holding a child C on its own LAN:
+
+| step | P's edges | `natClass` | consequence |
+|---|---|---|---|
+| 1 | `{parent A: relayed, child C: host}` | `natClass(2,1)` → `NATDirect` | eligible, correctly |
+| 2 | a rebuild re-parents C away → `{A: relayed}` | `natClass(1,1)` → `NATRelayed` | forced leaf |
+| 3 | a forced leaf is never given a child | only edge is the relayed uplink | `NATRelayed` **forever** |
+
+P can never regain the edge that *proved* it was direct; the tree's reaction to the
+verdict destroyed the only evidence that could clear it. Both of the `TestNATClass` rows
+covering steps 1 and 2 were green, because they test the arithmetic and not the
+trajectory. `media.RTTMemory`'s doc comment argues verbatim this structure for the RTT
+sensor — "no challenger could ever win" — and the cure is the same: `NATDirectMemory`
+(2 min, the same horizon and the same justification) keeps a measured direct verdict
+alive after the edge that produced it closes.
+
+The memory is **one-sided on purpose**, and that asymmetry is what makes it safe. A
+relayed verdict is never remembered: latching toward `NATRelayed` is the harm (forced
+leaf, disqualified as coordinator, no path back), while latching toward `NATDirect`
+merely *delays* a demotion and its correction path is immediate — the first measurement
+past the horizon reclassifies the peer with no further evidence needed. An unmeasured
+tick does not refresh it either, because `natClass`'s permissive answer for a peer with
+no edges is an absence of data, not a direct path; treating it as one would restore the
+latch by another route. `TestNATVerdictSurvivesLosingItsOnlyDirectEdge` walks the three
+steps above; `TestNATDirectMemoryExpires`, `TestNATRelayedIsNeverRemembered` and
+`TestNATNoEdgesDoesNotRefreshTheMemory` pin the three ways the fix could over-reach.
+
+What the memory does **not** fix, stated because it is structural: a peer that goes
+genuinely TURN-bound stays eligible for up to two minutes and may be handed children it
+can only reach over a relay during that window. That is the conservative direction — the
+same one `NATRelayedThreshold` already chooses — but it is a real window, not zero. And
+a peer that has never had a direct edge has nothing to remember, so first attachment is
+unchanged.
+
+**It fails safe on absence, and the chicken-and-egg is the same one `RTTMemory` already
+records.** The class is only observable AFTER a PeerConnection exists, so a peer that
+has just joined is unclassified — "first attachment is RTT-blind", now also
+NAT-blind, and for the identical reason: WebRTC offers no way to characterise a path
+without forming it. An unmeasured peer reports `NATDirect`, which is exactly what it
+reported when the class was a flag. The opposite default would make every peer a forced
+leaf for its first seconds, so a meet's first tree could not be built and the first
+election would have no eligible candidate.
+
+**A mutation run moved the seam.** With only the two pure readers pinned, a `Router`
+that classified every edge correctly and then returned a **constant** `NATDirect` passed
+the entire suite — measured and thrown away is indistinguishable from declared. The fold
+now lives in `Router.linkStatsFrom`, taking one stats report per edge, so the only part
+of the sensor that needs a live PeerConnection to exercise is the single
+`session.stats()` delegation.
+
+The infrastructure that makes the class reachable landed with it: **`cmd/turn`**, a TURN
+relay in ~50 lines over `github.com/pion/turn/v5` — already in the module graph, because
+pion/webrtc depends on it for the ICE *client* — and `-turn`/`-turn-user`/`-turn-pass`
+on the peer. coturn remains the deployment answer and is in `deploy/docker-compose.yml`
+behind an opt-in profile; nothing in the test path touches it. A relay nobody can start
+is a relay nobody verifies.
+
+`cmd/turn` **denies the private ranges by default** (`-denied-peers`, the same set
+compose gives coturn plus multicast), because a relay that will forward into the LAN or
+loopback it sits in is a pivot into that network and that is not a state anybody should
+reach by omission — the argument `-users` already makes about anonymous allocations. The
+tension is real and is resolved in the open rather than by weakening the default:
+`docs/verify-turn.md` runs inside a netns on `10.99.0.0/24`, which the default denies, so
+the recipe passes an explicit narrowed list and a test reads the document to prove the two
+have not drifted apart (`TestVerifyTurnDeniedPeersAdmitsTheNamespace`). A refused
+permission is logged at warn, because otherwise a safe default is indistinguishable from
+a broken server: ICE simply never completes.
+
+What is still **declared rather than measured**: `UploadKbps`, alone. Phase 7 closes
+**one** of the two declared fields, not both. A real bandwidth probe means saturating
+the uplink to measure it, in a system whose entire thesis is that the uplink is the
+scarce resource; it was not attempted, and pretending otherwise would be the one
+dishonest number in this document.
 
 ### 8.2 No authentication, anywhere
 
@@ -2029,9 +2134,21 @@ boundary — it stops a confused peer, not a lying one.
 - **PLI *response* is unproven.** File and synthetic sources have no live encoder, so keyframe
   request *plumbing* (including the upstream SSRC translation) is proven, but a source
   actually producing a keyframe on demand awaits a browser sender.
-- **Phase 7 is untouched.** No simulcast, no SVC, no TURN infrastructure. A relay sends one
-  quality layer to every downstream, and `overlay.NATRelayed` is a *modelled* constraint
-  declared by a flag.
+- **Phase 7 is partly built.** No simulcast and no SVC: a relay still sends one quality
+  layer to every downstream. TURN infrastructure and the measured NAT class DO exist
+  (`cmd/turn`, `media.relayedPath`), but **the TURN path has not been exercised live**.
+  What has been run by hand is the relay in isolation — a `pion/turn` client allocated
+  `127.0.0.1:49176`, inside the pinned `49160-49200`, and a wrong password was refused.
+  What has NOT been run is the two together: a real ICE negotiation nominating a relay
+  pair with the direct path blocked, and the classification flipping as a result. The
+  command sequence believed to prove it is written down in `docs/verify-turn.md` and is
+  marked as proposed, not as evidence. That recipe's own firewall rules were WRONG on
+  first writing — they blocked host↔host only, leaving the `host↔relay` pair alive, and
+  by RFC 8445 §6.1.2.3 that pair *outranks* `relay↔relay` (`2·MAX` is a host priority,
+  ~2.1e9, against a relay's ~1.7e7). ICE would have nominated it, only one end would have
+  held a relay-typed local candidate, and the run's stated expectation — `turn` for BOTH
+  peers — was unreachable. The rules and the flow table are corrected; the point worth
+  keeping is that an unexecuted recipe is not evidence about anything, including itself.
 
 ### 8.8 Naming and surface honesty
 
@@ -2047,6 +2164,25 @@ boundary — it stops a confused peer, not a lying one.
   matter, so `converged`/`diverged` is computed and shown rather than averaged away. Relatedly,
   the per-member fitness value is named `fitness_lower_bound` on the wire, because uptime is
   unreachable from a `MemberSnapshot` — "a value quietly 0.15 too low is *invisibly* wrong."
+- **`NAT` is a misnomer, kept for wire compatibility and flagged here rather than
+  renamed.** The field, `overlay.NATType`, and the `-nat` flag all say "NAT" while what
+  is measured is *whether this peer's media paths go through a relay* — a behavioural
+  classification, not a NAT type. `NATRelayed`/`"turn"` is accurate about the
+  consequence; `NATDirect`/`"direct"` quietly asserts more than the sensor knows, since
+  it is also what an unmeasured peer reports. The honest names would be
+  `RelayBound`/`Unclassified`, and the rename was **costed and declined**: the string
+  values ride the wire in `metrics.Report`, appear in the dashboard body, and are typed
+  by operators as `-nat turn` — a rename touches all three for a clarification that a
+  doc comment delivers for free. The stated trigger for revisiting it is the same shape
+  as `internal/metrics`': split it when a **third** class appears, because at that point
+  the two-valued spelling stops working anyway.
+- **`-nat` changed meaning without changing its spelling.** It was the SOURCE of the
+  class; it is now an OVERRIDE, defaulting to `auto`. Every existing invocation of
+  `-nat turn` still means exactly what it meant, which is why the flag was kept rather
+  than deleted — but a reader of an old command line cannot tell from the text whether
+  the value was measured or forced. That is what `natSource` in the startup log line is
+  for (`nat=measured` vs `nat=forced:turn`), and it is the only place the difference is
+  visible: every later telemetry frame carries a bare class either way.
 - **The dashboard is read-mostly and eventually consistent.** A `seq` gap triggers a resync;
   that is the only consistency mechanism. It is an operator's lens, not a control surface.
 - **The frontend is dark-theme only.** The design system scoped a light variant out

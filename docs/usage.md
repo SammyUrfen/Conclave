@@ -97,18 +97,66 @@ Four modes, selected by flags.
 | `-media` | `""` | VP8 IVF file to send (looped); empty sends synthetic frames. |
 | `-record` | `""` | Write the first received track to this IVF file; empty just counts packets. |
 | `-stun` | `""` | STUN server URL. Empty is fine on one host. |
+| `-turn` | `""` | TURN relay URL, e.g. `turn:10.0.0.5:3478`. |
+| `-turn-user` / `-turn-pass` | `""` | TURN long-term credentials. **All three TURN flags or none** — a URL without credentials gathers no relay candidate and fails *silently*, so a partial set is rejected at startup. |
 | `-name` | `""` | Stable topology name (`relay`, `leaf-b`, …). Required by `-topology` and `-managed`. Must match `^[a-z0-9][a-z0-9_-]{0,63}$`. |
 | `-topology` | `""` | **Static tree.** Path to a JSON tree file (edges in names). Requires `-name`; fails loud on a malformed tree. Empty ⇒ full mesh. |
 | `-managed` | `false` | **Managed tree.** Report telemetry and realise the coordinator's pushed tree. Requires `-name`; mutually exclusive with `-topology`. |
 | `-upload-kbps` | `3000` | *(managed)* Advertised upload budget for forwarding others' media. **Declared, not measured.** |
-| `-nat` | `direct` | *(managed)* Declared NAT class `direct` \| `turn`. `turn` ⇒ forced leaf. **Declared, not detected.** |
+| `-nat` | `auto` | *(managed)* NAT class. **`auto` MEASURES it** from this peer's own nominated ICE candidate pairs; `direct` \| `turn` **force** the value the sensor would otherwise report. `turn` ⇒ forced leaf, and disqualified as coordinator. See the note below. |
 | `-coordinatable` | `true` | *(managed)* May this peer be elected coordinator? `false` declines — a laptop on battery. |
 | `-heartbeat` | `1s` | *(managed)* Liveness beat interval. **Declared on the wire**, and what the coordinator computes its degraded/gone thresholds from. Anything under 1 ms is refused, because the wire carries whole milliseconds. |
 | `-backup` | `true` | *(managed/tree)* On primary-parent failure, promote the coordinator's precomputed backup parent **without asking**. |
 
 **A flag set in the wrong mode warns rather than failing:** `WARN flag has no effect in this mode flag=upload-kbps`. Only flags you explicitly set are named. The five managed-only flags are `-backup`, `-coordinatable`, `-heartbeat`, `-nat`, `-upload-kbps`.
 
+> **What `-nat auto` measures, and what it does not.** It is **not** NAT-type detection.
+> The peer reads the *local candidate type* of its nominated ICE candidate pairs and
+> reports `turn` only when **every** path it holds is relay-typed — a behavioural
+> "my media is going through a relay", nothing about mapping or filtering behaviour.
+> Two consequences worth knowing before you read a report:
+> **(a)** a peer that has not connected to anybody yet has measured nothing and reports
+> `direct`, the permissive class (the same blind spot as first-attachment RTT); and
+> **(b)** one direct path is enough to stay `direct`, deliberately — a peer that reaches
+> *some* neighbours directly is demonstrably able to relay, and demoting it to a leaf
+> would tear its subtree apart on the weakest evidence available. The startup line says
+> which source is in play: `nat=measured` or `nat=forced:turn`.
+
 > **Why `-backup` is a positive flag over a negative field.** `RouterConfig` carries `DisableBackup bool`, not `Backup bool`, because "default true" is unachievable for a plain Go bool — a caller who forgot the field would silently get **failover disabled**, the wrong direction to fail in for the entire point of the phase. The CLI keeps the positive polarity because flags express non-zero defaults fine; `cmd/peer` is the single place the polarity flips.
+
+---
+
+## `turn` — the TURN relay (Phase 7)
+
+A media relay of last resort, for a peer that has no direct path to a neighbour. It is
+~50 lines over `github.com/pion/turn/v5` — already in the module graph, because
+pion/webrtc depends on it for the ICE *client* — so it needs no container and no system
+package. **coturn** is the deployment answer and lives in `deploy/docker-compose.yml`
+behind an opt-in `--profile turn`; nothing in the test path touches it.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-addr` | `:3478` | UDP listen address. |
+| `-public-ip` | `""` | **Required.** The address handed to clients as their relay address. Must be an IP literal — it goes into an ICE candidate, not a URL — and it cannot be inferred from a wildcard listener. |
+| `-users` | `""` | **Required.** `user=password[,user=password…]`. There is no anonymous mode: an open TURN server is a bandwidth amplifier, and that must not be reachable by omission. |
+| `-realm` | `conclave` | Long-term-credential realm. Part of the key derivation, so the peer must be issued credentials for the same realm or every correct password is refused with a bare 401. |
+| `-relay-ports` | `""` (ephemeral) | Confine relay allocations to `lo-hi`. Same reasoning as the peer's `-media-ports`: a firewall rule can only name ports known in advance, and the TURN verification *is* such a rule. |
+| `-log-level` / `-log-format` | `info` / `text` | As the server. |
+
+```console
+$ ./bin/turn -public-ip 10.99.0.1 -users conclave=hunter2 -relay-ports 49160-49200
+level=INFO msg="turn relay listening" service=conclave-turn addr=:3478 \
+  public_ip=10.99.0.1 realm=conclave users=1 relay_ports=49160-49200
+
+$ ./bin/peer -call -managed -room $MEET -name alpha \
+    -turn turn:10.99.0.1:3478 -turn-user conclave -turn-pass hunter2
+```
+
+The end-to-end recipe — blocking the direct path pair-specifically with `nft` inside an
+unprivileged namespace so the TURN path is the only one left — is
+[`verify-turn.md`](./verify-turn.md). **It has not been run yet**; the relay's own
+allocation path has been checked by hand (`ALLOCATED relay address: 127.0.0.1:49176`,
+inside the pinned range, with a wrong password refused).
 
 ---
 
@@ -119,9 +167,10 @@ Run `make` (or `make help`) for the live list. Pass binary flags through the `AR
 | Target | Does |
 |---|---|
 | `make help` | List targets (default goal). |
-| `make build` | Compile both binaries into `./bin/server`, `./bin/peer`. |
+| `make build` | Compile all three binaries into `./bin/server`, `./bin/peer`, `./bin/turn`. |
 | `make run-server` | `go run ./cmd/server $(ARGS)`. |
 | `make run-peer` | `go run ./cmd/peer $(ARGS)`. |
+| `make run-turn` | `go run ./cmd/turn $(ARGS)` — the TURN relay. Needs `-public-ip` and `-users`. |
 | `make test` | `go test -race ./...` — all packages, race detector on. |
 | `make cover` | Run tests with a coverage profile and print a per-function report. |
 | `make fmt` | `go fmt ./...`. |
@@ -600,12 +649,13 @@ This is the first appearance of **context-as-lifecycle** (`signal.NotifyContext`
 
 - **Phases 5 and 6 have no recorded live run.** They are verified by the automated suite — deterministic simulation of the control plane plus real-pion integration tests of the media plane — but not by a live multi-process demonstration of failover and migration (`DESIGN.md` §9.5).
 - **Every live run so far has been single-host.** Multiple processes on one machine over loopback: no cross-machine result, no real NAT traversal, no real packet loss, no real congestion control. The "≈6 Mbit/s at 5 peers" figure is arithmetic on a measured per-stream bitrate, not an observed collapse.
-- **The telemetry is mostly declared, not measured.** `-upload-kbps` and `-nat` are operator claims; `RTTServerMs`, `LossPct` and `CPUPct` are **never populated in production**. The consequences are concrete: the degradation dwell cannot arm, voluntary promotion/demotion cannot fire, and `BuildTree`'s min-latency rank has no data. All of it is exercised in `simnet`, where the values are injected.
+- **One telemetry field is still declared, not measured.** `-upload-kbps` is an operator claim, and there is no bandwidth probe: measuring the uplink means saturating it, in a system whose whole thesis is that the uplink is the scarce resource. Everything else is live — CPU from `/proc/stat`, control-link RTT from a WebSocket ping, uplink loss from RTCP receiver reports, pairwise RTT from the nominated ICE candidate pair, and the NAT class from that pair's local candidate type (`DESIGN.md` §8.1).
 - **Synthetic media isn't decodable.** Without `-media`, the sender emits opaque bytes — enough to prove RTP flows and `OnTrack` fires, but the recorded `.ivf` won't play.
 - **Keyframe *response* is unproven.** File and synthetic sources have no live encoder, so PLI *plumbing* (including the upstream SSRC translation) is proven and "recover on demand" awaits a browser sender.
 - **Recorded IVF header dimensions are `ivfwriter` defaults**, not the sender's frame size — the VP8 frames inside still decode at their true resolution.
 - **`/healthz` is liveness, not readiness.** It reports "the process is up and routing", not "a call could succeed".
 - **No authentication, anywhere.** No token, password, credential, JWT or TLS termination in any non-test file. Anyone who can reach `/ws` can join any meet under any unused name; anyone who can reach `/api` can create meets and read every meet's telemetry. What exists instead is server-stamped identity, the epoch fence, the origin allow-list, unguessable meet ids, and bounded state. Fine for `localhost` bring-up; see `deploy/README.md` before exposing anything.
-- **No simulcast, no SVC, no TURN.** Phase 7 was not built. A relay forwards one quality layer to every downstream, and `-nat turn` is a declared constraint rather than a detected one.
+- **No simulcast and no SVC.** A relay forwards one quality layer to every downstream. TURN and the measured NAT class *are* built, but **the TURN path has not been exercised live** — the relay allocates and the classification logic is pinned by tests, and the two have not yet been shown working together over a real ICE negotiation (`verify-turn.md`).
+- **The NAT class is behavioural, not a NAT type.** `turn` means "all of this peer's media paths are relayed", not "this peer is behind a symmetric NAT". A peer that has connected to nobody reports `direct` because it has measured nothing.
 
 For the phase plan see [`ROADMAP.md`](./ROADMAP.md); for why the system is shaped this way, [`DESIGN.md`](./DESIGN.md) is the single best explanation.

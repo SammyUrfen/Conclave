@@ -73,12 +73,13 @@ All day-to-day tasks go through the `Makefile`. Run `make` (or `make help`) any 
 make build
 ```
 
-Compiles both binaries into `./bin/`:
+Compiles all three binaries into `./bin/`:
 
 | Binary | What it is |
 |---|---|
 | `./bin/server` | The **arbiter**: meet rendezvous, the WebSocket signaling relay, epoch minting and election arbitration, and the `/api` dashboard surface. Optionally hosts the coordinator (`-coordinate`). Never in the media path. |
 | `./bin/peer` | A **participant**: health probe, mesh call, static tree, or a fully managed peer that reports telemetry, realises the pushed tree, and fails over to a backup parent on its own. |
+| `./bin/turn` | A **TURN relay** (Phase 7), for peers with no direct path to each other. ~50 lines over `github.com/pion/turn/v5`, which pion/webrtc already pulls in for the ICE client — so there is **nothing extra to install**, which is the whole reason it exists rather than coturn. Optional: leave it unused on one host. |
 
 `./bin/` is git-ignored — never commit build artifacts.
 
@@ -195,11 +196,15 @@ A quick checklist that mirrors the **`make check`** gate — `check` = `fmt` + `
 - [ ] `go version` → **go1.26 or newer**
 - [ ] `gcc --version` (or `clang --version`) succeeds — race detector will link
 - [ ] `go build ./...` → exits 0, no output
-- [ ] `make build` → produces `./bin/server` and `./bin/peer`
+- [ ] `make build` → produces `./bin/server`, `./bin/peer` and `./bin/turn`
 - [ ] `make check` → runs **fmt + vet + check-determinism + test**; the `test` stage is `go test -race ./...` and must be green
 - [ ] `make check-determinism` on its own → **silent**, exit 0 (it only prints when it finds a control-plane package reaching for the wall clock)
 - [ ] **Manual smoke test:** `make run-server` in one terminal; in another, `curl localhost:9000/healthz` returns `{"status":"ok","service":"conclave-server"}` and `make run-peer` exits **0**. Kill the server with `Ctrl-C` and confirm it logs `server stopped cleanly`.
 - [ ] **Dashboard smoke test:** `make run-server ARGS="-coordinate"`, then `curl -sS localhost:9000/api/meets` → `{"api_version":1,"demo_enabled":false,"meets":[],"ended":[]}`. Open `web/index.html` in a browser and type `localhost:9000` in the server field — no build step, no npm, nothing to install.
+
+Optional, and only if you want the TURN path:
+
+- [ ] `./bin/turn -public-ip 127.0.0.1 -users conclave=hunter2 -relay-ports 49160-49200` logs `turn relay listening … relay_ports=49160-49200` and stays up. Nothing else in the repository requires it — no test, no gate — and a single-host run never needs it. See [`verify-turn.md`](./verify-turn.md) for the end-to-end exercise, which does need `nft` and `unshare` (both present on a stock Fedora; `tc` is **not** required and is deliberately not used).
 
 Optional, once §4 tools are installed:
 

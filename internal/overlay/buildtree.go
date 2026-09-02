@@ -16,7 +16,11 @@ const (
 	// NATDirect: STUN-reachable or public. Such a node has a usable direct path to
 	// others and may act as a relay.
 	NATDirect NATType = "direct"
-	// NATRelayed: symmetric-NAT / CGNAT, reachable only via a TURN relay. Its path is
+	// NATRelayed: reachable only via a TURN relay — symmetric NAT, CGNAT, or a
+	// firewall that kills every direct path. The peer that reports this does not know
+	// WHICH; it only observes that all of its media paths are relayed
+	// (media.relayedPath), and that observation is the whole basis for the constraint
+	// below. Its path is
 	// already indirect and its bandwidth constrained, so it is forced to be a LEAF —
 	// never a parent. (This is the ROADMAP's "TURN-bound peers are leaves" rule.)
 	NATRelayed NATType = "turn"

@@ -187,6 +187,10 @@ type Router struct {
 	// no longer has an edge to (see RTTMemory). Under mu because LinkStats runs on
 	// the metrics reporter's goroutine while Run mutates the peer map.
 	rtt rttStore
+	// nat remembers this peer's last MEASURED direct verdict (see NATDirectMemory).
+	// Under mu for the same reason rtt is: LinkStats runs on the metrics reporter's
+	// goroutine.
+	nat natMemory
 	// name↔id maps translate between the stable topology names and the runtime ids
 	// the server assigns. Filled from the joined roster + peer-joined/peer-left, so
 	// every tree decision is made in names and resolved to an id here.
@@ -1297,8 +1301,15 @@ func (r *Router) Realized() (parent string, parentState string, children []metri
 // one wire field serves both. That mismatch predates this sensor and is recorded in
 // docs/DESIGN.md §8.1 rather than papered over here.
 //
+// THE NAT CLASS IS REMEMBERED IN ONE DIRECTION ONLY. A measured DIRECT verdict stands
+// for NATDirectMemory after the edge that produced it closes, because the control
+// plane's own reaction to a relayed verdict — forced leaf, no children — destroys the
+// evidence that could clear it. A relayed verdict is never remembered. See
+// NATDirectMemory for the trajectory that forced this, relayedPath for what the class
+// does and does not claim, and natClass for what an unmeasured peer reports.
+//
 // Meaningful in tree mode only; a full-mesh Router has no overlay position to report.
-func (r *Router) LinkStats() (peerRTT []metrics.PeerRTT, lossPct float64) {
+func (r *Router) LinkStats() (peerRTT []metrics.PeerRTT, lossPct float64, nat overlay.NATType) {
 	// Snapshot names and sessions together under the one lock, exactly as Realized
 	// does: reading the peer map and the id↔name map separately could observe a peer
 	// mid-teardown and file a measurement under an empty name.
@@ -1320,14 +1331,52 @@ func (r *Router) LinkStats() (peerRTT []metrics.PeerRTT, lossPct float64) {
 	// Session.stats walks every transceiver and transport, so it runs OUTSIDE the
 	// lock. Holding mu across it would stall applyTopology and every pion callback
 	// that posts to Run behind a stats collection, on the reporter's cadence.
+	//
+	// ONE GetStats per edge, read twice: the report is the expensive thing here, so
+	// the NAT classification rides along on the collection the RTT sensor already pays
+	// for. Everything after this loop is arithmetic on those reports and lives in
+	// linkStatsFrom, so the only part of this sensor that needs a live PeerConnection
+	// to exercise is the single delegation below.
+	reports := make([]edgeReport, 0, len(edges))
+	for _, e := range edges {
+		reports = append(reports, edgeReport{name: e.name, report: e.session.stats()})
+	}
+	return r.linkStatsFrom(reports)
+}
+
+// edgeReport pairs one neighbour's topology name with pion's stats report for the
+// PeerConnection to it.
+type edgeReport struct {
+	name   string
+	report webrtc.StatsReport
+}
+
+// linkStatsFrom is the whole of LinkStats except the collection: it turns one stats
+// report per live edge into the three signals the telemetry frame carries.
+//
+// It is split out so the fold is testable against hand-written reports, and that split
+// was made because a mutation run proved it was needed: with only the pure readers
+// pinned, a Router that classified every edge correctly and then returned a CONSTANT
+// class passed the whole suite. Every way this sensor can be quietly wrong — filing an
+// RTT under the wrong neighbour, counting an unconnected edge as evidence, computing
+// the NAT class and not returning it — is arithmetic, and arithmetic reachable only
+// through a live PeerConnection is arithmetic nobody checks.
+func (r *Router) linkStatsFrom(reports []edgeReport) (peerRTT []metrics.PeerRTT, lossPct float64, nat overlay.NATType) {
 	type measured struct {
 		name string
 		ms   float64
 	}
-	fresh := make([]measured, 0, len(edges))
-	for _, e := range edges {
-		if ms, ok := selectedPairRTTMs(e.session.stats()); ok {
+	fresh := make([]measured, 0, len(reports))
+	var natMeasured, natRelayed int
+	for _, e := range reports {
+		if ms, ok := selectedPairRTTMs(e.report); ok {
 			fresh = append(fresh, measured{name: e.name, ms: ms})
+		}
+		if relayed, ok := relayedPath(e.report); ok {
+			natMeasured++
+			if relayed {
+				natRelayed++
+			}
 		}
 	}
 
@@ -1337,13 +1386,14 @@ func (r *Router) LinkStats() (peerRTT []metrics.PeerRTT, lossPct float64) {
 		r.rtt.record(m.name, m.ms, now)
 	}
 	peerRTT = r.rtt.snapshot(now)
+	nat = r.nat.classify(natMeasured, natRelayed, now)
 	r.mu.Unlock()
 
 	lossPct = 0
 	if r.fwd != nil {
 		lossPct = r.fwd.loss.worstPct()
 	}
-	return peerRTT, lossPct
+	return peerRTT, lossPct, nat
 }
 
 // Fence returns a snapshot of this peer's authority state, for the host to report to

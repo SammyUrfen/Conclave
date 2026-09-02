@@ -80,6 +80,17 @@
 // names — which is the ground truth a newly promoted coordinator rebuilds the
 // previous tree from, instead of inheriting its predecessor's beliefs.
 //
+// The Router is also where three of the peer's telemetry signals are measured
+// (LinkStats): pairwise RTT, worst-leg uplink loss, and — since Phase 7 — the peer's
+// NAT class.
+// That last one is a BEHAVIOURAL classification and not NAT-type discovery: the
+// nominated ICE candidate pair names the local candidate media leaves through, and a
+// relay-typed one means a TURN allocation, so the answer is "this peer's media paths
+// are going through a relay" and nothing more. It is the only question conclave asks
+// NAT for (may this node be a parent), and it fails safe — a peer that has not
+// connected to anybody yet is unclassified and reports the permissive class, the same
+// structural blind spot RTTMemory records for first attachment.
+//
 // Media sources (PlayIVF, SendSynthetic) feed an outbound track; sinks
 // (RecordVP8, DrainAndCount) consume a remote track. Codecs are pinned to VP8 in
 // the MediaEngine so both ends agree without depending on default ordering.

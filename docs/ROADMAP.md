@@ -91,7 +91,7 @@ It is **completely fine to stop after Phase 3 or 4.** A working "elected peer SF
 | 4 | Metrics plane + coordinator computes the tree | ✅ done |
 | 5 | Join/leave handover + backup parents | ✅ done |
 | 6 | Coordinator election + migration | ✅ done |
-| 7 | Simulcast/SVC, TURN fallback, polish & demo | ⬜ **not built** |
+| 7 | Simulcast/SVC, TURN fallback, polish & demo | 🟨 **partly built** — TURN + measured NAT class shipped; simulcast/SVC not started |
 
 **Phase 7's scope moved, and only partly.** The *observability* task ("a small `/debug`
 dashboard … showing the live graph, per-node upload, coordinator identity/epoch, and
@@ -102,11 +102,15 @@ published to GitHub Pages (`.github/workflows/pages.yml`), with container/TLS re
 `deploy/`. Splitting them was deliberate: the frontend is not a Go concern, and a page
 served by the arbiter would have to be rebuilt and redeployed with it.
 
-**The rest of Phase 7 was NOT built.** There is no simulcast, no SVC, and no TURN/coturn
-infrastructure. A relay forwards one quality layer to every downstream, and
-`overlay.NATRelayed` is a *modelled* constraint declared by the peer's `-nat turn` flag,
-not a measured NAT classification. Nothing in the repository probes bandwidth, RTT, loss,
-or CPU either — see the limitation box under Phase 6.
+**The TURN slice of Phase 7 has since landed; simulcast/SVC has not.** There is still no
+simulcast and no SVC — a relay forwards one quality layer to every downstream. But TURN
+infrastructure now exists (`cmd/turn`, a ~50-line relay over `github.com/pion/turn/v5`,
+plus an opt-in coturn service in `deploy/`), the peer can use it (`-turn`, `-turn-user`,
+`-turn-pass`), and `overlay.NATRelayed` is **measured** rather than declared: a peer
+whose nominated ICE candidate pairs all use a relay-typed local candidate classifies
+itself TURN-bound (`media.relayedPath`). `-nat` survives as an override and now defaults
+to `auto`. RTT, loss and CPU are measured too (Phase 5–6's sensor work). `UploadKbps` is
+the one field still declared — see `DESIGN.md` §8.1.
 
 The single-doc synthesis of what actually shipped, including every trade-off with its
 rejected alternative, is **[`DESIGN.md`](./DESIGN.md)**.
@@ -330,17 +334,17 @@ rejected alternative, is **[`DESIGN.md`](./DESIGN.md)**.
 
 ---
 
-## Phase 7 — Simulcast/SVC, TURN fallback, polish & demo — ⬜ not built
+## Phase 7 — Simulcast/SVC, TURN fallback, polish & demo — 🟨 partly built
 
-> **Read this before the task list below.** One of the four tasks — observability — was
-> pulled forward into Phases 5–6 and reshaped; the other three were not started. Stated
-> plainly:
+> **Read this before the task list below.** Observability was pulled forward into
+> Phases 5–6 and reshaped; TURN + NAT detection has since been built; simulcast/SVC and
+> the demo script have not. Stated plainly:
 >
 > | Phase 7 task | Status |
 > |---|---|
 > | Simulcast / SVC (multi-layer send, per-downstream layer selection) | **not built.** A relay forwards one layer to every downstream. |
 > | Adaptive per-edge layer selection under congestion | **not built.** Depends on simulcast. |
-> | TURN via coturn; detect symmetric NAT and force those peers to leaves | **not built.** `overlay.NATRelayed` exists and is honoured by the builder, but it is a *declared* constraint (`peer -nat turn`), not a detection. No coturn, no TURN credentials in `ICEServers`. |
+> | TURN; detect NAT-constrained peers and force them to leaves | **built, not yet exercised live.** `cmd/turn` is a pure-Go relay over `pion/turn/v5` (already an indirect dependency, so zero new ones); `peer -turn/-turn-user/-turn-pass` puts credentials in `ICEServers`; and the class is **measured** from the nominated ICE candidate pair's local candidate type, not declared — `-nat` is now an override defaulting to `auto`. Built as a Go binary rather than as coturn because coturn is not installed here and a relay nobody can start is a relay nobody verifies; coturn is in `deploy/docker-compose.yml` as the deployment story. **Deliberately narrower than the original wording:** this is a *behavioural* classification ("my media is going through a relay"), NOT symmetric-NAT detection — RFC 5780 needs a two-address STUN server, `pion/stun` does not implement it, and conclave never asks the taxonomic question. Live verification is written up in `docs/verify-turn.md` and has **not been run**. |
 > | Observability: a `/debug` dashboard showing the live graph, coordinator identity/epoch, and failover events | **shipped in Phases 5–6, in a different shape** — the arbiter's `/api` REST + WS surface (`internal/dashboard`) plus a separate zero-build static frontend (`web/`) on GitHub Pages, with `deploy/` recipes for `wss://`. Not a server-rendered `/debug` page. |
 > | Demo script (join to 6, kill a relay, kill the coordinator, watch recovery) | **not built** as a script. The behaviours are covered by the automated suite; a live multi-process run of Phases 5–6 has not been recorded (`DESIGN.md` §9.5). |
 >
@@ -352,7 +356,7 @@ rejected alternative, is **[`DESIGN.md`](./DESIGN.md)**.
 **Go tasks**
 - **Simulcast / SVC:** senders emit multiple quality layers (VP8/VP9 simulcast, or SVC with VP9/AV1). Relays forward only the layer each downstream needs (adaptive layer selection based on downstream RTT/loss/requested resolution). Reference pion's **simulcast** example. This is what lets one relay serve heterogeneous downstreams cheaply.
 - **Adaptive selection:** feed downstream metrics into per-edge layer decisions; drop to a lower layer on congestion, promote on recovery (with hysteresis, again).
-- **TURN via coturn:** stand up `coturn`; add TURN creds to `ICEServers`; detect symmetric-NAT/CGNAT peers and force them to be **leaves**. Verify a TURN-only peer still participates as a leaf.
+- **TURN via coturn:** stand up `coturn`; add TURN creds to `ICEServers`; detect symmetric-NAT/CGNAT peers and force them to be **leaves**. Verify a TURN-only peer still participates as a leaf. *(Done, differently: a pure-Go `cmd/turn` instead of coturn, and a behavioural relay-bound classification instead of NAT-type detection. See the status table above.)*
 - **Observability:** a small `/debug` dashboard (or just structured `slog` → a viewer) showing the live graph, per-node upload, coordinator identity/epoch, and failover events. This is what sells the portfolio piece.
 - **Demo script:** scripted scenario (join to 6, kill a relay, kill the coordinator, watch recovery) that shows the system self-healing.
 
