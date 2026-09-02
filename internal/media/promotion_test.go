@@ -207,12 +207,12 @@ func TestForwarderTwoSourcesOverOneEdge(t *testing.T) {
 	f.addOutLive("zoe", "bob", toZoe, nil)
 	f.addOutLive("fred", "bob", toFred, nil)
 
-	genZoe := f.newUpstreamGen("zoe")
-	genFred := f.newUpstreamGen("fred")
-	f.fanout("zoe", genZoe, vp8Pkt(10, 9000, true))
-	f.fanout("fred", genFred, vp8Pkt(500, 45000, true))
-	f.fanout("zoe", genZoe, vp8Pkt(11, 12000, false))
-	f.fanout("fred", genFred, vp8Pkt(501, 48000, false))
+	genZoe := f.newUpstreamGen("zoe", "")
+	genFred := f.newUpstreamGen("fred", "")
+	f.fanout("zoe", "", genZoe, vp8Pkt(10, 9000, true))
+	f.fanout("fred", "", genFred, vp8Pkt(500, 45000, true))
+	f.fanout("zoe", "", genZoe, vp8Pkt(11, 12000, false))
+	f.fanout("fred", "", genFred, vp8Pkt(501, 48000, false))
 
 	if got := len(toZoe.snapshot()); got != 2 {
 		t.Errorf("zoe's leg carried %d packets, want 2", got)

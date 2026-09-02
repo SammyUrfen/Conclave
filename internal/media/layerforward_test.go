@@ -480,6 +480,9 @@ func TestSingleLayerSourceBehavesExactlyAsBefore(t *testing.T) {
 func TestReviewLayerDowngradesOnSustainedLoss(t *testing.T) {
 	f := newForwarder(discardLog(), &uploadMeter{}, func(func()) {}, newFakeClock())
 	twoLayerSource(t, f, &captureRTCP{})
+	// A THREE-rung source, so "shed one rung" and "drop to the floor" are different
+	// answers and this test discriminates between them too.
+	f.learnSSRC("S", "h", f.newUpstreamGen("S", "h"), ssrcH)
 	f.addOutLive("S", "bad", &captureTrack{}, nil)
 	f.addOutLive("S", "good", &captureTrack{}, nil)
 

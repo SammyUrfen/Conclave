@@ -181,6 +181,19 @@ func (l *lossTracker) forget(child string) {
 	delete(l.byPeer, child)
 }
 
+// pctFor returns what ONE child last reported, as a percentage — the per-leg input
+// to selectLayer, as against worstPct's node-wide aggregate.
+//
+// A child that has never reported reads as 0, i.e. clean. That is safe because the
+// only production caller is reviewLayer, which runs FROM a reception report and so
+// always has one; it is stated rather than guarded because a guard would have to
+// invent a third state for a value that has no caller who can see it.
+func (l *lossTracker) pctFor(child string) float64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.byPeer[child] * 100
+}
+
 // worstPct returns the highest loss any current downstream leg reports, as a
 // percentage. A node with no legs — every leaf — reports 0, which is the honest
 // answer: it receives no reception reports at all, and 0 is what every build before

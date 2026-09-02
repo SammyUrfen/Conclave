@@ -92,12 +92,17 @@ type options struct {
 
 // callConfig is the parsed configuration for call mode.
 type callConfig struct {
-	server, room, mediaPath, recordPath, stun string
-	name, topologyPath                        string
-	send                                      bool
-	managed                                   bool
-	uploadKbps                                int
-	nat                                       overlay.NATType
+	server, room, recordPath, stun string
+	name, topologyPath             string
+	// mediaPaths are the IVF files this peer publishes, LOWEST bitrate first. One
+	// path (the overwhelmingly common case) is exactly the single-track behaviour
+	// this peer has always had; several publish one ordinary track per file, which
+	// is what lets a relay give different children different qualities.
+	mediaPaths []string
+	send       bool
+	managed    bool
+	uploadKbps int
+	nat        overlay.NATType
 	// mediaPorts is the UDP range media is confined to; the zero value means
 	// "ephemeral", which is what a peer run without -media-ports gets.
 	mediaPorts [2]uint16
@@ -143,7 +148,9 @@ func parseArgs(args []string) (options, error) {
 	call := fs.Bool("call", false, "join a room and establish a WebRTC call instead of probing /healthz")
 	room := fs.String("room", "default", "room to join (call mode)")
 	send := fs.Bool("send", false, "send a video track to peers (call mode)")
-	mediaPath := fs.String("media", "", "VP8 IVF file to send; empty sends synthetic frames (call mode; implies -send)")
+	mediaPath := fs.String("media", "",
+		"VP8 IVF file(s) to send, comma-separated LOWEST bitrate first; several publish "+
+			"one quality layer each and let a relay pick per child (call mode; implies -send)")
 	recordPath := fs.String("record", "", "write the first received track to this IVF file; empty just counts (call mode)")
 	stun := fs.String("stun", "", "STUN server URL, e.g. stun:stun.l.google.com:19302 (call mode; empty is fine on one host)")
 	name := fs.String("name", "", "stable topology name for this peer, e.g. relay|leaf-b (tree mode)")
@@ -181,15 +188,16 @@ func parseArgs(args []string) (options, error) {
 		return options{}, err
 	}
 
+	mediaPaths := splitMediaPaths(*mediaPath)
 	cfg := callConfig{
 		server:        *server,
 		room:          *room,
-		mediaPath:     *mediaPath,
+		mediaPaths:    mediaPaths,
 		recordPath:    *recordPath,
 		stun:          *stun,
 		name:          *name,
 		topologyPath:  *topology,
-		send:          *send || *mediaPath != "",
+		send:          *send || len(mediaPaths) > 0,
 		managed:       *managed,
 		uploadKbps:    *uploadKbps,
 		nat:           nat,
@@ -226,6 +234,9 @@ func validate(cfg callConfig, timeout time.Duration) error {
 	}
 	if cfg.uploadKbps < 0 {
 		return fmt.Errorf("invalid -upload-kbps %d: must not be negative", cfg.uploadKbps)
+	}
+	if err := media.ValidateMediaPaths(cfg.mediaPaths); err != nil {
+		return err
 	}
 	if cfg.heartbeat <= 0 {
 		return fmt.Errorf("invalid -heartbeat %v: must be positive", cfg.heartbeat)
@@ -281,6 +292,27 @@ func inertFlags(set map[string]bool, call bool, cfg callConfig) []string {
 		}
 	}
 	return inert
+}
+
+// splitMediaPaths turns the -media flag into the list of files this peer
+// publishes, one per quality layer, lowest bitrate first.
+//
+// COMMA-separated rather than a repeatable flag: a repeatable flag needs a
+// flag.Value implementation for a list this project uses in exactly one place, and
+// comma is what every other Go CLI does with a path list. The cost is stated rather
+// than hidden — a path containing a comma cannot be expressed, which is documented
+// in docs/usage.md and is not a case worth a second flag.
+//
+// Empty entries are dropped so `-media ""` and an unset flag mean the same thing:
+// no file, synthetic frames.
+func splitMediaPaths(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // parseFormat validates the -log-format flag.
@@ -458,7 +490,7 @@ func routerConfigFor(
 		ICEServers:     iceServers,
 		MediaPortRange: cfg.mediaPorts,
 		SendMedia:      cfg.send,
-		MediaPath:      cfg.mediaPath,
+		MediaPaths:     cfg.mediaPaths,
 		RecordPath:     cfg.recordPath,
 		Topology:       topo,
 		SelfName:       cfg.name,
@@ -1277,7 +1309,7 @@ func runCall(ctx context.Context, logger *slog.Logger, cfg callConfig) error {
 	}
 	router = media.NewRouter(logger, client, rcfg)
 	logger.Info("running call",
-		slog.Bool("send", cfg.send), slog.String("media", cfg.mediaPath),
+		slog.Bool("send", cfg.send), slog.Any("media", cfg.mediaPaths),
 		slog.String("record", cfg.recordPath), slog.Bool("stun", cfg.stun != ""),
 		slog.Bool("tree", topo != nil), slog.Bool("managed", cfg.managed),
 		slog.Bool("backup", cfg.backup), slog.Bool("coordinatable", cfg.coordinatable))

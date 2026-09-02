@@ -215,7 +215,7 @@ func (r *Router) onPeerState(ctx context.Context, name string, st webrtc.PeerCon
 			// keyframeForChild covers the rest from the other side.
 			if r.fwd != nil {
 				r.fwd.keyframeForChild(r.selfName)
-				r.fwd.requestUpstreamKeyframe(name)
+				r.fwd.requestUpstreamKeyframeAll(name)
 			}
 		}
 	case webrtc.PeerConnectionStateFailed:

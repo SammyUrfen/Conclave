@@ -345,11 +345,11 @@ func TestMediaLayersFromPaths(t *testing.T) {
 	// More paths than rungs must be REFUSED at the flag, not silently truncated: a
 	// peer that publishes fewer layers than the operator asked for is a configuration
 	// that reports success and does something else.
-	if err := validateMediaPaths(make([]string, len(layerLadder)+1)); err == nil {
+	if err := ValidateMediaPaths(make([]string, len(layerLadder)+1)); err == nil {
 		t.Errorf("validateMediaPaths accepted %d paths for a %d-rung ladder; it must fail loud",
 			len(layerLadder)+1, len(layerLadder))
 	}
-	if err := validateMediaPaths([]string{"a", "b"}); err != nil {
+	if err := ValidateMediaPaths([]string{"a", "b"}); err != nil {
 		t.Errorf("validateMediaPaths rejected a legal 2-layer config: %v", err)
 	}
 }

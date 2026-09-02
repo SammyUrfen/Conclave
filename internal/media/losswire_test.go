@@ -57,9 +57,8 @@ func TestRTCPDrainStillForwardsKeyframeRequests(t *testing.T) {
 	f := newForwarder(slog.New(slog.DiscardHandler), &uploadMeter{}, func(func()) {}, newFakeClock())
 	for _, src := range []string{"via-pli", "via-fir"} {
 		f.setUpstream(src, &captureRTCP{})
-		f.mu.Lock()
-		f.sources[src].ssrc.Store(0x515151)
-		f.mu.Unlock()
+		gen := f.newUpstreamGen(src, "")
+		f.learnSSRC(src, "", gen, 0x515151)
 	}
 
 	before := f.PLIForwarded()
