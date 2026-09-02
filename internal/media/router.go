@@ -1326,21 +1326,48 @@ func (r *Router) LinkStats() (peerRTT []metrics.PeerRTT, lossPct float64, nat ov
 	// Session.stats walks every transceiver and transport, so it runs OUTSIDE the
 	// lock. Holding mu across it would stall applyTopology and every pion callback
 	// that posts to Run behind a stats collection, on the reporter's cadence.
+	//
+	// ONE GetStats per edge, read twice: the report is the expensive thing here, so
+	// the NAT classification rides along on the collection the RTT sensor already pays
+	// for. Everything after this loop is arithmetic on those reports and lives in
+	// linkStatsFrom, so the only part of this sensor that needs a live PeerConnection
+	// to exercise is the single delegation below.
+	reports := make([]edgeReport, 0, len(edges))
+	for _, e := range edges {
+		reports = append(reports, edgeReport{name: e.name, report: e.session.stats()})
+	}
+	return r.linkStatsFrom(reports)
+}
+
+// edgeReport pairs one neighbour's topology name with pion's stats report for the
+// PeerConnection to it.
+type edgeReport struct {
+	name   string
+	report webrtc.StatsReport
+}
+
+// linkStatsFrom is the whole of LinkStats except the collection: it turns one stats
+// report per live edge into the three signals the telemetry frame carries.
+//
+// It is split out so the fold is testable against hand-written reports, and that split
+// was made because a mutation run proved it was needed: with only the pure readers
+// pinned, a Router that classified every edge correctly and then returned a CONSTANT
+// class passed the whole suite. Every way this sensor can be quietly wrong — filing an
+// RTT under the wrong neighbour, counting an unconnected edge as evidence, computing
+// the NAT class and not returning it — is arithmetic, and arithmetic reachable only
+// through a live PeerConnection is arithmetic nobody checks.
+func (r *Router) linkStatsFrom(reports []edgeReport) (peerRTT []metrics.PeerRTT, lossPct float64, nat overlay.NATType) {
 	type measured struct {
 		name string
 		ms   float64
 	}
-	fresh := make([]measured, 0, len(edges))
+	fresh := make([]measured, 0, len(reports))
 	var natMeasured, natRelayed int
-	for _, e := range edges {
-		// ONE GetStats per edge, read twice. The report is the expensive thing here —
-		// pion walks every transceiver, transport and certificate to build it — so the
-		// NAT classification rides along on the walk the RTT sensor already pays for.
-		report := e.session.stats()
-		if ms, ok := selectedPairRTTMs(report); ok {
+	for _, e := range reports {
+		if ms, ok := selectedPairRTTMs(e.report); ok {
 			fresh = append(fresh, measured{name: e.name, ms: ms})
 		}
-		if relayed, ok := relayedPath(report); ok {
+		if relayed, ok := relayedPath(e.report); ok {
 			natMeasured++
 			if relayed {
 				natRelayed++

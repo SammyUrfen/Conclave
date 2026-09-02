@@ -2,6 +2,7 @@ package media
 
 import (
 	"math"
+	"reflect"
 	"testing"
 	"time"
 
@@ -545,6 +546,77 @@ func TestNATClass(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := natClass(tt.measured, tt.relayed); got != tt.want {
 				t.Errorf("natClass(%d, %d) = %q, want %q", tt.measured, tt.relayed, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestLinkStatsFromFoldsTheEdgeReports is the wiring test, and it exists because a
+// mutation run found the gap it fills: with only relayedPath and natClass pinned, a
+// Router that computed the class correctly and then returned a constant NATDirect
+// passed the entire suite. The classification was measured and thrown away, which is
+// indistinguishable from the declared build it replaces.
+//
+// The mutations this catches: returning a constant class from the fold; dropping the
+// per-edge accounting so every edge counts as unmeasured; filing an RTT under the
+// wrong neighbour's name.
+func TestLinkStatsFromFoldsTheEdgeReports(t *testing.T) {
+	relayEdge := func(name string, rttSec float64) edgeReport {
+		return edgeReport{name: name, report: webrtc.StatsReport{
+			"l": localCand("l", webrtc.ICECandidateTypeRelay),
+			"p": candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "l", "r", rttSec),
+		}}
+	}
+	directEdge := func(name string, rttSec float64) edgeReport {
+		return edgeReport{name: name, report: webrtc.StatsReport{
+			"l": localCand("l", webrtc.ICECandidateTypeHost),
+			"p": candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "l", "r", rttSec),
+		}}
+	}
+	tests := []struct {
+		name    string
+		reports []edgeReport
+		wantNAT overlay.NATType
+		wantRTT map[string]float64
+	}{
+		{
+			name:    "every edge relayed classifies the peer TURN-bound",
+			reports: []edgeReport{relayEdge("a", 0.020), relayEdge("b", 0.030)},
+			wantNAT: overlay.NATRelayed,
+			wantRTT: map[string]float64{"a": 20, "b": 30},
+		},
+		{
+			name:    "one direct edge keeps the peer eligible to relay",
+			reports: []edgeReport{relayEdge("a", 0.020), directEdge("b", 0.030)},
+			wantNAT: overlay.NATDirect,
+			wantRTT: map[string]float64{"a": 20, "b": 30},
+		},
+		{
+			// An edge that has not connected contributes no verdict and no RTT, and
+			// must not be counted as a direct path either — that would let one
+			// unconnected edge hold a genuinely TURN-bound peer at NATDirect forever.
+			name: "an unconnected edge contributes nothing",
+			reports: []edgeReport{
+				relayEdge("a", 0.020),
+				{name: "b", report: webrtc.StatsReport{}},
+			},
+			wantNAT: overlay.NATRelayed,
+			wantRTT: map[string]float64{"a": 20},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := NewRouter(discardLog(), nil, RouterConfig{SelfName: "self", Managed: true})
+			rtt, _, nat := r.linkStatsFrom(tt.reports)
+			if nat != tt.wantNAT {
+				t.Errorf("nat = %q, want %q", nat, tt.wantNAT)
+			}
+			got := map[string]float64{}
+			for _, e := range rtt {
+				got[e.Name] = e.RTTMs
+			}
+			if !reflect.DeepEqual(got, tt.wantRTT) {
+				t.Errorf("peerRTT = %v, want %v", got, tt.wantRTT)
 			}
 		})
 	}
