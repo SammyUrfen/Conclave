@@ -30,6 +30,21 @@ func (f *meetFixture) pushTo(t *testing.T, name string, topo *overlay.Topology) 
 	}
 }
 
+// sessionLive reports whether holder has a session toward name that is fully
+// constructed. hasSession is not enough here: startPeerOpt registers the peerLink
+// and only then builds the Session, and under -race that gap is wide enough for a
+// poller to walk into it and read a nil session.
+func sessionLive(r *Router, name string) bool {
+	id := r.idForName(name)
+	if id == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	link := r.peers[id]
+	return link != nil && link.session != nil
+}
+
 // killParentEdge makes child's Router believe its parent edge died, by posting the
 // state transition pion's own OnState callback posts. It drives the identical code
 // path while staying off pion's ~25s ICE failure timer.
@@ -87,7 +102,7 @@ func TestBackupPromotionMakesTheNewParentTheOfferer(t *testing.T) {
 	killParentEdge(f, "c", "b")
 
 	waitFor(t, "both ends of the backup edge to hold a session", 40*time.Second, func() bool {
-		return f.routers["c"].hasSession("a") && f.routers["a"].hasSession("c")
+		return sessionLive(f.routers["c"], "a") && sessionLive(f.routers["a"], "c")
 	})
 
 	if f.offererToward(t, "c", "a") {
@@ -230,7 +245,7 @@ func TestBackupPromoteThatNeverLandsFailsClosed(t *testing.T) {
 	killParentEdge(f, "c", "b")
 
 	waitFor(t, "c to open its side of the backup edge", 30*time.Second, func() bool {
-		return f.routers["c"].hasSession("a")
+		return sessionLive(f.routers["c"], "a")
 	})
 	if f.offererToward(t, "c", "a") {
 		t.Error("the promoting child is the offerer on the backup edge; it must ask and answer, " +
