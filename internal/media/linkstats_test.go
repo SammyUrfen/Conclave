@@ -471,6 +471,40 @@ func TestRelayedPath(t *testing.T) {
 			wantRelayed: false, wantOK: true,
 		},
 		{
+			// Mutation caught: indexing local and remote candidates into ONE map with
+			// no type filter. relayedPath must resolve LocalCandidateID against a
+			// LOCAL candidate; here the only entry carrying that id is a REMOTE one,
+			// so an unfiltered map classifies this peer from the FAR END's candidate
+			// and reports a relayed path it does not have. pion's ids are agent-unique
+			// today, so this is hardening rather than a live bug — but the id space is
+			// a library detail, and the failure it would cause (a healthy relay forced
+			// to a leaf by its neighbour's TURN binding) is silent and permanent.
+			//
+			// The id is resolved against the wrong side or not at all; "not at all" is
+			// the right answer, because an id that names no local candidate is the
+			// dangling case the row below already calls unclassified.
+			name: "an id that is only a REMOTE candidate does not classify the peer",
+			report: webrtc.StatsReport{
+				"remote": remoteCand("shared", webrtc.ICECandidateTypeRelay),
+				"p":      candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "shared", "shared", 0.02),
+			},
+			wantOK: false,
+		},
+		{
+			// The collision the row above isolates, now with BOTH sides present: the
+			// local candidate must win regardless of the order pion emitted them in.
+			// Without the type filter this case is decided by Go's map iteration order
+			// and is green about a quarter of the time, which is why it is the
+			// companion assertion and not the discriminator.
+			name: "a local and a remote candidate sharing an id resolve to the local one",
+			report: webrtc.StatsReport{
+				"local":  localCand("shared", webrtc.ICECandidateTypeHost),
+				"remote": remoteCand("shared", webrtc.ICECandidateTypeRelay),
+				"p":      candPair(webrtc.StatsICECandidatePairStateSucceeded, true, "shared", "shared", 0.02),
+			},
+			wantRelayed: false, wantOK: true,
+		},
+		{
 			// Mutation caught: mis-casting non-pair stats, the same hazard
 			// TestSelectedPairRTTMs pins for the RTT walk.
 			name: "non-pair, non-candidate stats are skipped",
