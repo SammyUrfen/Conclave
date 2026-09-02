@@ -445,9 +445,67 @@ statement of the invariant — but it is **not** what that test discriminates, a
 now says so. This is §6.5's Case C exactly: *the finding is not that the code was wrong; it
 is that the stated reason was wrong, which is how the next person deletes it.*
 
-The one surviving mutation is recorded rather than hidden: splicing per layer **and** per leg
-on a re-parent commit is semantically equivalent, for the reason above. A mutation that
-changes no behaviour is not an untested line.
+---
+
+### The second sweep — 52 mutations, 16 survivors, and what each one turned out to be
+
+The layer work was swept again, harder: **52 hand-applied mutations, 36 killed outright, 16
+survivors**. A survivor is exactly two things, and the whole value of the exercise is
+deciding which — *the test is missing*, or *the mutant is equivalent*. Guessing is worse than
+not sweeping, because a survivor filed as "equivalent" under a wrong reason is how the next
+person deletes a line that was load-bearing. The first sweep produced one of those (finding 4
+above); this one produced another, on the mutation this table's last row records.
+
+Fifteen of the sixteen were **missing tests**, and each is now killed by a named test that was
+verified against its own mutation — applied, run red, reverted — rather than argued for:
+
+| Mutation | Killed by | The failure it lets through |
+|---|---|---|
+| `promoteOrArm` never arms | `TestArmedLayerPromotesTheNextReaderOnArrival` | the reader that appears after a commit never becomes authoritative: **child black forever** |
+| `activate` never clears `awaiting` | `TestActivationDisarmsSoTheNextReaderMustWait` | an uncommitted reader hijacks the leg merely by arriving — make-before-break inverted |
+| `promoteOrArm` keeps the dead parent's SSRC | `TestArmingResetsTheLayerSSRC` | an upstream PLI naming a stream the new parent never sent, **discarded with no error** |
+| only the FIRST layer track is published | `TestOriginPublishesEveryLayerEndToEnd` | §7.5's inert feature from the SEND side: a three-rung origin puts one rung on the wire |
+| `retop` never reports the top moved | `TestNewTopRungMovesEveryAutoLeg` | an auto leg follows the new top **without a splice** — raw sequence numbers on the old series |
+| `newUpstreamGen` does not splice auto legs on a new top | `TestNewTopRungMovesEveryAutoLeg` | same corruption by the other route |
+| the RTT sensor is never wired to the forwarder | `TestRTTSensorIsWiredToTheForwarder` | upgrades onto a queueing path; fails toward "no opinion", so nothing logs |
+| `rttToPeer` always reports no measurement | `TestRTTSensorIsWiredToTheForwarder` | identical, one layer down |
+| an empty reception report counts as a clean round | `TestReviewLayerDowngradesOnSustainedLoss` | a peer that has received nothing clocks the policy — five frames upgrade a leg on **zero evidence** |
+| `requestUpstreamKeyframeAll` collapsed to one unnamed layer | `TestReparentAsksEveryLayerForAKeyframe` | every named rung goes unasked after a re-parent; f's keyframe does not decode q |
+| an armed layer splices EVERY leg | `TestArmedLayerSplicesOnlyItsOwnLegs` | a sibling on another rung is charged a drop-until-keyframe window for someone else's promotion |
+| `spliceLayer` ignores the rung | `TestArmedLayerSplicesOnlyItsOwnLegs` | same, by the other route |
+| `learnSSRC` promotes any generation's SSRC | `TestPendingGenerationDoesNotStealTheLiveSSRC` | during make-before-break the PLI names the PENDING parent's stream and the old parent discards it |
+| the `len(ladder) < 2` guard | `TestSelectLayer/an_EMPTY_ladder_is_not_selectable`, `TestReviewLayerSurvivesASourceWithNoTracksYet` | **not dead code** — see below |
+| splicing per layer as well as per leg on a commit | *nothing — equivalent* | see below |
+
+Two of those rows deserve their own paragraph.
+
+**The `len(ladder) < 2` guard is not dead code, and the sweep nearly recorded it as such.** It
+reads like an optimisation for the single-layer source. It is not: a `forwardSource` acquires
+its LEGS from the topology and its LADDER only when the origin's tracks arrive, so there is a
+real window in which `ladder()` is **empty**. A child that has received no media yet still
+sends reception reports, and one landing in that window runs `reviewLayer` with an empty
+ladder — where `indexOf` returns −1 and the off-ladder clamp indexes `ladder[len(ladder)-1]`,
+i.e. `ladder[-1]`. Deleting the guard does not change a behaviour, it **panics on a per-child
+RTCP-drain goroutine and takes the process down**. Verified: with the guard removed,
+`TestReviewLayerSurvivesASourceWithNoTracksYet` fails with
+`panic: runtime error: index out of range [-1]` raised from `reviewLayer`.
+
+**The one genuine survivor, and its reason corrected.** `commitSwitch` splices per LEG
+(`spliceAll`); splicing per LAYER instead — ranging `s.layers` and calling `spliceLayer(id)`
+for each — leaves the whole suite green, and is **equivalent**. The reason previously recorded
+here was that `Switch` is idempotent before a leg resumes. That is true and it is **not the
+reason**: the two variants are indistinguishable because `commitSwitch` runs under the
+forwarder's WRITE lock, so no `fanout` can observe an intermediate state between the per-layer
+splices — and because, post-F1, every leg resolves to exactly one layer that the source
+actually holds, so ranging the layers reaches the same one-splice-per-leg result **by a
+different rule**, not by absorbing a second call. Idempotence would only matter if some leg
+were spliced twice, and none is. Splicing per leg stays, because it states the invariant the
+rewriter actually has ("a leg is spliced when ITS upstream changed") in the place the
+invariant lives. Re-verified after the correction: 14/14 packages green under the mutation.
+
+That correction is finding 4 of the first sweep happening again, one level up — *the code was
+right, the stated reason was wrong* — which is why it is written down rather than quietly
+fixed.
 
 ---
 
@@ -596,14 +654,31 @@ the ratio drops below 1:1.
 | `TestMediaLayersFromPaths` | naming the single-layer track anything but `video` |
 | `TestPionAnswererFillsEveryOfferedRecvonlyMLine` | (library pin) pion silently dropping the layers past the first offered m-line |
 | `TestRelayEdgeRecvSlots` | all three m-line mutations §7.5 records — one slot in total, slots added before the forwarded tracks, or the full ladder given to the answerer. The pin above stays green through every one |
+| `TestOriginPublishesEveryLayerEndToEnd` | §7.5's failure from the SEND side — `startPeerOpt`'s publish loop cut to one track. Real Hub, real tree, real pion |
+| `TestArmedLayerPromotesTheNextReaderOnArrival` | a commit that arms nothing: the post-commit reader never becomes authoritative |
+| `TestActivationDisarmsSoTheNextReaderMustWait` | a layer left armed after its activation, so the next reader hijacks the leg on arrival |
+| `TestArmingResetsTheLayerSSRC` | an upstream PLI carrying the DEAD parent's SSRC, silently discarded by the new one |
+| `TestReparentOntoALayeredUpstreamKeepsFlowing` | the F1 shape change run the other way: one unnamed layer → named rungs |
+| `TestNewTopRungMovesEveryAutoLeg` | an auto leg that follows a new top rung without being spliced |
+| `TestReparentAsksEveryLayerForAKeyframe` | a re-parent asking one layer for a keyframe instead of every rung |
+| `TestArmedLayerSplicesOnlyItsOwnLegs` | the too-MANY-splices half: one layer's promotion splicing a sibling on another rung |
+| `TestPendingGenerationDoesNotStealTheLiveSSRC` | a pending reader's SSRC pointing the upstream PLI at a stream the current parent never sent |
+| `TestRTTSensorIsWiredToTheForwarder` | the RTT input unwired or always absent — invisible, because it only gates upgrades |
+| `TestReviewLayerSurvivesASourceWithNoTracksYet` | deleting `selectLayer`'s empty-ladder guard, which panics on an RTCP-drain goroutine |
 
 **The one this table cannot list is the one that mattered most.** Every test above was green
 while the feature was *inert end to end*: the relay offered one recvonly m-line, so a
 three-layer sender put one rung on the wire and the receiving peer got the LOWEST quality
 from a 720p sender, with clean logs throughout. A mutation sweep asks "which line can I
 delete and keep the suite green"; it has nothing to say about a line that was never written.
-Running the actual binaries is what found it, and the two pins above exist so it cannot come
-back. See `docs/DESIGN.md` §7.5.
+Running the actual binaries is what found it, and the pins above exist so it cannot come back
+— **on both halves of the wire**. `TestPionAnswererFillsEveryOfferedRecvonlyMLine` and
+`TestRelayEdgeRecvSlots` cover the RECEIVE side only, which is how a second sweep found the
+SEND side still open: `startPeerOpt`'s publish loop could be cut to one track with the entire
+suite green, reproducing the identical silent failure from the origin's end.
+`TestOriginPublishesEveryLayerEndToEnd` closes it, and it is the only test in the repository
+that does — verified by applying that mutation and running `go test ./...`, where it is the
+sole failure. See `docs/DESIGN.md` §7.5.
 
 ---
 
@@ -656,4 +731,8 @@ Stated plainly, because a testing doc that oversells is worse than one that is o
 - **A model-only sweep cannot discriminate a mutation in the shipped coordinator loop** (§3).
 - **Two ordering seams are argued but not pinned by a test.** `Publisher.Publish` is called on the coordinator's `Run` goroutine and must not block, but unlike `Sender` there is no dedicated goroutine and no bounded-queue-with-drop in front of it. And `pendingLocalChange` is cleared inside `negotiate`, after `SetLocalDescription` and before `sendDescription` — sound, but moving the clear earlier would lose a removal arriving in that window and **every existing test would still pass**.
 - **`internal/media` is outside the determinism gate** and holds three wall-clock calls; its tests dominate the suite either way (~82 s of ~104 s under `-race`, ~16 s of ~17 s without). That is the price of testing against a real WebRTC stack, and it is why every other package was kept off one.
+- **No layer has ever been selected by real congestion.** Every downgrade and upgrade in the suite is driven by an RTCP reception report a test constructed, or by an RTT value a test recorded. The policy, the splice, the keyframe request and the wiring are all proven; what has never happened is a link getting genuinely worse and the relay noticing. The one end-to-end layer test (`TestOriginPublishesEveryLayerEndToEnd`) runs three peers on loopback and proves the ladder is *published and learned*, not that it *adapts*.
+- **A ladder that SHRINKS within the named shape is not handled and not tested.** `dropOtherShape` reconciles the two SHAPES — one unnamed layer versus several named rungs — and nothing else. If a source ever published `q/h/f` and then `q/h`, the `f` record would survive as an armed layer no reader will appear on, `retop` would keep ranking it top, and every auto leg would resolve to a rung nothing sends: the F1 blackout with a different trigger. It is unreachable in this build (a peer's `-media` list is fixed at process start, and a source that leaves is dropped whole by `removeSource`), so it is a latent hazard rather than a defect — recorded here because the same code has already produced one critical failure.
+- **`learnSSRC` discards `ensureLayer`'s `topChanged`.** If it were ever the call that CREATED a layer record, `dropOtherShape` could reset every leg to auto without anything splicing them. It cannot be today — `forward` always calls `newUpstreamGen` for a layer immediately before `learnSSRC`, and no other production path calls it — so the two are ordered by construction rather than by a guard. Nothing enforces that ordering if a third caller ever appears.
+- **Layer selection is leaf-only, by design.** A leg toward a child relay is pinned to the top rung (`TestPinnedLegNeverSelects`, `TestRelayChildIsPinnedFromBothCallSites`), so a congested peer two hops down cannot be served a lower rung at all. That is a stated non-goal, not a gap in the tests — see `DESIGN.md` §8.5 — but it means the feature's reach is one hop from the origin's relay.
 - **Coverage percentage is not a target.** `make cover` is a floor-of-confidence signal, not a number to game. 100% line coverage of `ParseLevel` still would not prove the error *message* is right.
